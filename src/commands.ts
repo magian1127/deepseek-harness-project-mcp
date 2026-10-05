@@ -294,11 +294,18 @@ function message(error: unknown): string {
  * 注册 `/mcp-project` 命令，返回可逆的注销函数。
  *
  * `commands` 服务缺失（极简宿主）时返回空操作：本插件在那种宿主上只剩会话提示与
- * 挂载能力，不应该让整个 `apply` 失败。
+ * 挂载能力，不应该让整个 `apply` 失败。但**必须留下诊断**——命令面无声消失时，
+ * 用户连"为什么没有 `/mcp-project`"都无从查起，而这恰恰是他诊断"项目 MCP 没挂上"
+ * 的唯一入口（规格 §12）。`apply` 之后服务被卸载也会走到这条分支。
  */
 export function registerCommands(ctx: HostContext, deps: CommandDeps): Disposer {
   const commands = ctx.get('commands') as CommandsService | undefined
-  if (commands === undefined || typeof commands.register !== 'function') return () => {}
+  if (commands === undefined || typeof commands.register !== 'function') {
+    ctx.logger?.warn?.(
+      'project-mcp：宿主没有 commands 服务，/mcp-project 命令未注册；本插件在缺失该服务的 profile 上仍会按会话注入提示',
+    )
+    return () => {}
+  }
 
   return commands.register({
     name: COMMAND_NAME,

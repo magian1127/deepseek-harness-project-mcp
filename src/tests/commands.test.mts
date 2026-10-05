@@ -178,6 +178,10 @@ test('trust 幂等：重复批准不重复挂载同一 serverName', async () => 
 
   await run('trust')
   await run('trust')
+  // 命令层**刻意**每次都按当前计划调用 `mountInto`：它不知道也不需要知道哪些
+  // serverName 已经在 agent scope 里挂过。幂等由挂载层负责，其回归守护在
+  // `mount.test.mts` 的「重复 trust 只挂载一次（幂等）」——那里注入真实的
+  // `agent.ctx.plugin` 假实现，直接断言 plugin 的调用次数。
   assert.deepEqual(mounted, ['gh', 'gh'], '命令层每次都按当前计划挂载，幂等由挂载层负责')
 })
 

@@ -31,6 +31,7 @@ import { registerCommands } from './commands.js'
 import type { CommandDeps, ProjectInspection } from './commands.js'
 import type {
   AgentShape,
+  Disposer,
   HostContext,
   McpClientConfig,
   PluginFiberShape,
@@ -39,6 +40,17 @@ import type {
 
 /** Cordis 插件名（与 Loader 行 `name` 无关，只用于诊断输出）。 */
 export const name = 'project-mcp'
+
+/**
+ * 本插件同步依赖的宿主服务。
+ *
+ * 显式声明而不是在 `apply` 里碰运气：缺少任一服务时 Cordis 让插件保持**未激活**
+ * 并等待，而不是让 `apply` 在半个装配状态下抛错（`practices.md`「Stability」第 20 行）。
+ * 声明之后下面仍保留缺失分支的诊断——服务可能在 `apply` 之后被卸载，而
+ * `commands` 缺失会让命令面无声消失、`loader` 缺失会让撞名守卫静默退化为空集，
+ * 这两种退化都必须留下可查的日志（规格 §8.2 / §12）。
+ */
+export const inject = ['commands', 'loader', 'systemPrompt'] as const
 
 /**
  * 本插件没有可配置字段：`.mcp.json` 即配置源（规格 §4.1）。
@@ -106,6 +118,59 @@ async function writeStoreAtomic(store: TrustStore): Promise<void> {
 }
 
 /**
+ * 该 agent 在**插件侧**留下的登记项。
+ *
+ * 为什么插件要自己留一份：`agent.ctx` 上的注册有**两个 owner**（`practices.md`
+ * 第 8 行）。agent 销毁会清掉 `agent.ctx` 上的注册，但插件卸载（禁用、HMR 重载）
+ * **不会**——只把 disposer 交给 `agent.ctx` 的话，插件停用后活会话会一直保留项目级
+ * MCP 挂载与陈旧的提示段，直到该 agent 被销毁（第 19 行明文要求"把 disposer 按
+ * agent 键控地留在插件自己的 effect 里"）。
+ *
+ * 用 `Map` 而不是 `WeakMap`：插件卸载时要能遍历回收，而 `WeakMap` 不可迭代。
+ * 代价是它强引用 agent，因此 `agent/disposed` 必须把条目删掉，否则插件存活期间
+ * 会一直攥着已销毁的会话。
+ */
+interface AgentRegistrations {
+  /** 已挂载的项目级 MCP 服务器：`serverName` → `agent.ctx.plugin()` 返回的 fiber。 */
+  servers: Map<string, PluginFiberShape>
+  /** 提示段的 section disposer；未注入过提示时为 `undefined`。 */
+  notice?: Disposer
+}
+
+/** 取（必要时建立）该 agent 的插件侧登记项。 */
+function registrationsOf(
+  agents: Map<AgentShape, AgentRegistrations>,
+  agent: AgentShape,
+): AgentRegistrations {
+  let record = agents.get(agent)
+  if (record === undefined) {
+    record = { servers: new Map() }
+    agents.set(agent, record)
+  }
+  return record
+}
+
+/**
+ * 卸载一组已挂载的项目服务器。
+ *
+ * `dispose()` 是异步的，本函数不 await：调用方既有同步的命令处理器（`untrust`），
+ * 也有同步的 effect 卸载钩子，两处都不能返回 promise。失败降级为 warning——卸载
+ * 失败不该反过来打断会话或插件卸载。
+ */
+function disposeServers(ctx: HostContext, servers: Map<string, PluginFiberShape>): void {
+  for (const [serverName, fiber] of servers) {
+    try {
+      void Promise.resolve(fiber.dispose()).catch((error: unknown) => {
+        ctx.logger?.warn?.(`project-mcp：卸载「${serverName}」失败：${message(error)}`)
+      })
+    } catch (error) {
+      ctx.logger?.warn?.(`project-mcp：卸载「${serverName}」失败：${message(error)}`)
+    }
+  }
+  servers.clear()
+}
+
+/**
  * 把配置挂进该 agent 的 scope；同名已挂载则跳过。
  *
  * 幂等是必需的：重复 `/mcp-project trust` 会对同一个 `serverName` 再建一个
@@ -118,7 +183,7 @@ async function writeStoreAtomic(store: TrustStore): Promise<void> {
  */
 function mountInto(
   ctx: HostContext,
-  mounted: WeakMap<AgentShape, Map<string, PluginFiberShape>>,
+  agents: Map<AgentShape, AgentRegistrations>,
   McpClient: unknown,
   agent: AgentShape,
   configs: McpClientConfig[],
@@ -131,17 +196,15 @@ function mountInto(
   const agentCtx = agent.ctx
   if (agentCtx === undefined || typeof agentCtx.plugin !== 'function') return
 
-  let byName = mounted.get(agent)
-  if (byName === undefined) {
-    byName = new Map()
-    mounted.set(agent, byName)
-  }
+  const { servers } = registrationsOf(agents, agent)
 
   for (const config of configs) {
-    if (byName.has(config.serverName)) continue
+    if (servers.has(config.serverName)) continue
     try {
       const fiber = agentCtx.plugin(McpClient, config)
-      byName.set(config.serverName, fiber)
+      // fiber 登记在插件侧：插件卸载时由 apply 的 effect 统一 dispose（见
+      // AgentRegistrations）。agent 销毁时 agent.ctx 也会回收它，两条路径都成立。
+      servers.set(config.serverName, fiber)
       // 只观察启动结果，不阻塞：`then` 走 `fiber.await()`，不触发 dispose。
       fiber.then(undefined, (error: unknown) => {
         ctx.logger?.warn?.(
@@ -159,21 +222,12 @@ function mountInto(
 /** 卸载该 agent 已挂载的全部项目服务器（`/mcp-project untrust`）。 */
 function unmountFrom(
   ctx: HostContext,
-  mounted: WeakMap<AgentShape, Map<string, PluginFiberShape>>,
+  agents: Map<AgentShape, AgentRegistrations>,
   agent: AgentShape,
 ): void {
-  const byName = mounted.get(agent)
-  if (byName === undefined) return
-  for (const [serverName, fiber] of byName) {
-    try {
-      void Promise.resolve(fiber.dispose()).catch((error: unknown) => {
-        ctx.logger?.warn?.(`project-mcp：卸载「${serverName}」失败：${message(error)}`)
-      })
-    } catch (error) {
-      ctx.logger?.warn?.(`project-mcp：卸载「${serverName}」失败：${message(error)}`)
-    }
-  }
-  byName.clear()
+  const record = agents.get(agent)
+  if (record === undefined) return
+  disposeServers(ctx, record.servers)
 }
 
 /**
@@ -241,14 +295,22 @@ function inspectAgent(
   agent: AgentShape,
 ): ProjectInspection {
   const header = agent.session?.header ?? {}
+  // 必须传 Loader **本身**：`entries()` 在 Loader 上而不在 `loader.root` 上，
+  // 传 root 会让名单静默变成空集，撞名守卫随之完全失效（规格 §8）。
+  const loader = ctx.get('loader')
+  if (loader === undefined) {
+    // 撞名守卫退化必须可见：静默的空集会伪装成"没有任何全局行"，于是同名的项目
+    // 服务器照常挂载，遮蔽全局行并多 spawn 一个子进程（规格 §8.2）。
+    ctx.logger?.warn?.(
+      'project-mcp：未能从宿主解析到 loader，无法收集全局 MCP 名单，撞名守卫本次退化为空集',
+    )
+  }
   const input: SessionMountInput = {
     header,
     projectExists: existsSync,
     readFile: readFileUtf8,
     trust: readTrustStore(readFileUtf8),
-    // 必须传 Loader **本身**：`entries()` 在 Loader 上而不在 `loader.root` 上，
-    // 传 root 会让名单静默变成空集，撞名守卫随之完全失效（规格 §8）。
-    globalServers: collectGlobalServerNames(ctx.get('loader')),
+    globalServers: collectGlobalServerNames(loader),
     env: process.env,
   }
 
@@ -268,14 +330,29 @@ function inspectAgent(
  * 只在需要用户行动时调用（`renderNotice` 对 `mount` / `skip` 返回空串）。段文本用
  * `interpolate: false`：默认的严格 `{{变量}}` 插值会在渲染期对未知引用**抛错**，
  * 而这里的文本含用户路径，任何 `{{` 都会让整个会话的提示渲染失败。
+ *
+ * 段注册在 `agent.ctx` 上（作用域正确：提示只属于该会话），但返回的 section
+ * disposer **同时**留在插件侧登记项里：`agent.ctx` 上的注册有两个 owner，插件卸载
+ * 不会回收它们（`practices.md` 第 8 / 19 行）。已经注入过提示的会话不重复注册——
+ * 同一 scope 内重名 section 会抛错。
  */
-function injectNotice(ctx: HostContext, agent: AgentShape, text: string): void {
+function injectNotice(
+  ctx: HostContext,
+  agents: Map<AgentShape, AgentRegistrations>,
+  agent: AgentShape,
+  text: string,
+): void {
   const agentCtx = agent.ctx
   if (agentCtx === undefined || typeof agentCtx.effect !== 'function') return
   const systemPrompt = agentCtx.get('systemPrompt') as SystemPromptService | undefined
   if (systemPrompt === undefined || typeof systemPrompt.section !== 'function') return
 
-  agentCtx.effect(
+  const record = registrationsOf(agents, agent)
+  if (record.notice !== undefined) return
+
+  // 先把注册结果交给 agent.ctx（作用域归属），再把同一个 disposer 记进插件侧：
+  // `ctx.effect` 返回的是该 effect 的 disposer，与 section 的 disposer 等价可逆。
+  record.notice = agentCtx.effect(
     () =>
       systemPrompt.section({
         name: NOTICE_SECTION,
@@ -292,6 +369,11 @@ function injectNotice(ctx: HostContext, agent: AgentShape, text: string): void {
  *
  * 装配顺序刻意是"先命令、后监听"：命令注册是同步的，`apply` 返回后立刻可用；
  * 会话挂载依赖 `agent/created` 事件，只影响此后新建的会话。
+ *
+ * 本插件对 `agent.ctx` 的每一处注册都**双份登记**：注册落在 `agent.ctx`（作用域
+ * 正确），disposer 同时按 agent 键控地留在插件自己的 effect 里（`practices.md`
+ * 第 8 / 19 行）。因此三条拆除路径各自都能独立回收：agent 销毁、插件卸载、两者
+ * 之间的任意顺序；重复拆除是幂等的（`dispose()` 后集合已清空）。
  */
 export function apply(ctx: HostContext, config: unknown): void {
   void config
@@ -304,14 +386,15 @@ export function apply(ctx: HostContext, config: unknown): void {
     )
   }
 
-  const mounted = new WeakMap<AgentShape, Map<string, PluginFiberShape>>()
+  /** 插件侧的 agent 登记表；见 `AgentRegistrations`（刻意用可迭代的 Map）。 */
+  const agents = new Map<AgentShape, AgentRegistrations>()
 
   const deps: CommandDeps = {
     readStore: () => readTrustStore(readFileUtf8),
     writeStore: writeStoreAtomic,
     inspect: agent => inspectAgent(ctx, agent),
-    mountInto: (agent, configs) => mountInto(ctx, mounted, McpClient, agent, configs),
-    unmountFrom: agent => unmountFrom(ctx, mounted, agent),
+    mountInto: (agent, configs) => mountInto(ctx, agents, McpClient, agent, configs),
+    unmountFrom: agent => unmountFrom(ctx, agents, agent),
   }
 
   // 所有注册走 ctx.effect，随 fiber 卸载可逆清理（宿主 ctx 与 agent ctx 皆是）。
@@ -327,15 +410,53 @@ export function apply(ctx: HostContext, config: unknown): void {
 
           const view = inspectAgent(ctx, agent)
           if (view.plan.kind === 'mount') {
-            mountInto(ctx, mounted, McpClient, agent, view.plan.configs)
+            mountInto(ctx, agents, McpClient, agent, view.plan.configs)
           }
 
           const notice = renderNotice(view.plan, view.projectRoot ?? '')
-          if (notice !== '') injectNotice(ctx, agent, notice)
+          if (notice !== '') injectNotice(ctx, agents, agent, notice)
         } catch (error) {
           ctx.logger?.error?.(`project-mcp：会话挂载失败：${message(error)}`)
         }
       }),
     'project-mcp:agent-created',
+  )
+
+  // agent 销毁时把插件侧的登记项也清掉：`AgentRegistrations` 用 Map（可迭代）而
+  // 非 WeakMap，不清理就会让插件在整个存活期内攥住已销毁的会话。
+  ctx.effect(
+    () =>
+      ctx.on('agent/disposed', (payload: unknown) => {
+        try {
+          const agent = (payload as { agent?: AgentShape } | undefined)?.agent
+          if (agent === undefined) return
+          const record = agents.get(agent)
+          if (record === undefined) return
+          agents.delete(agent)
+          disposeServers(ctx, record.servers)
+          record.notice?.()
+        } catch (error) {
+          ctx.logger?.warn?.(`project-mcp：清理已销毁会话的登记项失败：${message(error)}`)
+        }
+      }),
+    'project-mcp:agent-disposed',
+  )
+
+  // 插件自身的卸载钩子：把**所有** agent 维度注册一并回收。`agent.ctx` 上的注册
+  // 不会随插件卸载自动消失（`practices.md` 第 8 / 19 行），缺了这一段，插件被禁用
+  // 或 HMR 重载后活会话会继续保留项目级 MCP 挂载与陈旧提示段，直到 agent 被销毁。
+  ctx.effect(
+    () => () => {
+      for (const record of agents.values()) {
+        disposeServers(ctx, record.servers)
+        try {
+          record.notice?.()
+        } catch (error) {
+          ctx.logger?.warn?.(`project-mcp：移除会话提示段失败：${message(error)}`)
+        }
+      }
+      agents.clear()
+    },
+    'project-mcp:agent-registrations',
   )
 }

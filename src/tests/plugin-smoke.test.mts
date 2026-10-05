@@ -58,8 +58,21 @@ function createMockContext(options?: { loader?: unknown; agents?: unknown }) {
   return {
     ctx, calls, live, registeredCommands, registeredSections,
     runDisposers: () => { for (const d of disposers.splice(0)) d() },
+    /** 某事件当前的监听者数量：用来断言监听**确实**注册了，而不是"触发没抛错"。 */
+    listenerCount: (name: string) => listeners.get(name)?.size ?? 0,
+    /**
+     * 派发事件。
+     *
+     * **无监听者时抛错**而不是空遍历：调用方用 `fire` 来证明监听器已注册，而
+     * "什么都没发生"与"监听器不存在"在空遍历下无法区分——这正是本文件原来那条
+     * `assert.ok(true)` 变成恒真断言的原因。注册表本身是这段测试的观测面。
+     */
     fire: (name: string, payload: unknown) => {
-      for (const cb of listeners.get(name) ?? []) cb(payload)
+      const set = listeners.get(name)
+      if (set === undefined || set.size === 0) {
+        throw new Error(`没有监听者的事件被派发：${name}`)
+      }
+      for (const cb of set) cb(payload)
     },
   }
 }
@@ -72,12 +85,22 @@ test('apply 注册命令与提示段，清理可逆', () => {
   assert.equal(mock.live.size, 0)
 })
 
-test('apply 注册 agent/created 监听', () => {
+test('apply 注册 agent/created 监听，且随插件卸载注销', () => {
   const mock = createMockContext()
   apply(mock.ctx, {})
-  // 触发不应抛异常（无 loader 时全局名单为空集）
+
+  // 可观测事实一：监听器确实挂上了（原来的 `assert.ok(true)` 在这里恒真）。
+  assert.equal(mock.listenerCount('agent/created'), 1, 'apply 未注册 agent/created 监听')
+  // 可观测事实二：插件侧还注册了 agent/disposed 清理钩子。
+  assert.equal(mock.listenerCount('agent/disposed'), 1, 'apply 未注册 agent/disposed 清理')
+
+  // `fire` 在无监听者时抛错，因此这一行本身就是断言；这里只验证不抛异常
+  // （无 loader 时全局名单为空集，假 agent 无 ctx/工作区 → 计划 skip）。
   mock.fire('agent/created', { agent: { session: { header: {} } } })
-  assert.ok(true)
+
+  mock.runDisposers()
+  assert.equal(mock.listenerCount('agent/created'), 0, '插件卸载后监听器未注销')
+  assert.equal(mock.listenerCount('agent/disposed'), 0, '插件卸载后清理钩子未注销')
 })
 
 test('renderNotice 对未信任计划列出待批准服务器', () => {
