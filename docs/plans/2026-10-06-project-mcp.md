@@ -314,7 +314,8 @@ test('readProjectMcpFile 返回原始文本用于指纹', () => {
 - `CommandsService`：`register(definition: CommandDefinitionShape): Disposer`
 - `CommandDefinitionShape`：`{ name: string; description: string; handler: (invocation: { agent?: AgentShape; rawInput?: string }) => unknown }`
 - `SystemPromptService`：`section(section: { name: string; order?: number; text: string | ((context: unknown) => string) }): Disposer`
-- `AgentShape`：`{ id: unknown; ctx: HostContext; session: { header: { cwd?: string; parentSession?: unknown; origin?: string } } }`
+- `AgentShape`：`{ id: unknown; ctx: AgentContext; session: { header: { cwd?: string; parentSession?: unknown; origin?: string } } }`
+- `AgentContext`：扩展 `HostContext`，**额外含 `plugin(module: unknown, config: unknown): unknown`** —— 这是任务 7 挂载 MCP 的唯一途径（`agent.ctx.plugin(McpClient, cfg)`），任务 2 按 brief 逐字实现时未加，任务 7 必须补上（见裁决）
 - `McpClientConfig`：`{ transport: 'stdio'; serverName: string; command: string; args: string[]; env: Record<string, string>; cwd: string; failOnStartupError: boolean } | { transport: 'streamable-http'; serverName: string; url: string; headers: Record<string, string>; failOnStartupError: boolean }`
 
 - [ ] **步骤 4：实现 `src/discovery.ts` 的 `findProjectRoot`**
@@ -747,9 +748,15 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { collectGlobalServerNames } from '../global-rows.js'
 
-/** 构造一个 Loader 形状：root.entries() 产出条目。 */
+/**
+ * 构造一个真实 Loader 形状：`entries()` 在 Loader 本体上（Loader extends
+ * EntryTree），不在 `loader.root`（那是 EntryGroup，没有 entries）。
+ * 条目形状是 `{ options: { name, config } }`，与 DSH 自身生产代码一致
+ * （packages/extensions/tool-cordis/src/config.ts:102 用 `[...loader.entries()]`，
+ * 同文件 :75 按 `entry.options.name` 取名）。
+ */
 function loaderOf(entries: Array<{ name: string; config?: unknown }>): unknown {
-  return { root: { entries: () => entries } }
+  return { entries: () => entries.map(options => ({ options })) }
 }
 
 test('收集 mcp-client 行的 serverName', () => {
@@ -784,19 +791,23 @@ test('loader 为 undefined 时返回空集', () => {
 
 test('loader 形状不符时返回空集，不抛异常', () => {
   assert.deepEqual([...collectGlobalServerNames({})], [])
-  assert.deepEqual([...collectGlobalServerNames({ root: {} })], [])
-  assert.deepEqual([...collectGlobalServerNames({ root: { entries: 'nope' } })], [])
+  assert.deepEqual([...collectGlobalServerNames({ entries: 'nope' })], [])
 })
 
 test('entries() 抛错时返回空集，不抛异常', () => {
-  const loader = { root: { entries: () => { throw new Error('boom') } } }
+  const loader = { entries: () => { throw new Error('boom') } }
   assert.deepEqual([...collectGlobalServerNames(loader)], [])
 })
 
-test('递归子树的条目也被收集', () => {
-  const child = { name: '@deepseek-ai/dsh-mcp-client', config: { serverName: 'nested' } }
-  const parent = { name: 'group', subtree: { entries: () => [child] } }
-  const loader = loaderOf([parent])
+test('条目缺 options 或 options 形状不符时被忽略，不抛异常', () => {
+  const loader = { entries: () => [null, 42, {}, { options: null }, { options: {} }] }
+  assert.deepEqual([...collectGlobalServerNames(loader)], [])
+})
+
+test('嵌套子树的条目也被收集', () => {
+  const child = { options: { name: '@deepseek-ai/dsh-mcp-client', config: { serverName: 'nested' } } }
+  const parent = { options: { name: 'group' }, subtree: { entries: () => [child] } }
+  const loader = { entries: () => [parent] }
   assert.deepEqual([...collectGlobalServerNames(loader)].sort(), ['nested'])
 })
 ```
@@ -811,17 +822,20 @@ test('递归子树的条目也被收集', () => {
 签名：`collectGlobalServerNames(loader: unknown): Set<string>`
 
 算法：
-1. 防御性取 `loader.root.entries`，非函数则返回空集
+1. 防御性取 `loader.entries`，非函数则返回空集
 2. 调 `entries()`，抛错则返回空集
-3. 遍历条目：`name === '@deepseek-ai/dsh-mcp-client'` 且 `config.serverName` 是非空字符串 → 加入集合
-4. 条目有 `subtree` 且其 `entries` 是函数 → 递归
+3. 遍历条目，取 `entry.options`；非对象则跳过
+4. `options.name === '@deepseek-ai/dsh-mcp-client'` 且 `options.config.serverName` 是非空字符串 → 加入集合
+5. 条目有 `subtree` 且其 `entries` 是函数 → 递归
 
 **必须按需调用，不缓存**（规格 §8.1：Loader 没有覆盖"已有条目改配置"的事件，缓存会在 HMR 后失效）。
+
+**关键**：`entries()` 在 **Loader 本体**上，不在 `loader.root` 上。`Loader extends EntryTree`（`vendor/loader/src/index.ts:77`）故有 `entries()`；`loader.root` 是 `EntryGroup`（`vendor/loader/src/config/group.ts:6-72`），只有 create/unlink/remove/update/stop。条目形状是 `{ options: { name, config } }`。
 
 - [ ] **步骤 4：运行测试，确认其通过**
 
 运行：`npm run build && node --test ".tsbuild/tests/global-rows.test.mjs"`
-预期：PASS，8 项测试全通过
+预期：PASS，9 项测试全通过
 
 - [ ] **步骤 5：提交**
 
