@@ -55,6 +55,11 @@ test('expandVariables 不把已定义值写进缺省报告', () => {
   assert.equal(JSON.stringify(result).includes('SECRET'), true)
 })
 
+test('expandVariables 不把原型链成员当成已定义', () => {
+  const result = expandVariables('${toString}', {})
+  assert.deepEqual(result, { missing: 'toString' })
+})
+
 test('translateServer 翻译 stdio 条目', () => {
   const result = translateServer('gh', { command: 'npx', args: ['-y', 'srv'] }, { cwd: '/work', env: {} })
   assert.equal(result.kind, 'ok')

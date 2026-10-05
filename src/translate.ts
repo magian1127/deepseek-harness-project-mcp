@@ -59,6 +59,11 @@ export function normalizeServerName(name: string): string {
  * 未定义且无默认值时返回 `{ missing: 变量名 }`——只回变量名，绝不回值：调用方
  * 会把结果写进诊断。值为空串也算"已定义"，此时优先于默认值。
  *
+ * 只认 `env` 的**自有属性**（`Object.hasOwn`）：`env` 是普通对象，直接 `env[name]`
+ * 会命中原型链，把 `Object.prototype` 的成员（`toString` / `constructor` / `valueOf`
+ * 等）当成"已定义值"，从而把一段 JS 源码展开进 `command` / `url` / `env`，而不是
+ * 按契约报告变量缺失。`.mcp.json` 是外部输入，字面写 `${toString}` 即可触发。
+ *
  * 多处缺变量时只报**第一个**：诊断要短，且多变量名对排查没有增量信息。
  */
 export function expandVariables(
@@ -67,7 +72,8 @@ export function expandVariables(
 ): { value: string } | { missing: string } {
   let missing: string | null = null
   const value = text.replace(VARIABLE_PATTERN, (match, name: string, fallback: string | undefined) => {
-    const defined = env[name]
+    // 只认自有属性：`env[name]` 会命中原型链（见函数注释）。
+    const defined = Object.hasOwn(env, name) ? env[name] : undefined
     if (defined !== undefined) return defined
     if (fallback !== undefined) return fallback
     missing ??= name
