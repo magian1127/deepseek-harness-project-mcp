@@ -2,3 +2,4 @@ node_modules/
 lib/
 .tsbuild/
 temp/
+package-lock.json
