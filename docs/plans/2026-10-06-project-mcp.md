@@ -1029,7 +1029,7 @@ export interface SessionMountInput {
 }
 
 export type SessionMountPlan =
-  | { kind: 'skip'; reason: string; silent?: boolean }
+  | { kind: 'skip'; reason: string; silent?: boolean; skipped?: Array<{ name: string; reason: string }> }
   | { kind: 'invalid'; reason: string }
   | { kind: 'untrusted'; projectRoot: string; fingerprint: string; pending: string[] }
   | { kind: 'mount'; projectRoot: string; fingerprint: string; configs: McpClientConfig[]; skipped: Array<{ name: string; reason: string }> }
@@ -1047,12 +1047,27 @@ export type SessionMountPlan =
 6. 遍历 `servers`，对每个名字：`translateServer` → 收集 `candidates`（翻译成功项）与 `skipped`（翻译失败项，含原因）
 7. **对 `candidates` 按规范化后的 `serverName` 去重**：用一个 `Set<string>` 记录已用名，重复项记入 `skipped`，理由含"重名"/"duplicate"（规格 §6.2 规则 4）
 8. 从 `candidates` 中剔除与 `globalServers` 撞名的条目，记入 `skipped`，理由含"全局"/"global"
-9. **若 `candidates` 为空** → 返回 `{ kind: 'skip', reason: ... }`（附 `skipped` 供诊断）。此时**不得**返回 `untrusted`——没有任何可挂载项时要求批准是无意义的，且会让用户面对一批永远不生效的服务器名。
-10. 用 `isApproved(trust, projectRoot, fp, 规范化名)` 过滤 `candidates` 得到 `approved`
-11. 若 `approved` 为空 → `untrusted`，`pending` 列出**全部 `candidates` 的名字**（即真正需要批准的那些）
+9. **翻译出过候选、但全部被去重或撞名过滤掉** → 返回 `{ kind: 'skip', reason: ... }`（附 `skipped` 供诊断）。此时**不得**返回 `untrusted`——这些服务器本身可挂载，只是被全局行遮蔽或彼此重名，要求用户批准一批永远不会挂载的服务器名毫无意义。
+10. 用 `isApproved(trust, projectRoot, fp, 规范化名)` 过滤 `mountable` 得到 `approved`
+11. 若 `approved` 为空**且 `mountable` 非空** → `untrusted`，`pending` 列出**全部 `mountable` 的名字**（即真正需要批准的那些）
 12. 否则 → `mount`，`configs` 只含 `approved`
 
-**为什么第 7 步去重是必需的**：`normalizeServerName` 的哈希后缀只保证**不同原名**不碰撞，但一个**已经长得像规范化结果**的键会与规范化产物相同。实测：`normalizeServerName('a b') === 'a_b_c8687a08'` 且 `normalizeServerName('a_b_c8687a08') === 'a_b_c8687a08'`。若两条都进入 `configs`，`@deepseek-ai/dsh-mcp-client` 的第二个实例会在 `apply` 内抛错（`packages/mcp/mcp-client/src/index.ts:169-173`，"serverName ... is already in use"），导致该实例不生效、`/mcp-project` 展示与实际挂载结果不一致。去重让行为确定且可诊断。
+**为什么第 7 步去重是必需的**：`normalizeServerName` 的哈希后缀只保证**不同原名**不碰撞，但一个**已经长得像规范化结果**的键会与规范化产物相同。实测：`normalizeServerName('a b') === 'a_b_c8687a08'` 且 `normalizeServerName('a_b_c8687a08') === 'a_b_c8687a08'`。若两条都进入 `configs`，`@deepseek-ai/dsh-mcp-client` 的第二个实例会在 `apply` 内抛错（`packages/mcp/mcp-client/src/index.ts:169-173`，"serverName ... is already in use"），导致该实例不生效、`/mcp-project` 展示与实际挂载结果不一致。去重让行为确定且可诊断。先到者胜。
+
+**第 9 步与第 12 步的区分（本处曾自相矛盾，以下为澄清后的规则）**：
+
+两种"零可挂载项"的情形必须区分，判据是**翻译阶段是否产出过候选**：
+
+| 情形 | `candidates` | `mountable` | 结果 |
+| --- | --- | --- | --- |
+| 翻译全失败（传输不支持、变量缺失、条目非法） | 空 | 空 | **`mount` + `configs: []`** |
+| 翻译有候选，但全被去重/撞名过滤 | 非空 | 空 | **`skip`** |
+| 有候选、有 mountable，但一条都没批准 | 非空 | 非空 | **`untrusted`** |
+| 有已批准项 | 非空 | 非空 | **`mount`** |
+
+两者的共同原则是"没有可挂载项时不要求批准"；区别只在计划形状：翻译全失败时这份文件根本没有可用服务器（规格 §12「单条非法 → 跳过该条，其余照常」，没有"其余"时就是挂载零条），故仍是 `mount`。
+
+**连带影响**：`kind === 'mount'` **可以携带空 `configs`**。任务 7 的 `renderNotice` 对 `mount` 返回 `''`，故"文件里一条可用服务器都没有"不会注入会话提示，只在 `/mcp-project` 里由 `skipped` 呈现。
 
 **注意**：第 10 步的 `serverName` 必须是 `translateServer` 返回的**规范化名**，与信任存储中记录的一致。
 
