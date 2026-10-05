@@ -82,7 +82,7 @@ class TooDeepError extends Error {}
  * 处理这几种情形。`depth` 为当前值的嵌套层数（根为 0），超过上限即抛哨兵。
  *
  * 深度检查发生在**递归之前**，所以在栈耗尽前必然先命中哨兵；`RangeError` 不可达。
- * 检查不区分容器与原始值，因此阈值判定是"深度 ≤ 63 的容器仍被规范化，深度 ≥ 64
+ * 检查不区分容器与原始值，因此阈值判定是"深度 ≤ 64 的值仍被规范化，深度 ≥ 65
  * 一律降级"——比精确到容器更保守，代价只是病态输入更早降级。
  */
 function canonicalValue(value: unknown, depth: number): unknown {
