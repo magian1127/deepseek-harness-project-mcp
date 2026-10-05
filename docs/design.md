@@ -285,7 +285,7 @@ if (parentSession !== undefined || origin === 'subagent') → 跳过
 - 变量未定义且无默认值 → **跳过该服务器 + 警告**（记变量名，不记值）。
   理由：带未展开的 `${VAR}` 字面量启动，几乎必然导致服务器认证失败，且错误难以理解。
 - **空串是已定义的值**：`${VAR:-default}` 在 `VAR=''` 时取空串，**不**取 default。这与 bash 的 `${VAR-default}`（不带冒号）一致，与 `${VAR:-default}`（带冒号，空串也取 default）不同。
-  理由：判定条件是 `env[VAR] === undefined`，与"未定义"的字面语义一致；且空串往往是用户显式设置的结果，静默替换成 default 会掩盖配置意图。
+  理由：判定条件是 `Object.hasOwn(env, VAR) && env[VAR] !== undefined`（只认自有属性，避免命中原型链成员如 `toString`），与"未定义"的字面语义一致；且空串往往是用户显式设置的结果，静默替换成 default 会掩盖配置意图。
 - 展开在内存中进行，不落盘。
 
 ## 11. 命令
