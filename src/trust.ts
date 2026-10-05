@@ -11,7 +11,9 @@
  *   改变指纹（规格 §7.2）——没有指纹，"批准一次"就会永久授权该路径下未来的任何
  *   内容。
  * - 失败关闭（规格 §7.4）：文件缺失、损坏、版本不认识、结构不符，一律视为全部
- *   未信任，且不抛异常——本模块运行在会话创建路径上，抛异常会中断会话。
+ *   未信任，且不抛异常——本模块运行在会话创建路径上，抛异常会中断会话。规范化
+ *   对深层嵌套输入同样不抛：递归设深度上限，超限与非法 JSON 一样降级返回原文
+ *   （见 `MAX_CANONICAL_DEPTH`）。
  * - 本模块不产生日志，也不把文件内容放进返回值以外的任何地方：`.mcp.json` 与
  *   信任文件都可能含凭据（规格 §10）。
  */
@@ -51,19 +53,48 @@ function isStringArray(value: unknown): value is string[] {
 }
 
 /**
+ * 规范化递归的深度上限。
+ *
+ * 深度必须设限：递归的输入是**不受信文件**的解析产物，而 `JSON.parse` 能接受的
+ * 嵌套深度只受输入长度约束——`'{"a":' × 3000 + '1' + '}' × 3000` 这段 18 KB 的输入
+ * 解析成功，却会让无上限的递归下降抛 `RangeError: Maximum call stack size
+ * exceeded`。本模块运行在会话创建路径上，抛异常会中断会话（规格 §7.4）。
+ *
+ * 64 层远超真实 `.mcp.json` 的需要（现实中不超过 5 层），因此不会误伤合法文件。
+ *
+ * **不要把上限调到数千层**：`JSON.stringify`（`canonicalize` 的最后一步）自身也是
+ * 递归实现，本机实测约 4000 层开始抛同样的 `RangeError`。3000 层的原始复现输入里，
+ * 抛异常的是本文件的递归下降（`JSON.stringify` 尚能处理）；但若把上限抬高到那附近，
+ * 就会把风险转移给 `JSON.stringify`。64 层同时让两者都远离各自的栈极限。
+ */
+const MAX_CANONICAL_DEPTH = 64
+
+/**
+ * 递归超深的哨兵。只有 `canonicalize` 捕获它：超深与非法 JSON 走同一条降级路径
+ * （返回 `raw`），而不是把异常抛进会话创建路径。
+ */
+class TooDeepError extends Error {}
+
+/**
  * 递归把值换成键序确定的等价结构：对象键按字典序排序，数组保序。
  *
  * `JSON.parse` 的产物只含 null / 布尔 / 数字 / 字符串 / 数组 / 普通对象，递归只需
- * 处理这几种情形。
+ * 处理这几种情形。`depth` 为当前值的嵌套层数（根为 0），超过上限即抛哨兵。
+ *
+ * 深度检查发生在**递归之前**，所以在栈耗尽前必然先命中哨兵；`RangeError` 不可达。
+ * 检查不区分容器与原始值，因此阈值判定是"深度 ≤ 63 的容器仍被规范化，深度 ≥ 64
+ * 一律降级"——比精确到容器更保守，代价只是病态输入更早降级。
  */
-function canonicalValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonicalValue)
+function canonicalValue(value: unknown, depth: number): unknown {
+  if (depth > MAX_CANONICAL_DEPTH) throw new TooDeepError()
+  if (Array.isArray(value)) return value.map(item => canonicalValue(item, depth + 1))
   if (isPlainObject(value)) {
     // 键来自不受信文件，用 fromEntries 落成普通自有属性：`__proto__` 这类键必须
-    // 是数据属性，而不是改写结果对象的原型。
+    // 是数据属性，而不是改写结果对象的原型。若改回 `out[key] = value`，`__proto__`
+    // 条目会被静默丢弃、指纹对它重新失敏——`trust.test.mts` 有该退化的回归守卫。
     const pairs = Object.keys(value)
       .sort()
-      .map((key): [string, unknown] => [key, canonicalValue(value[key])])
+      .map((key): [string, unknown] => [key, canonicalValue(value[key], depth + 1)])
     return Object.fromEntries(pairs)
   }
   return value
@@ -72,8 +103,17 @@ function canonicalValue(value: unknown): unknown {
 /**
  * 规范化 JSON 文本：解析后按 key 排序递归序列化，剔除空白与键序差异。
  *
- * 解析失败时返回 `raw` 本身——调用方 `readProjectMcpFile` 已校验过合法性，此处只
- * 作防御，不抛异常。
+ * 两条失败路径都返回 `raw` 本身，本函数**不抛异常**：
+ * - `JSON.parse` 失败（非法 JSON）——调用方 `readProjectMcpFile` 已校验过合法性，
+ *   此处只作防御；
+ * - 递归超深（`TooDeepError`）——深层嵌套的**合法** JSON 同样来自不受信文件，不能
+ *   让它把 `RangeError` 抛进会话创建路径。
+ *
+ * 这里的 catch 刻意不限定异常类型：递归阶段唯一可达的是 `TooDeepError`（解析产物
+ * 无环、无 BigInt），但任何意外异常在此降级都比中断会话更符合本模块契约。
+ *
+ * 降级到 `raw` 不削弱安全属性：原文指纹对内容依然敏感（不同文本必然不同哈希），
+ * 最坏后果只是格式差异也要求重新批准——偏保守的方向，不会让内容变更逃过指纹。
  */
 export function canonicalize(raw: string): string {
   let parsed: unknown
@@ -82,7 +122,11 @@ export function canonicalize(raw: string): string {
   } catch {
     return raw
   }
-  return JSON.stringify(canonicalValue(parsed))
+  try {
+    return JSON.stringify(canonicalValue(parsed, 0))
+  } catch {
+    return raw
+  }
 }
 
 /** 内容指纹：`sha256:<hex>`，基于规范化文本（规格 §7.2）。 */
