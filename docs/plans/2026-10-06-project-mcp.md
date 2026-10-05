@@ -826,7 +826,8 @@ test('嵌套子树的条目也被收集', () => {
 2. 调 `entries()`，抛错则返回空集
 3. 遍历条目，取 `entry.options`；非对象则跳过
 4. `options.name === '@deepseek-ai/dsh-mcp-client'` 且 `options.config.serverName` 是非空字符串 → 加入集合
-5. 条目有 `subtree` 且其 `entries` 是函数 → 递归
+
+**不需要手动递归子树**：真实的 `EntryTree.entries()` 自身已递归嵌套子树（`vendor/loader/src/config/tree.ts:26-33`，第 31 行 `yield* entry.subtree.entries()`）。上面的"嵌套子树"用例之所以通过，是因为**夹具**模拟了这个递归语义（`subtree.entries()` 由夹具的 loader 迭代器展开）——实现侧只需遍历一层。在真实 Loader 上手动递归是冗余死代码。
 
 **必须按需调用，不缓存**（规格 §8.1：Loader 没有覆盖"已有条目改配置"的事件，缓存会在 HMR 后失效）。
 
