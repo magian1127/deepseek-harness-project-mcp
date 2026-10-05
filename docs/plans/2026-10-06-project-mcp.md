@@ -966,6 +966,19 @@ test('全部候选被跳过时不要求批准', () => {
   if (plan.kind === 'skip') assert.equal(plan.skipped?.length, 1)
 })
 
+test('规范化后重名的条目被去重', () => {
+  // normalizeServerName('a b') === normalizeServerName('a_b_c8687a08') === 'a_b_c8687a08'
+  const raw = '{"mcpServers":{"a b":{"command":"x"},"a_b_c8687a08":{"command":"y"}}}'
+  const trust = approve(EMPTY_TRUST, '/repo', fingerprint(raw), ['a_b_c8687a08'], 't')
+  const plan = planSessionMount(inputOf({ readFile: () => raw, trust }))
+  assert.equal(plan.kind, 'mount')
+  if (plan.kind === 'mount') {
+    assert.equal(plan.configs.length, 1)
+    assert.equal(plan.skipped.length, 1)
+    assert.match(plan.skipped[0]?.reason ?? '', /重名|duplicate/)
+  }
+})
+
 test('未知传输的服务器被跳过，其余照常挂载', () => {
   const raw = '{"mcpServers":{"bad":{"type":"sse","url":"https://x"},"good":{"command":"x"}}}'
   const trust = approve(EMPTY_TRUST, '/repo', fingerprint(raw), ['bad', 'good'], 't')
@@ -1023,13 +1036,16 @@ export type SessionMountPlan =
 4. `readProjectMcpFile(projectRoot, readFile)`：`absent` → `skip` 且 `silent: true`；`invalid` → `invalid`
 5. `fp = fingerprint(raw)`
 6. 遍历 `servers`，对每个名字：`translateServer` → 收集 `candidates`（翻译成功项）与 `skipped`（翻译失败项，含原因）
-7. 从 `candidates` 中剔除与 `globalServers` 撞名的条目，记入 `skipped`，理由含"全局"/"global"
-8. **若 `candidates` 为空** → 返回 `{ kind: 'skip', reason: ... }`（附 `skipped` 供诊断）。此时**不得**返回 `untrusted`——没有任何可挂载项时要求批准是无意义的，且会让用户面对一批永远不生效的服务器名。
-9. 用 `isApproved(trust, projectRoot, fp, 规范化名)` 过滤 `candidates` 得到 `approved`
-10. 若 `approved` 为空 → `untrusted`，`pending` 列出**全部 `candidates` 的名字**（即真正需要批准的那些）
-11. 否则 → `mount`，`configs` 只含 `approved`
+7. **对 `candidates` 按规范化后的 `serverName` 去重**：用一个 `Set<string>` 记录已用名，重复项记入 `skipped`，理由含"重名"/"duplicate"（规格 §6.2 规则 4）
+8. 从 `candidates` 中剔除与 `globalServers` 撞名的条目，记入 `skipped`，理由含"全局"/"global"
+9. **若 `candidates` 为空** → 返回 `{ kind: 'skip', reason: ... }`（附 `skipped` 供诊断）。此时**不得**返回 `untrusted`——没有任何可挂载项时要求批准是无意义的，且会让用户面对一批永远不生效的服务器名。
+10. 用 `isApproved(trust, projectRoot, fp, 规范化名)` 过滤 `candidates` 得到 `approved`
+11. 若 `approved` 为空 → `untrusted`，`pending` 列出**全部 `candidates` 的名字**（即真正需要批准的那些）
+12. 否则 → `mount`，`configs` 只含 `approved`
 
-**注意**：第 9 步的 `serverName` 必须是 `translateServer` 返回的**规范化名**，与信任存储中记录的一致。
+**为什么第 7 步去重是必需的**：`normalizeServerName` 的哈希后缀只保证**不同原名**不碰撞，但一个**已经长得像规范化结果**的键会与规范化产物相同。实测：`normalizeServerName('a b') === 'a_b_c8687a08'` 且 `normalizeServerName('a_b_c8687a08') === 'a_b_c8687a08'`。若两条都进入 `configs`，`@deepseek-ai/dsh-mcp-client` 的第二个实例会在 `apply` 内抛错（`packages/mcp/mcp-client/src/index.ts:169-173`，"serverName ... is already in use"），导致该实例不生效、`/mcp-project` 展示与实际挂载结果不一致。去重让行为确定且可诊断。
+
+**注意**：第 10 步的 `serverName` 必须是 `translateServer` 返回的**规范化名**，与信任存储中记录的一致。
 
 `skip` 分支需携带 `skipped` 数组以便 `/mcp-project` 展示原因；为此扩展类型：
 
@@ -1040,7 +1056,7 @@ export type SessionMountPlan =
 - [ ] **步骤 5：运行测试，确认其通过**
 
 运行：`npm run build && node --test ".tsbuild/tests/session.test.mjs"`
-预期：PASS，13 项测试全通过
+预期：PASS，14 项测试全通过
 
 - [ ] **步骤 6：提交**
 
