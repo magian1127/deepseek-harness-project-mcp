@@ -88,7 +88,7 @@ index.ts ──> session.ts ──> discovery.ts, translate.ts, trust.ts, global
 
 ---
 
-### 任务 1：项目骨架与 profile 模块加载
+### Task 1：项目骨架与 profile 模块加载
 
 **文件：**
 - 新建：`package.json`、`tsconfig.json`、`tsconfig.tests.json`、`.gitignore`、`cordis.patch.yml`
@@ -219,7 +219,7 @@ git commit -m "搭建 project-mcp 插件骨架与 profile 模块加载"
 
 ---
 
-### 任务 2：宿主服务鸭子类型与项目根发现
+### Task 2：宿主服务鸭子类型与项目根发现
 
 **文件：**
 - 新建：`src/types.ts`
@@ -353,7 +353,7 @@ git commit -m "添加宿主服务鸭子类型与项目根发现"
 
 ---
 
-### 任务 3：`.mcp.json` 条目翻译与 serverName 规范化
+### Task 3：`.mcp.json` 条目翻译与 serverName 规范化
 
 **文件：**
 - 新建：`src/translate.ts`
@@ -549,7 +549,7 @@ git commit -m "添加 mcp.json 条目翻译与 serverName 规范化"
 
 ---
 
-### 任务 4：信任存储
+### Task 4：信任存储
 
 **文件：**
 - 新建：`src/trust.ts`
@@ -728,7 +728,7 @@ git commit -m "添加信任存储与指纹绑定"
 
 ---
 
-### 任务 5：全局 MCP 行检测
+### Task 5：全局 MCP 行检测
 
 **文件：**
 - 新建：`src/global-rows.ts`
@@ -832,7 +832,7 @@ git commit -m "添加全局 MCP 行检测"
 
 ---
 
-### 任务 6：会话挂载流程
+### Task 6：会话挂载流程
 
 **文件：**
 - 新建：`src/session.ts`
@@ -1036,7 +1036,7 @@ git commit -m "添加会话挂载决策"
 
 ---
 
-### 任务 7：命令、提示与插件装配
+### Task 7：命令、提示与插件装配
 
 **文件：**
 - 新建：`src/commands.ts`
@@ -1227,7 +1227,7 @@ git commit -m "装配 project-mcp 插件入口与命令"
 
 ---
 
-### 任务 8：文档
+### Task 8：文档
 
 **文件：**
 - 新建：`README.md`、`README.en.md`、`AGENTS.md`
