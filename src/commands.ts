@@ -43,6 +43,16 @@ export interface ProjectInspection {
   mountable: string[]
   /** 规范化后与文件里的键不同的服务器（原名 → 规范名），用于展示重命名。 */
   renamed: Array<{ originalName: string; serverName: string }>
+  /**
+   * 与信任状态无关的完整跳过诊断。
+   *
+   * 不能只读 `plan.skipped`：`untrusted` 变体**不携带**它（`session.ts` 第 11 步），
+   * 而那正是用户批准**之前**看到的状态——只看计划会让"某个服务器为什么不出现"在
+   * 最需要答案的时刻无从查起（规格 §12 要求跳过原因在 `/mcp-project` 可见）。
+   * `index.ts` 用一份全批准的探针计划补齐这份名单；探针不可用（如全部候选被过滤，
+   * 此时计划是 `skip`）时回退到 `plan.skipped`。
+   */
+  skipped: Array<{ name: string; reason: string }>
 }
 
 /** 命令执行结果，对齐 DSH `CommandResult`（本插件只产出这两态）。 */
@@ -100,8 +110,17 @@ function trustAnchor(plan: SessionMountPlan): { projectRoot: string; fingerprint
   return undefined
 }
 
-/** 计划里的跳过诊断；`invalid` 与 `untrusted` 不携带。 */
-function skippedNotes(plan: SessionMountPlan): Array<{ name: string; reason: string }> {
+/**
+ * 跳过诊断：优先用检视携带的完整名单（与信任状态无关），缺失时回退到计划自带的。
+ *
+ * `untrusted` 与 `invalid` 两个变体不携带 `skipped`，而 `untrusted` 恰恰是用户批准
+ * **之前**的状态——只读计划会让跳过原因在最需要答案的时刻消失。`view.skipped` 由
+ * `index.ts` 的全批准探针补齐；探针不可用时（全部候选被过滤，计划本身是 `skip`）
+ * 回退到 `plan.skipped`。
+ */
+function skippedNotes(view: ProjectInspection): Array<{ name: string; reason: string }> {
+  if (view.skipped.length > 0) return view.skipped
+  const { plan } = view
   if (plan.kind === 'skip') return plan.skipped ?? []
   if (plan.kind === 'mount') return plan.skipped
   return []
@@ -139,7 +158,7 @@ function renderList(view: ProjectInspection, store: TrustStore): CommandOutcome 
   const approvedSet = new Set(approved)
   const mounted = plan.kind === 'mount' ? plan.configs.map(config => config.serverName) : []
   const unapproved = view.mountable.filter(name => !approvedSet.has(name))
-  const skipped = skippedNotes(plan)
+  const skipped = skippedNotes(view)
 
   const lines: string[] = []
   lines.push(`项目：${projectRoot ?? '（无法定位项目根）'}`)
