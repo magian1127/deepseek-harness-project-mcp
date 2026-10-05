@@ -827,11 +827,20 @@ test('嵌套子树的条目也被收集', () => {
 3. 遍历条目，取 `entry.options`；非对象则跳过
 4. `options.name === '@deepseek-ai/dsh-mcp-client'` 且 `options.config.serverName` 是非空字符串 → 加入集合
 
-**不需要手动递归子树**：真实的 `EntryTree.entries()` 自身已递归嵌套子树（`vendor/loader/src/config/tree.ts:26-33`，第 31 行 `yield* entry.subtree.entries()`）。上面的"嵌套子树"用例之所以通过，是因为**夹具**模拟了这个递归语义（`subtree.entries()` 由夹具的 loader 迭代器展开）——实现侧只需遍历一层。在真实 Loader 上手动递归是冗余死代码。
+**关于子树递归**（本节曾两次写错，以下为实测结论）：
+
+- **夹具需要递归**：本任务的假 Loader 夹具是 `{ entries: () => [parent] }`，它**不**调用 `parent.subtree.entries()`——即夹具并未模拟真实 Loader 的摊平语义。因此"嵌套子树"用例要求实现侧下降 `entry.subtree`；只遍历一层会让该用例失败（实测 `[]` vs `['nested']`）。
+- **真实 Loader 上这层下降是冗余的**：`EntryTree.entries()` 自身已递归嵌套子树（`vendor/loader/src/config/tree.ts:26-33`，第 31 行 `yield* entry.subtree.entries()`）。
+- **但下降必须配 `visited` 去重**，否则在真实 Loader 上指数爆炸：祖先树已摊平一次、本函数再逐层下降，深度 d 的树被展开约 2^d 次（实测深度 5 → 32 次、深度 10 → 1024 次、深度 15 → 32768 次；深度 50 在 120 秒内不返回，会挂死会话创建路径）。加 `visited` 后每棵树最多展开一次，深度 1000 仅 1001 次。
+- 设计理由：入参是 `unknown`，契约上不假设 `entries()` 一定返回摊平视图。多走一遍的代价可忽略，而漏掉嵌套子树里的全局行恰恰会导致规格 §8.2 要防的静默遮蔽。
+
+**关于条目字段访问**：`options.config` 是**可选**的。若写成 `options.config.serverName`，一条只写 `name` 的 mcp-client 行就会抛 `TypeError`，被外层 catch 整体吞掉、**已收集的名字一并丢失**——撞名保护被整体关闭。必须逐行独立降级（`isPlainObject(config) ? config.serverName : undefined`）。
 
 **必须按需调用，不缓存**（规格 §8.1：Loader 没有覆盖"已有条目改配置"的事件，缓存会在 HMR 后失效）。
 
 **关键**：`entries()` 在 **Loader 本体**上，不在 `loader.root` 上。`Loader extends EntryTree`（`vendor/loader/src/index.ts:77`）故有 `entries()`；`loader.root` 是 `EntryGroup`（`vendor/loader/src/config/group.ts:6-72`），只有 create/unlink/remove/update/stop。条目形状是 `{ options: { name, config } }`。
+
+`entries()` 是读 `this.store` 的生成器方法，必须以 `tree` 为接收者调用（`entries.call(tree)`）——脱开接收者会抛 `TypeError`。
 
 - [ ] **步骤 4：运行测试，确认其通过**
 
