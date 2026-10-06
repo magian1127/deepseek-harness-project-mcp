@@ -1,0 +1,272 @@
+# 开发指南（development）
+
+> 本文件是源码地图、依赖策略、构建与测试的**唯一权威位置**。
+> 用户可见语义见 [`behavior.md`](behavior.md)；设计依据见 [`design.md`](design.md)；
+> 按症状诊断见 [`troubleshooting.md`](troubleshooting.md)。
+
+## 1. 仓库结构
+
+| 路径 | 职责 |
+| --- | --- |
+| `src/*.ts` | 唯一手写实现源码 |
+| `src/tests/*.test.mts` | `node:test` 测试源码 |
+| `cordis.patch.yml` | 随包发布的持久 bundle patch（行 id `dsh-project-mcp`） |
+| `lib/` | Host 构建产物（`tsc`），**不得手改** |
+| `.tsbuild/` | 测试构建产物（`tsc`），**不得手改** |
+| `docs/` | 按主题拆分的权威文档 |
+| `temp/` | 临时产物，已 gitignore |
+
+`lib/` 与 `.tsbuild/` 只能由构建命令生成。
+
+## 2. 源码地图
+
+| 模块 | 职责 | I/O |
+| --- | --- | --- |
+| `index.ts` | 插件入口 `apply`：装配命令、订阅 `agent/created` 与 `agent/disposed`、挂载与卸载、写信任存储 | **唯一做真实 I/O 与 Cordis 交互的模块** |
+| `types.ts` | 宿主服务的最小鸭子类型（`HostContext` / `AgentContext` / `CommandsService` / `SystemPromptService` / `LoaderService` / `AgentShape` / `McpClientConfig`） | 无 |
+| `profile-modules.ts` | 从当前 profile 的模块解析上下文解析并预载 DSH 运行时模块 | 模块解析 + 文件读 |
+| `discovery.ts` | 项目根发现（向上找 `.git`）、`.mcp.json` 读取与解析 | 纯函数 + 注入 I/O |
+| `translate.ts` | 条目 → `McpClientConfig`、`serverName` 规范化、`${VAR}` 展开 | 纯函数 |
+| `trust.ts` | 信任存储读写、规范化指纹、批准/撤销、存储路径 | 纯函数 + 注入 I/O |
+| `global-rows.ts` | 从 Loader 树收集全局 `mcp-client` 行的 `serverName` | 纯函数（只读遍历） |
+| `session.ts` | `planSessionMount`：会话 → 挂载决策（纯函数，零 I/O） | 纯函数 |
+| `commands.ts` | `/mcp-project` 命令族（列表 / trust / untrust） | 无（依赖经 `CommandDeps` 注入） |
+| `notice.ts` | `renderNotice`：会话提示文本 | 纯函数 |
+
+**依赖方向**（单向，无环）：
+
+```
+index.ts ──> session.ts ──> discovery.ts, translate.ts, trust.ts, global-rows.ts
+   │                              │
+   ├──> commands.ts, notice.ts    └──> types.ts
+   └──> profile-modules.ts
+```
+
+**职责边界**：`session.ts` / `translate.ts` / `discovery.ts` / `trust.ts` / `global-rows.ts`
+各自只承担一件事、互不依赖，且全部通过注入 I/O 保持可彻底单测。`index.ts` 是唯一的装配层，
+因此它的测试是"假 ctx + 真实 fs"的集成冒烟，而非穷尽单测。
+
+## 3. 依赖策略：不把 `@deepseek-ai/*` 写进依赖
+
+**这是本工作区的硬约定**，对齐 `deepseek-harness-hashline` 的 `src/profile-modules.ts`。
+
+DSH 运行时模块（`@deepseek-ai/dsh-*`、`@deepseek-ai/schemastery`）**不写入本包
+`dependencies` / `peerDependencies`**，而是运行时从当前 profile 的模块解析上下文加载：
+
+1. 保证与主进程**同一模块实例**——`HarnessError`、schemastery 等类型的 `instanceof` 判定
+   依赖同一性；
+2. `link:` 与 `file:` 两种安装方式走同一条路径；
+3. 避免 peer 声明被宿主 preflight 按 semver 拒绝（0.1.7-rc.1 起精确版本清单会被拒）。
+
+`dependencies` 与 `peerDependencies` 都必须省略。`devDependencies` 只有 `@types/node` 与
+`typescript`。
+
+### 3.1 需要的运行时模块与获取方式
+
+| 需求 | 获取方式 |
+| --- | --- |
+| 挂载 MCP 插件 | **profile 解析** `@deepseek-ai/dsh-mcp-client`（必须真模块，`ctx.plugin()` 需要插件本体） |
+| 原子写 + 文件锁 | **profile 解析** `@deepseek-ai/dsh-atomic-write`；失败则降级为"同目录临时文件 + rename" |
+| 项目根发现 | **自实现**（向上找 `.git`）；不依赖 `skill-filesystem` 内部函数 |
+| 命令注册 | **鸭子类型**（`ctx.get('commands')`） |
+| 系统提示注入 | **鸭子类型**（`ctx.get('systemPrompt')`） |
+| 遍历 Loader 树 | **鸭子类型**（`ctx.get('loader')`） |
+
+降级原则：运行时模块加载失败时**降级而非启动失败**，并记一条警告。MCP 挂载无法降级——
+拿不到 `mcp-client` 时功能整体不可用，此时记错误并**保持静默不挂载**（安全侧：宁可不挂，
+不可错挂）。命令仍然注册：查看状态、批准、撤销都不需要 `mcp-client`，缺了它们用户连
+"为什么没挂上"都查不到。
+
+### 3.2 Peer 解析契约
+
+DSH 0.1.7-rc 起，宿主的组合批次经模块 hooks 管线并行动态 import 官方插件的 ESM；在同步
+求值里 `require(esm)` 会撞 Node 的 `not yet fully loaded`（管线被当前同步栈阻塞，同步重试
+永远等不到加载完成）。因此 `profile-modules.ts` 必须：
+
+1. 模块顶层用 `require.resolve` **只解析**（不求值、无竞态）；
+2. 读目标包 `package.json` 的 `exports['.']`，取其中的 `import` 条目（退回 `default`，
+   再退回 `main`，最后退回 require 条目）；
+3. 以文件 URL **异步 import 预载**（模块顶层 `await`）；
+4. 预载失败后才走同步 `require` 兜底（脱离 profile 的测试 / CLI 环境），再失败即
+   **永久降级**并返回 `null`。
+
+**profile 名解析**：`--profile <name>` 优先；无该标志时，Electron 环境（桌面版 Host）固定
+为 `desktop`，否则为 `web`。桌面版不能落回 `web` 默认，否则 `createRequire` 会锚到 web
+profile，拿不到与桌面运行时同实例的 DSH 模块。
+
+**路径拼接**统一用 `posix.join`（输出跨平台确定，Windows 的 `fs` / `createRequire` 同样
+接受正斜杠）；但**向上回溯**必须用平台感知的 `dirname`——`posix.dirname` 对 Windows 盘符
+路径会返回 `.`，会让 Windows 上的项目根发现静默止步于 cwd。
+
+## 4. 不可破坏的约束
+
+1. **不得**把 `@deepseek-ai/*` 写入 `dependencies` / `peerDependencies`。
+2. **相对导入一律写 `.js` 扩展名**（如 `from './discovery.js'`），即使源文件是 `.ts`；
+   测试文件同理（`from '../trust.js'`）。
+3. `serverName` 必须匹配 `/^[A-Za-z0-9_-]{1,32}$/`；命令名必须匹配
+   `/^[a-z][a-z0-9_-]*$/u`。
+4. 信任文件权限 `0600`；写失败**不吞**（静默失败会让"已批准"成为假象）。
+5. 展开后的环境变量值**永不**进入日志、错误消息、会话记录或任何持久化产物；只记变量名。
+6. 所有诊断只由服务器名、变量名与自造的 `reason` 文本拼成，不回显 `.mcp.json` 内容。
+7. 会话创建路径上的任何函数**都不抛异常**（抛异常会中断会话创建）。
+8. 挂载必须设 `failOnStartupError: false` 且**不 await 连接**。
+9. 挂载与提示段的 disposer 必须**双份登记**：注册落在 `agent.ctx`（作用域正确），
+   disposer 同时按 agent 键控地留在插件自己的 `ctx.effect` 里。`agent.ctx` 上的注册有
+   两个 owner，插件卸载（禁用、HMR 重载）**不会**回收它们。
+10. `lib/` 与 `.tsbuild/` 不得手改。
+11. `ctx.get('loader')` 必须传 **Loader 本体**而非 `loader.root`：`entries()` 在 Loader 上，
+   传 root 会让全局名单静默变成空集、撞名守卫完全失效。
+12. 信任键（`projectRoot` + `fingerprint`）必须与 `isApproved` 的查询键**逐字一致**；
+   批准时复用计划携带的值，不自行推导（如用进程 cwd）。
+13. 文档与源码中不写本机绝对路径。
+14. 提交标题以中文开头。
+
+## 5. `inject` 声明与缺服务的 profile
+
+`src/index.ts` 导出：
+
+```ts
+export const inject = ['commands', 'loader', 'systemPrompt'] as const
+```
+
+显式声明而不是在 `apply` 里碰运气：缺少任一服务时 Cordis 让插件保持**未激活**并等待，
+而不是让 `apply` 在半个装配状态下抛错。这是缺服务时的正确行为（不激活而非抛错）。
+
+**后果**：`sdk-minimal` profile 的 bundle **不提供 `commands`**（它不叠加 `dsh-base`，
+自己的 patch 是完整树，且没有 commands 行）。该 profile 上本插件会保持 PENDING——
+连 `/mcp-project` 命令也不出现。`web` / `desktop` / `headless` 等叠加 `dsh-base` 的
+profile 都提供这三个服务。
+
+声明之后仍保留服务缺失分支的诊断：服务可能在 `apply` 之后被卸载，而 `commands` 缺失会让
+命令面无声消失、`loader` 缺失会让撞名守卫静默退化为空集，这两种退化都必须留下可查日志。
+
+## 6. 构建与测试
+
+```powershell
+npm install
+npm run build        # tsc -p tsconfig.json && tsc -p tsconfig.tests.json
+npm run typecheck    # tsc -p tsconfig.json --noEmit
+npm test             # npm run build && node --test ".tsbuild/tests/*.test.mjs"
+npm pack --dry-run   # 核对打包内容
+```
+
+单独跑一个测试文件：
+
+```powershell
+npm run build && node --test ".tsbuild/tests/session.test.mjs"
+```
+
+`tsconfig.json`：`target ES2024`、`module ESNext`、`moduleResolution Bundler`、
+`rootDir src`、`outDir lib`、`strict`、`verbatimModuleSyntax`、`noEmitOnError`、
+`include: ["src/*.ts"]`。
+
+`tsconfig.tests.json` 继承前者，`outDir .tsbuild`、`noCheck: true`、`declaration: false`、
+`include: ["src/*.ts", "src/tests/*.mts"]`。`noCheck` 意味着测试文件的模块解析错误只在
+**运行期**暴露——构建 exit 0 不代表测试能加载。
+
+### 6.1 打包
+
+`package.json` 的 `files` 字段决定 npm tarball 内容：
+
+```
+lib, cordis.patch.yml, README.md, README.en.md, LICENSE, docs, !docs/plans,
+src, !src/tests, tsconfig.json, tsconfig.tests.json
+```
+
+没有 `files` 时 `npm pack` 会把 `.superpowers/`、`src/tests`、`docs/plans/`、
+`tsconfig*.json` 与 `package-lock.json` 全部打包（实测 65 个文件）。加了之后是 56 个，
+且上述内容均不在其中。改动 `files` 后必须重跑 `npm pack --dry-run` 核对。
+
+## 7. 测试策略
+
+### 7.1 分层
+
+| 层 | 覆盖 | 命令 |
+| --- | --- | --- |
+| 纯函数单测 | `discovery` / `translate` / `trust` / `global-rows` / `session` / `notice` | `npm test` |
+| 装配集成 | `plugin-smoke`（假 ctx，验证注册与清理可逆）、`commands`（注入 `CommandDeps`，验证命令输出）、`mount`（真实 fs + 假 agent ctx，验证挂载路径） | `npm test` |
+| 模块解析 | `profile-modules`（`--profile` 解析、`DSH_HOME` 落点） | `npm test` |
+| 类型 | `tsc --noEmit` | `npm run typecheck` |
+| 打包 | tarball 内容 | `npm pack --dry-run` |
+
+### 7.2 测试文件与用例数（当前 110）
+
+| 文件 | 用例 | 覆盖 |
+| --- | --- | --- |
+| `profile-modules.test.mts` | 5 | `--profile` 标志、Electron 默认 `desktop`、非 Electron 默认 `web`、伪值忽略、`DSH_HOME/profiles/<name>` 落点 |
+| `discovery.test.mts` | 10 | 向上找最近的 `.git`、无 `.git` 回退 cwd、`absent` / 非法 JSON / 顶层非对象 / `mcpServers` 非对象、缺 `mcpServers` 按空、原文透传用于指纹 |
+| `translate.test.mts` | 23 | `normalizeServerName` 六态、`expandVariables` 六态（含原型链）、`translateServer` 的 stdio / http / 别名 / sse / ws / 无 type 有 url / 非对象 / 缺 command / 变量缺失 / env 展开 / 规范名 |
+| `trust.test.mts` | 25 | 指纹稳定性与敏感性（空白、键序、新增条目、`__proto__`、超深嵌套）、读写往返、失败关闭四态、`isApproved` 四态、`approve` / `revoke` 不改入参 |
+| `global-rows.test.mts` | 9 | 收集 `mcp-client` 行、忽略非 mcp-client / 缺 `serverName` / 非字符串、`loader` 缺失或形状不符或 `entries()` 抛错时降级空集、嵌套子树 |
+| `session.test.mts` | 14 | 无 cwd、子代理两种判据、无文件静默跳过、未信任、已信任、指纹失配、撞名跳过、损坏文件、结构错误、全候选被跳过时不要求批准、规范化去重、未知传输、变量缺失诊断 |
+| `plugin-smoke.test.mts` | 6 | `apply` 注册与注销、`agent/created` 监听可逆、`renderNotice` 四态 |
+| `commands.test.mts` | 9 | 未批准仍显示诊断、部分批准同时可见、空 `configs` 说明、trust 用计划键、幂等、未知名字报错、untrust 卸载、未知子命令、无 agent |
+| `mount.test.mts` | 9 | 未批准不挂载（安全断言）、挂载带 `failOnStartupError: false`、loader 传本体、重复 trust 幂等、插件卸载回收、agent 销毁清理、loader 缺失诊断、commands 缺失诊断、`inject` 声明 |
+
+### 7.3 Review Focus 的守护位置
+
+规格未逐一钉死的五类输入/失败模式，各自有测试守护：
+
+| 风险 | 守护用例 |
+| --- | --- |
+| `.mcp.json` 合法 JSON 但结构错误（顶层数组、`mcpServers` 是字符串、条目 `null`） | `discovery.test.mts` 的三条 invalid 用例 + `session.test.mts`「结构错误的 .mcp.json 不抛异常」 |
+| `${VAR}` 引用未定义变量，且不泄漏值 | `translate.test.mts`「变量缺失时跳过且只报变量名」+ `session.test.mts`「诊断不含变量值」 |
+| 同名服务器同时存在于全局行与 `.mcp.json` | `session.test.mts`「与全局行撞名的服务器被跳过」+ `mount.test.mts`「loader 传的是 Loader 本体」 |
+| 信任文件损坏或未知版本 | `trust.test.mts` 四条失败关闭用例 |
+| 批准后文件被修改（含 `git pull` 拉入新条目） | `trust.test.mts`「对新增条目敏感」+ `session.test.mts`「指纹不匹配时回到未信任」 |
+
+### 7.4 测试夹具手法
+
+- **注入 I/O**：`discovery` / `translate` / `trust` / `session` 的读写与 `exists` 全部由参数
+  注入，单测不碰真实文件系统。
+- **假 ctx**：`plugin-smoke.test.mts` 与 `commands.test.mts` 用记录式的假宿主服务，断言
+  注册、注销与输出文本。
+- **真实 fs + 假 agent ctx**：`mount.test.mts` 用 `mkdtempSync` 建临时项目与临时
+  `DSH_HOME`，只把宿主服务与 agent ctx 换成可观测的假实现；`DSH_HOME` 必须在 **import
+  被测模块之前**设置——`profile-modules.ts` 在模块顶层就解析并缓存 DSH 运行时模块。
+- **变异测试**：新增守护后用变异验证鉴别力（改回缺陷实现，确认恰好红掉对应用例）。
+  `noEmitOnError` 会让编译失败的变异静默跑旧产物，变异后必须确认构建真的产出了新文件。
+
+## 8 验证分层与未验证项
+
+**已由测试与命令覆盖**：上表 110 个用例、`npm run typecheck`、`npm pack --dry-run` 的
+tarball 内容。
+
+**未在真实 DSH 运行时验证**（需要真实 profile 与会话，无法在纯单元测试中覆盖）：
+
+- `agent/created` 在 `clear` / `compact` source 下的幂等性；
+- 非阻塞挂载下 `ctx.plugin()` 返回的 fiber 在 agent dispose 时是否被正确清理；
+- 从 `agent.ctx` 遍历 Loader 树能否拿到完整条目集（scope 继承是否覆盖 root）；
+- 首条消息是否真的赶不上工具注册；
+- `/mcp-project` 与提示段在真实 GUI 会话中的实际渲染。
+
+Host 半边没有热通道，验证这些需要由使用者重启一次 DSH。**不要在未重启的情况下**用旧
+进程的行为推断新构建的行为。
+
+### 8.1 文档与已提交代码的一致性
+
+本文件与 [`behavior.md`](behavior.md) 描述的是 **HEAD 中实际存在的代码**，不是计划或评审
+记录里声称的行为。已发现两处声称与代码不符（文档按代码写，并记为局限）：
+
+- 评审记录声称"批准后刷新会话提示段"已修复，但 HEAD 的 `injectNotice` 只在
+  `agent/created` 调用，`commands.ts` 中无任何刷新调用；
+- 评审记录声称"已挂载"一列改读真实挂载记账，但 HEAD 的 `renderList` 仍取
+  `plan.configs`。
+
+核对方法：`Select-String -Path src\*.ts -Pattern 'injectNotice'` 应只命中
+`index.ts` 的定义与 `agent/created` 中的调用点。
+
+## 9. 已知局限（实现层面）
+
+| 局限 | 位置 | 说明 |
+| --- | --- | --- |
+| `disabled: true` 的全局行仍被计入名单 | `global-rows.ts` | 见 [`behavior.md` 第 8.3 节](behavior.md#83-已知局限-被禁用的全局行仍占名) |
+| 模块名精确匹配 | `global-rows.ts` | 行名写成子路径或相对路径时漏检 |
+| `readProjectMcpFile` 把任何读错误当作 `absent` | `discovery.ts` | 无法区分 `ENOENT` 与 `EACCES`；方向是 fail-safe |
+| 每会话独立连接 | `index.ts` | N 个会话 = N 份连接与子进程 |
+| 会话提示不随批准刷新 | `notice.ts` + `index.ts` | 提示段在 `agent/created` 时按当时计划注册一次；`trust` 不重建它，旧提示留存到会话重启。`injectNotice` 对已注入的会话直接返回（同 scope 重名 section 会抛错），因此刷新需要先拆除再注册，尚未实现 |
+| "已挂载"取自计划而非实际挂载记账 | `commands.ts` | 正常路径一致；`untrust` 后 `dispose()` 未完成时立刻重新批准是已知偏差窗口 |
+| 首条消息可能赶不上工具 | `index.ts` | 非阻塞挂载的固有代价 |
+| `findProjectRoot` 不规范化路径 | `discovery.ts` | 同一目录的反斜杠与正斜杠写法在信任存储里是两个键 |
+| `runTrust` 在锁外读、锁内写 | `commands.ts` + `index.ts` | 并发批准不同项目理论上会丢更新 |
+| `3100` 提示段排序位是复制的字面量 | `index.ts` | 上游改动会静默分叉 |

@@ -2,6 +2,8 @@
   "name": "deepseek-harness-project-mcp",
   "version": "0.1.0",
   "type": "module",
+  "description": "项目级 MCP：由项目根 .mcp.json 决定该项目下的会话启用哪些 MCP 服务器，未启用的完全不建立连接、不启动子进程。Per-project MCP servers for DeepSeek Harness, driven by the project-root .mcp.json: unapproved servers never connect and never spawn a process.",
+  "license": "MIT",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "exports": {
@@ -9,8 +11,31 @@
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
-  "engines": { "node": "^22.19.0 || >=24.0.0" },
   "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "README.en.md",
+    "LICENSE",
+    "docs",
+    "!docs/plans",
+    "src",
+    "!src/tests",
+    "tsconfig.json",
+    "tsconfig.tests.json"
+  ],
+  "engines": { "node": "^22.19.0 || >=24.0.0" },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "mcp",
+    "mcp-servers",
+    "project-mcp",
+    "mcp-json",
+    "per-project"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.tests.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
