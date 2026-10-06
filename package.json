@@ -39,7 +39,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.tests.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test \".tsbuild/tests/*.test.mjs\""
+    "test": "npm run build && node --test --test-timeout=60000 \".tsbuild/tests/*.test.mjs\""
   },
   "devDependencies": {
     "@types/node": "^22.15.0",

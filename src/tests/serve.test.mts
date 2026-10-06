@@ -29,7 +29,7 @@ import type { McpClientConfig, ServeMetadata } from '../types.js'
 function makeIo(options: {
   /** 依次返回的探测结果；用尽后重复最后一项。 */
   responses?: Array<{ ok?: boolean; status?: number } | Error>
-  /** 每次 sleep 推进的假时钟毫秒数（默认不推进，模拟"立刻返回"）。 */
+  /** 每次 sleep 推进的假时钟毫秒数（默认不额外推进）。 */
   advancePerSleep?: number
 } = {}) {
   const responses = options.responses ?? [{ ok: true }]
@@ -51,7 +51,23 @@ function makeIo(options: {
       slept.push(ms)
       clock += advance
     },
-    now: () => clock,
+    /**
+     * 假时钟：**每次读取都自增 1 毫秒**。
+     *
+     * 这不是为了模拟精度，而是为了**保证 `waitReady` 一定会终止**。真实时钟永远前进，
+     * 所以生产代码里"探测一直失败"只会等到 `readyTimeoutMs` 就返回；但一个完全不推进的
+     * 假时钟会让同一个循环**永不退出**——整个测试套件挂住，而不是给出一个失败用例。
+     * 这一点是变异测试发现的：把 `checkHealth` 的成功分支改成失败后，`serve.test.mts`
+     * 直接挂死（比"变红"更糟——CI 上表现为超时，看不出根因）。
+     *
+     * 自增 1 毫秒对断言无影响：所有涉及等待的用例都用 `advancePerSleep` 明确推进更大的
+     * 步长，而"恰好探测几轮"的断言（`waitReady 轮询到就绪` 的 3 次探测）靠的是响应序列，
+     * 不是时钟。
+     */
+    now: () => {
+      clock += 1
+      return clock
+    },
     timeoutSignal: () => new AbortController().signal,
   }
   return {
