@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { registerCommands } from '../commands.js'
-import type { CommandDeps, ProjectInspection, ReclaimStatus } from '../commands.js'
+import type { CommandDeps, ProjectInspection } from '../commands.js'
 import type { AgentShape, HostContext, McpClientConfig } from '../types.js'
 import type { TrustStore } from '../trust.js'
 
@@ -57,7 +57,6 @@ function listView(): ProjectInspection {
     renamed: [],
     skipped: [],
     mounted: [],
-    reclaim: { status: 'none', limit: 8, sessions: 0 },
   }
 }
 
@@ -102,20 +101,12 @@ function harness(deps: CommandDeps) {
   return Object.assign(run, { definition: () => definition! })
 }
 
-function deps(
-  overrides: Partial<CommandDeps> & { view: Omit<ProjectInspection, 'reclaim'> & { reclaim?: ReclaimStatus } },
-): CommandDeps {
+function deps(overrides: Partial<CommandDeps> & { view: ProjectInspection }): CommandDeps {
   const { view, ...rest } = overrides
-  // `reclaim` 在只关心其它列的用例里补默认值：这些用例断言的是信任状态、诊断与挂载
-  // 记账，连接上限与回收状态对它们没有意义，但类型要求它存在。
-  const inspection: ProjectInspection = {
-    reclaim: { status: 'none', limit: 8, sessions: 0 },
-    ...view,
-  }
   return {
     readStore: () => ({ version: 1, projects: {} }) as TrustStore,
     writeStore: async () => {},
-    inspect: () => inspection,
+    inspect: () => view,
     mountInto: () => {},
     unmountFrom: () => {},
     mountedServers: () => [],

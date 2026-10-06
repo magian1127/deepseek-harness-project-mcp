@@ -98,24 +98,11 @@ export interface LoaderService {
   entries(): Iterable<unknown>
 }
 
-/**
- * 会话 agent 的最小形状：定位工作区、取 session header、挂载 MCP 都够用。
- *
- * `status` 是 `Agent` 上的**公开只读属性**（声明合并见
- * `packages/core/agent/src/runtime-types.ts:171-172`：`readonly status: AgentStatus`，
- * `AgentStatus = 'idle' | 'running'`，同文件 `:109`）。回收判定直接读它，
- * **不需要**监听 `agent/status` 事件——那会引入一个本插件不需要的长期监听器。
- *
- * 声明成 `unknown` 而不是 `'idle' | 'running'`：这是鸭子类型，真实对象可能因上游契约
- * 漂移给出别的值，而回收侧必须能对它做**运行时**判定（判不出 idle 就不回收，见
- * `reclaim.ts`）。声明成窄字面量会让"非预期值"在类型层就被吞掉，反而失去这条防线。
- */
+/** 会话 agent 的最小形状：定位工作区、取 session header、挂载 MCP 都够用。 */
 export interface AgentShape {
   id: unknown
   ctx: AgentContext
   session: { header: { cwd?: string; parentSession?: unknown; origin?: string } }
-  /** 当前生命周期状态；回收只挑 `'idle'` 的会话。非预期值一律视为 `running`。 */
-  status?: unknown
 }
 
 /** `@deepseek-ai/dsh-mcp-client` 的 Config 形状（挂载时逐字传给 ctx.plugin）。 */

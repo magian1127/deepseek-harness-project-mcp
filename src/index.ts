@@ -35,9 +35,7 @@ import { errorName, validateMountConfig } from './config-guard.js'
 import { McpFileTooLargeError, readProjectMcpFile, findProjectRoot } from './discovery.js'
 import { collectGlobalServerNames } from './global-rows.js'
 import { renderNotice } from './notice.js'
-import { loadAtomicWrite, loadMcpClient, loadSchemastery } from './profile-modules.js'
-import { DEFAULT_CONNECTION_LIMIT, normalizeConnectionLimit, selectReclaimTargets } from './reclaim.js'
-import type { ReclaimEntry } from './reclaim.js'
+import { loadAtomicWrite, loadMcpClient } from './profile-modules.js'
 import { planSessionMount } from './session.js'
 import type { SessionMountInput, SessionMountPlan } from './session.js'
 import { withSessionTag } from './session-tag.js'
@@ -45,7 +43,7 @@ import { approve, fingerprint, readTrustStore, writeTrustStore } from './trust.j
 import type { TrustStore } from './trust.js'
 import { normalizeServerName } from './translate.js'
 import { registerCommands } from './commands.js'
-import type { CommandDeps, ProjectInspection, ReclaimStatus } from './commands.js'
+import type { CommandDeps, ProjectInspection } from './commands.js'
 import type {
   AgentShape,
   Disposer,
@@ -70,67 +68,14 @@ export const name = 'project-mcp'
 export const inject = ['commands', 'loader', 'systemPrompt'] as const
 
 /**
- * schemastery 的最小鸭子类型：只声明本插件实际调用的构造器。
+ * 本插件没有可配置字段：`.mcp.json` 即配置源（规格 §4.1）。
  *
- * 不 import `@deepseek-ai/*`（红线 1），而是运行时从 profile 解析（见
- * `profile-modules.ts` 的 `loadSchemastery`）。
+ * 刻意显式导出为 `undefined` 而不是 `null`：宿主设置页对 schema 做
+ * `'toJSON' in Config` 检查（`packages/settings/settings/src/index.ts`），`null`
+ * 会让 `in` 抛错并带崩整页；`undefined` 被当作"无 Config"安全降级。将来加字段时
+ * 在这里放 schemastery schema，config 会以普通值传入 `apply`。
  */
-interface SchemaField {
-  default(value: unknown): SchemaField
-  step(value: number): SchemaField
-  min(value: number): SchemaField
-  max(value: number): SchemaField
-  /** DSH 0.1.7+ schemastery 提供易变标记；旧版缺席时走 `meta` 直写。 */
-  volatile?(): SchemaField
-  meta?: Record<string, unknown>
-}
-
-interface SchemaFactory {
-  object(shape: Record<string, unknown>): unknown
-  number(): SchemaField
-}
-
-/**
- * 标记字段为**易变**（volatile）：宿主据此允许在插件页改值而无需重挂载插件。
- *
- * 照抄 `deepseek-harness-hashline/src/index.ts:60-68` 的手法：新版有 `.volatile()`，
- * 旧版（schemastery 3.18.2）没有，直接写 `meta.volatile`——宿主的 `volatileForm` /
- * `isVolatilePath` 读的正是 `meta`（`packages/settings/settings/src/schema.ts:38,75`）。
- * schema 实例是 function 类型，因此**不能**用 `typeof === 'object'` 守卫。
- */
-function markVolatile(field: SchemaField): SchemaField {
-  if (field === null || field === undefined) return field
-  if (typeof field.volatile === 'function') return field.volatile()
-  field.meta = { ...(field.meta ?? {}), volatile: true }
-  return field
-}
-
-/**
- * 插件的 Config schema：连接上限。
- *
- * 只有 `connectionLimit` 一个字段——本插件的配置源仍是项目根的 `.mcp.json`
- * （规格 §4.1），这里只暴露"宿主级"的回收上限。
- */
-export function createConfigSchema(z: SchemaFactory): unknown {
-  return z.object({
-    connectionLimit: markVolatile(z.number().step(1).min(0).default(DEFAULT_CONNECTION_LIMIT)),
-  })
-}
-
-/**
- * 宿主读取的插件 Config。
- *
- * **默认上限 8**（`DEFAULT_CONNECTION_LIMIT`）：超过就回收最后活跃时间最早的 `idle`
- * 会话连接；全部会话都在 `running` 时忽略上限（绝不打断正在工作的会话）。规则见
- * [`docs/behavior.md`](../docs/behavior.md)。
- *
- * profile 无 schemastery 时必须导出 **`undefined`**（不能是 `null`）：宿主设置页对
- * schema 做 `'toJSON' in Config` 检查（`packages/settings/settings/src/index.ts:427`），
- * `null` 会让 `in` 抛错并带崩整页设置；`undefined` 被当作"无 Config"安全降级，
- * config 以普通值传入 `apply`。此时上限走 `normalizeConnectionLimit` 的默认值 8。
- */
-const configSchemaFactory = loadSchemastery() as SchemaFactory | null
-export const Config = configSchemaFactory === null ? undefined : createConfigSchema(configSchemaFactory)
+export const Config = undefined
 
 /** 会话提示段的排序位：与内置 MCP 段同档（`SECTION_ORDERS.MCP_SERVERS = 3100`）。 */
 const MCP_SERVERS_ORDER = 3100
@@ -252,19 +197,6 @@ interface AgentRegistrations {
   servers: Map<string, PluginFiberShape>
   /** 提示段的 section disposer；未注入过提示时为 `undefined`。 */
   notice?: Disposer
-  /**
-   * 最后活跃时间（毫秒时间戳，`Date.now()`）。
-   *
-   * 更新时机**只有三处**，且都是"已有动作"的顺带记账——刻意不新增事件监听、不新增
-   * 定时器（规格要求"惰性检查"）：
-   * 1. 挂载时（`agent/created` → `mountInto`）；
-   * 2. `agent/pre-step` 触发时（每次发消息）；
-   * 3. 该会话执行 `/mcp-project` 命令族时。
-   *
-   * **不监听 `agent/status`**：回收判定只需要"读一次当前 status"（`agent.status` 是
-   * 公开属性），而 `agent/status` 监听器会为每个会话引入一个长期注册，收益为零。
-   */
-  lastActiveAt: number
 }
 
 /**
@@ -311,151 +243,10 @@ function registrationsOf(
   if (key === undefined) return undefined
   let record = agents.get(key)
   if (record === undefined) {
-    record = { servers: new Map(), lastActiveAt: Date.now() }
+    record = { servers: new Map() }
     agents.set(key, record)
   }
   return record
-}
-
-/**
- * 记一次该会话的活动（惰性检查的记账面）。
- *
- * 键不可用或该会话从未建立登记项时**什么都不做**：不得凭空建条目——只读路径
- * （`/mcp-project` 的列表、回收检查）不该因为"看过一眼"就为该会话留下记账。
- */
-function touch(
-  agents: Map<AgentKey, AgentRegistrations>,
-  agent: AgentShape,
-  now: number,
-): void {
-  const key = agentKeyOf(agent)
-  if (key === undefined) return
-  const record = agents.get(key)
-  if (record === undefined) return
-  record.lastActiveAt = now
-}
-
-/**
- * 该 agent 的当前生命周期状态；判不出 `'idle'` 时按 `'running'` 返回。
- *
- * 读的是 `agent.status`（公开属性，`packages/core/agent/src/runtime-types.ts:171-172`），
- * **不是** `agent/status` 事件。安全侧：非预期值一律视为 `running`（不回收），
- * 因为"误回收一个正在工作的会话"比"少回收一个空闲会话"代价高得多——前者会打断用户
- * 正在进行的对话，后者只是多占一份内存。
- */
-function agentStatusOf(agent: AgentShape): 'idle' | 'running' {
-  return agent.status === 'idle' ? 'idle' : 'running'
-}
-
-/**
- * 惰性回收：超过上限时回收最后活跃时间最早的 `idle` 会话连接。
- *
- * ## `reserve`：为"即将挂上的会话"预留名额
- *
- * 调用点常在**新会话挂载之前**（`agent/created`）。那时新会话还不在记账里，若按当前
- * 条目数判定，8 个已有会话 + 新来的第 9 个会看到 `8 <= 8` → 不回收 → 挂完变成 9 个，
- * 上限实际是 9。因此调用方把"即将占用的名额"经 `reserve` 传进来，判定按
- * `limit - reserve` 进行，挂载完成后总数**恰好**回到上限内。
- *
- * `reserve` 为 0（`agent/pre-step` 的顺带检查）时退化为普通判定。
- *
- * 为什么不能改成"先挂载、再回收"：新会话创建时是 `idle` 的，挂完立刻回收会让**它自己**
- * 成为唯一的 idle 候选（最久未活跃的 idle 里只有它），于是刚建好的会话被立即拆掉。
- * 先回收后挂载 + 预留名额既拿到硬上限，又不会拆掉正在建立的会话。
- *
- * ## 为什么必须惰性（不新增监听、不新增定时器）
- *
- * 判据与执行时机都在**已有动作**里顺带完成：`agent/created`（新会话挂载前）、
- * `agent/pre-step`（重挂时机 + 顺带回收）、`/mcp-project` 命令族（用户主动操作时）。
- * 定时器会让"没有会话在动"的进程也周期性唤醒；独立监听器则是每个会话一份长期注册。
- *
- * ## 为什么走 `fiber.dispose()` 而不是杀进程
- *
- * `mcp-client` 内置自动重连（`packages/mcp/mcp-client/src/connection.ts:41-46`，默认
- * `enabled: true`、500ms 后重试、最多 10 次），杀进程会被它当作连接断开并**重新拉起**。
- * `fiber.dispose()` 会 `clearTimeout(reconnectTimer)`（同文件 `:388-394`），是唯一
- * 能真正停掉连接的路径。`disposeServers` 已经正确调用它。
- *
- * ## 只清 `servers`，**不删登记项**
- *
- * 被回收的会话**还活着**（agent 未销毁），下次发消息时要重挂。因此：
- * - **不** `agents.delete(key)`——那会与 `agent/disposed` 的清理路径及重挂逻辑冲突；
- * - **保留** `lastActiveAt`，否则刚被回收的会话会因为"时间戳最旧"被反复选中；
- * - `record.notice` 也保留（提示段与 MCP 连接无关，撤下它没有理由）。
- *
- * 不抛异常：调用点在会话创建路径与 `pre-step` 瀑布上（红线 4）。
- */
-function reclaimOverLimit(
-  ctx: HostContext,
-  agents: Map<AgentKey, AgentRegistrations>,
-  limit: number,
-  reserve = 0,
-): string[] {
-  try {
-    const entries: ReclaimEntry[] = []
-    for (const [sessionId, record] of agents) {
-      // 判据是 `ctx.agents.get(sessionId)`：拿不到 live agent 说明它已销毁
-      // （`AgentRegistry.get` 见 `packages/core/agent/src/index.ts:566-568`），
-      // 那种会话的连接已随 agent.ctx 回收，不该占用回收名额。
-      const live = liveAgentOf(ctx, sessionId)
-      if (live === undefined) continue
-      entries.push({ sessionId, lastActiveAt: record.lastActiveAt, status: agentStatusOf(live) })
-    }
-
-    // 有效上限扣掉即将占用的名额；为负时 `selectReclaimTargets` 按 0 处理。
-    const effective = limit - (Number.isFinite(reserve) ? Math.max(0, Math.floor(reserve)) : 0)
-    const targets = selectReclaimTargets(entries, { limit: effective })
-    for (const sessionId of targets) {
-      const record = agents.get(sessionId)
-      if (record === undefined) continue
-      const mounted = record.servers.size
-      if (mounted === 0) continue
-      disposeServers(ctx, record.servers)
-      ctx.logger?.warn?.(
-        `project-mcp：项目级 MCP 连接数超过上限 ${limit}，已回收最久未活跃的空闲会话「${sessionId}」的 ${mounted} 个连接（该会话下次发消息时自动重挂）`,
-      )
-    }
-    return targets
-  } catch (error) {
-    // 回收失败绝不打断调用它的那条路径（会话创建 / pre-step）。
-    ctx.logger?.warn?.(`project-mcp：回收项目级 MCP 连接失败：${message(error)}`)
-    return []
-  }
-}
-
-/**
- * 取该 sessionId 当前**活着**的 agent（`ctx.agents.get`）。
- *
- * `agents` 服务缺失（极简宿主、测试夹具）时返回 `undefined`：此时回收**整体不执行**
- * ——判不出会话是否空闲就绝不回收（安全侧）。这也是"新增 `agents` 到 `inject` 会
- * 让插件在缺该服务的 profile 上保持未激活"这一代价的规避方式：本插件**不**声明
- * `agents` 依赖，拿不到就退化为不回收，其余功能（挂载、命令、提示）照常。
- */
-function liveAgentOf(ctx: HostContext, sessionId: string): AgentShape | undefined {
-  const registry = ctx.get('agents') as { get?(id: string): unknown } | undefined
-  if (registry === undefined || typeof registry.get !== 'function') return undefined
-  const agent: unknown = registry.get(sessionId)
-  if (agent === null || typeof agent !== 'object') return undefined
-  return agent as AgentShape
-}
-
-/**
- * 该会话的回收状态快照，供 `/mcp-project` 展示。
- *
- * 三种状态互斥且**穷尽**：
- * - `mounted`：有挂载的连接；
- * - `reclaimed`：登记项在、但 `servers` 为空——被回收过（或从未挂上）；
- * - `none`：本插件没有该会话的登记项（id 不可用、或会话从未触发过挂载路径）。
- */
-function reclaimStatusOf(
-  agents: Map<AgentKey, AgentRegistrations>,
-  agent: AgentShape,
-): ReclaimStatus['status'] {
-  const key = agentKeyOf(agent)
-  if (key === undefined) return 'none'
-  const record = agents.get(key)
-  if (record === undefined) return 'none'
-  return record.servers.size > 0 ? 'mounted' : 'reclaimed'
 }
 
 /**
@@ -530,9 +321,6 @@ function mountInto(
   // 依赖两处判定的一致性（将来改键规则时不会静默变成非空断言崩溃）。
   if (record === undefined) return
   const { servers } = record
-  // 挂载即一次活动：新会话（或重挂）必须把时间戳推到现在，否则刚挂上的会话会因为
-  // "时间戳最旧"在下一次回收检查里被立刻选中。
-  record.lastActiveAt = Date.now()
 
   for (const config of configs) {
     if (servers.has(config.serverName)) continue
@@ -599,28 +387,6 @@ function unmountFrom(
 }
 
 /**
- * 该会话是否需要重挂：**当前一个服务器都没挂**。
- *
- * 被回收过的会话（`servers` 已清空但条目仍在）满足它。会话**从未**挂上（未批准、
- * 计划是 `skip`）也满足——两者由调用方的计划判定区分（只有计划是 `mount` 才重挂）。
- *
- * 刻意不用"是否被回收过"这个布尔标记：标记需要额外的状态机与清理路径，而
- * "`servers` 为空"本身就是**唯一**有意义的判据——它直接回答"现在缺不缺连接"。
- */
-function needsRemount(
-  agents: Map<AgentKey, AgentRegistrations>,
-  agent: AgentShape,
-): boolean {
-  const key = agentKeyOf(agent)
-  if (key === undefined) return false
-  const record = agents.get(key)
-  // 条目不存在时返回 `false`：那种会话没有可用的记账，重挂会走 `mountInto` 的建条目
-  // 路径，但那属于"首次挂载"而非"重挂"。两者行为相同，因此不影响正确性。
-  if (record === undefined) return false
-  return record.servers.size === 0
-}
-
-/**
  * 只读收集：`.mcp.json` 里全部**可挂载**服务器与全部跳过诊断（与信任状态无关）。
  *
  * 为什么要这份名单：部分批准时（批准了一部分、另一些还没批），未获批准的条目
@@ -679,15 +445,12 @@ function collectMountable(
   return { mountable, renamed, skipped: probe.skipped }
 }
 
-/** 检视该 agent 所在项目：当前计划 + 展示所需的完整名单 + 真实挂载记账 + 回收状态。 */
+/** 检视该 agent 所在项目：当前计划 + 展示所需的完整名单 + 真实挂载记账。 */
 function inspectAgent(
   ctx: HostContext,
   agents: Map<AgentKey, AgentRegistrations>,
   agent: AgentShape,
-  limit: number,
 ): ProjectInspection {
-  // 用户主动操作（`/mcp-project` 命令族）即一次活动：读命令也要反映"这个会话刚动过"。
-  touch(agents, agent, Date.now())
   const header = agent.session?.header ?? {}
   // 必须传 Loader **本身**：`entries()` 在 Loader 上而不在 `loader.root` 上，
   // 传 root 会让名单静默变成空集，撞名守卫随之完全失效（规格 §8）。
@@ -723,9 +486,6 @@ function inspectAgent(
     // 会话 A 批准后，此前已创建、`agent/created` 早已触发过的会话 B 计划同样是
     // `mount`，但 B 一个服务器都没挂上——按计划渲染会把"计划要挂"报成"已挂载"。
     mounted: mountedServers(agents, agent),
-    // 回收面：本会话的连接状态 + 全局上限。两者都由命令层渲染，值一律来自插件侧
-    // 记账（不是计划），因此 `/mcp-project` 能如实回答"现在什么是活的、为什么可能没了"。
-    reclaim: { status: reclaimStatusOf(agents, agent), limit, sessions: agents.size },
   }
 }
 
@@ -819,11 +579,10 @@ function refreshNotice(
   ctx: HostContext,
   agents: Map<AgentKey, AgentRegistrations>,
   agent: AgentShape,
-  limit: number,
 ): void {
   try {
     removeNotice(ctx, agents, agent)
-    const view = inspectAgent(ctx, agents, agent, limit)
+    const view = inspectAgent(ctx, agents, agent)
     const text = renderNotice(view.plan, view.projectRoot ?? '')
     if (text !== '') injectNotice(ctx, agents, agent, text)
   } catch (error) {
@@ -855,13 +614,7 @@ function mountedServers(
  * 插件卸载、两者之间的任意顺序；重复拆除是幂等的（`dispose()` 后集合已清空）。
  */
 export function apply(ctx: HostContext, config: unknown): void {
-  // 上限：`Config` 缺失（profile 无 schemastery）或字段写错时退回默认 8。
-  // `normalizeConnectionLimit` 负责"配置不可信"的兜底，`selectReclaimTargets` 的
-  // `limit <= 0` 才是显式的"上限为 0"。
-  const limit = normalizeConnectionLimit(
-    (config as { connectionLimit?: unknown } | undefined)?.connectionLimit,
-  )
-
+  void config
   const McpClient = loadMcpClient()
   if (McpClient === null || McpClient === undefined) {
     // 安全侧：宁可不挂。命令仍然注册——查看状态、批准、撤销都不需要 mcp-client，
@@ -877,11 +630,11 @@ export function apply(ctx: HostContext, config: unknown): void {
   const deps: CommandDeps = {
     readStore: () => readTrustStore(readFileUtf8),
     writeStore: writeStoreAtomic,
-    inspect: agent => inspectAgent(ctx, agents, agent, limit),
+    inspect: agent => inspectAgent(ctx, agents, agent),
     mountInto: (agent, configs) => mountInto(ctx, agents, McpClient, agent, configs),
     unmountFrom: agent => unmountFrom(ctx, agents, agent),
     mountedServers: agent => mountedServers(agents, agent),
-    refreshNotice: agent => refreshNotice(ctx, agents, agent, limit),
+    refreshNotice: agent => refreshNotice(ctx, agents, agent),
   }
 
   // 所有注册走 ctx.effect，随 fiber 卸载可逆清理（宿主 ctx 与 agent ctx 皆是）。
@@ -895,19 +648,8 @@ export function apply(ctx: HostContext, config: unknown): void {
           const agent = (payload as { agent?: AgentShape } | undefined)?.agent
           if (agent === undefined || agent.session === undefined) return
 
-          const view = inspectAgent(ctx, agents, agent, limit)
-
-          // 新会话挂载**之前**先回收：否则"打开一个新会话"会让连接数短暂越过上限，
-          // 而那正是用户抱怨的场景（浏览几个会话就积累数个进程）。
-          //
-          // `reserve: 1` 为新会话预留名额——它此刻还不在记账里，不预留的话
-          // "8 个已有 + 新来的第 9 个"会看到 `8 <= 8` 而不回收，上限实际变成 9。
-          //
-          // 只在**确实要挂载**时回收：本会话不会挂载任何东西（没有 `.mcp.json`、
-          // 未批准、计划是 `skip`）时也回收，就会平白拆掉别的会话的连接——而打开一个
-          // 与 MCP 无关的项目会话是很常见的动作。
+          const view = inspectAgent(ctx, agents, agent)
           if (view.plan.kind === 'mount') {
-            reclaimOverLimit(ctx, agents, limit, 1)
             mountInto(ctx, agents, McpClient, agent, view.plan.configs)
           }
 
@@ -918,66 +660,6 @@ export function apply(ctx: HostContext, config: unknown): void {
         }
       }),
     'project-mcp:agent-created',
-  )
-
-  /**
-   * `agent/pre-step`：**重挂的唯一落点**（每次发消息都会触发）。
-   *
-   * ## 为什么是这里而不是 `agent/created`
-   *
-   * agent 活着时发消息**不会**再触发 `agent/created`——那个事件只在
-   * startup / resume / clear / compact 时触发。因此被回收的会话必须靠 `pre-step` 重挂。
-   *
-   * ## 必须 `return next()`
-   *
-   * `agent/pre-step` 是 **waterfall**（`packages/core/agent/src/runtime-types.ts:320`）。
-   * 不调用 `next()` 会**否决整条链**，包括内置的默认行为——会话将无法进入下一步。
-   * 本插件只是顺带记账与重挂，**不拥有**这个决策，因此必须原样把决策交还给链上的
-   * 下一个监听者（`skills/cordis-plugin-development/references/practices.md` 第 16 行：
-   * "A waterfall listener that does not own the decision must return `next()`"）。
-   *
-   * ## 行为边界：重挂后**当次请求看不到新工具**
-   *
-   * `agent/pre-step` 在 `systemPrompt.assemble` **之后**才触发
-   * （`packages/core/agent-loop/src/agent.ts:272` 是 assemble、`:277` 才是 pre-step），
-   * 而工具面是 assemble 的产物。因此重挂后**当次请求的工具列表仍是旧的**，
-   * **下一轮**才可见。这是本落点的固有边界，不试图绕过（见 `docs/behavior.md`）。
-   *
-   * ## 不抛异常
-   *
-   * 本监听器在会话的每一步上运行：抛错会让整条 waterfall 失败、打断用户的消息。
-   * 全部逻辑包在 try/catch 里，失败只记日志并照常 `return next()`。
-   */
-  ctx.effect(
-    () =>
-      ctx.on('agent/pre-step', (payload: unknown, next: () => unknown) => {
-        try {
-          const agent = (payload as { agent?: AgentShape } | undefined)?.agent
-          if (agent !== undefined && agent.session !== undefined) {
-            // 每次发消息都推一次时间戳：这正是"最后活跃时间"的语义。
-            touch(agents, agent, Date.now())
-
-            // 被回收过（`servers` 为空）且计划是 `mount` 时重挂。
-            if (needsRemount(agents, agent)) {
-              const view = inspectAgent(ctx, agents, agent, limit)
-              if (view.plan.kind === 'mount') {
-                mountInto(ctx, agents, McpClient, agent, view.plan.configs)
-                ctx.logger?.warn?.(
-                  `project-mcp：会话「${agentKeyOf(agent) ?? '(id 不可用)'}」的项目级 MCP 连接已重新挂载（本次请求的工具列表仍是旧的，下一轮可见）`,
-                )
-              }
-            }
-
-            // 顺带回收：发消息是"有会话在动"的最强信号，也是最自然的检查时机。
-            reclaimOverLimit(ctx, agents, limit)
-          }
-        } catch (error) {
-          ctx.logger?.warn?.(`project-mcp：pre-step 维护失败：${message(error)}`)
-        }
-        // 必须调用：本插件不拥有这个决策（见上面的说明）。
-        return next()
-      }),
-    'project-mcp:agent-pre-step',
   )
 
   // agent 销毁时把插件侧的登记项也清掉：`AgentRegistrations` 用 Map（可迭代）而

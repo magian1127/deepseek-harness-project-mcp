@@ -24,8 +24,6 @@ approve it per project.
 | Global name-collision guard | A project server sharing a name with a global profile MCP row is not mounted twice |
 | No double mount for subagents | A subagent session (`origin === 'subagent'`) shares its parent's workspace, so no extra connection or child process is created; a forked session is an independent conversation and is mounted normally |
 | Non-intrusive | With no `.mcp.json` the plugin stays completely silent; session notices appear only when you need to act |
-| Bounded, self-healing connections | At most **8 sessions** hold connections by default (a stdio child process measures ~73 MB). Over the limit the plugin reclaims the **least recently active idle** sessions, and a reclaimed session **remounts on its next message**. A busy session is never interrupted — when every session is `running`, the limit is ignored |
-| Configurable limit | `connectionLimit` on the plugin page (default 8) |
 
 ## Requirements
 
@@ -131,7 +129,6 @@ subcommand spellings.
 | Data | Location | Contents |
 | --- | --- | --- |
 | Trust record | `${DSH_HOME:-~/.dsh}/project-mcp-trust.json` (mode `0600`) | Version, project root paths, approval timestamps, `.mcp.json` content fingerprints (`sha256:<hex>`), and the approved server names |
-| Connection limit | `config` of the `dsh-project-mcp` profile row (editable on the plugin page) | A single number, default 8 |
 
 - The trust file contains **no** `.mcp.json` contents and **no** expanded environment values.
 - `.mcp.json` is read-only: this plugin never writes or manages it.
@@ -139,8 +136,6 @@ subcommand spellings.
   messages, session records, or disk.
 - When a variable is undefined with no default, that server is skipped and the diagnostic names the
   **variable**, never its value.
-- "Last active" timestamps live in memory only and are **never persisted** (restarting DSH resets
-  them); reclaim logs carry the **session id** and a connection count only.
 - The plugin makes no network requests of its own, collects no telemetry, and keeps no persistent
   data beyond the trust file.
 
@@ -148,8 +143,7 @@ subcommand spellings.
 
 | Limitation | Detail |
 | --- | --- |
-| Per-session connections | A project server under N sessions means N connections and child processes (a global profile row has one). **Over the limit (8 sessions by default) the connections of idle sessions are reclaimed** — see below. A stdio server gets `--project-mcp-session <session id>` appended after the `args` from `.mcp.json`, so you can tell which session owns a process — the rest of the command line is byte-identical across sessions for the same `.mcp.json`. The marker carries the session id only, never any configuration content, and servers ignore unknown arguments, so it does not affect runtime |
-| Connection limit and reclaim | The DSH WebUI has no "close session": opening any session in the sidebar mounts a connection (a stdio child process measures ~73 MB), and DSH has no idle reclamation of its own. So above **8 sessions** (configurable) the plugin reclaims the connections of the **least recently active** **idle** sessions. When every session is busy the limit is ignored — a working session is never interrupted. A reclaimed session **remounts on its next message**, but **that request still sees the old tool list; the tools appear on the following turn** (remounting happens after system-prompt assembly) |
+| Per-session connections | A project server under N sessions means N connections and child processes (a global profile row has one). A stdio server gets `--project-mcp-session <session id>` appended after the `args` from `.mcp.json`, so you can tell which session owns a process — the rest of the command line is byte-identical across sessions for the same `.mcp.json`. The marker carries the session id only, never any configuration content, and servers ignore unknown arguments, so it does not affect runtime |
 | First message may miss the tools | Mounting does not wait for the MCP connection; instant sessions cost the first message's tool visibility, which returns on the next turn |
 | Unsupported transports | `sse` / `ws` / `sdk` are always skipped; SSE is deprecated in the MCP spec and mainstream servers offer `streamable-http` |
 | Disabled global rows still claim the name | The collision check looks only at a row's module name and `serverName`, not at `disabled: true`; a disabled row therefore makes a same-named project server skip as "already provided globally" while the global side never connects |
