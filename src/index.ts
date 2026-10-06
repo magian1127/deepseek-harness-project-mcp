@@ -18,6 +18,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 
+import { errorName, validateMountConfig } from './config-guard.js'
 import { readProjectMcpFile, findProjectRoot } from './discovery.js'
 import { collectGlobalServerNames } from './global-rows.js'
 import { renderNotice } from './notice.js'
@@ -73,21 +74,15 @@ function readFileUtf8(path: string): string {
   return readFileSync(path, 'utf8')
 }
 
-/** 取错误消息文本；非 Error 抛出物降级为字符串。 */
+/**
+ * 取错误消息文本；非 Error 抛出物降级为字符串。
+ *
+ * 只用于**本插件自己产生**的错误（命令层写盘失败、提示段拆除失败等），其消息体
+ * 不含 `.mcp.json` 内容。凡是错误可能携带 config 的位置一律改用 `errorName()`
+ * （见 `config-guard.ts` 的说明）。
+ */
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
-}
-
-/**
- * 取错误的**类型名**，绝不含消息体。
- *
- * 供 Config 校验可能失败的日志点使用（见 `mountInto`）：schemastery 的 union 校验错误
- * 会把整个 config（含展开后的 `env` / `headers` 凭据）拼进 `message`，因此这些位置
- * 只能记类型名。`String(error)` 对非 Error 抛出物可能回显构造时的入参，同样不用。
- */
-function errorName(error: unknown): string {
-  if (error instanceof Error) return error.name
-  return typeof error
 }
 
 /**
@@ -190,8 +185,17 @@ function disposeServers(ctx: HostContext, servers: Map<string, PluginFiberShape>
  * （`packages/mcp/mcp-client/src/index.ts`），第二个实例会在 `apply` 内抛错，
  * 结果是"批准成功但挂载没生效"。
  *
+ * **非法配置在这里就被拦下**（`validateMountConfig`），永远不会到达 `ctx.plugin()`：
+ * `ctx.plugin()` 内部的 `_resolveConfig` 失败会抛 `ValidationError`，而 Cordis 在
+ * `_reload` 的 catch 里把它整条记进日志（`vendor/cordis/src/fiber.ts:659-663`）。
+ * 那条消息由 schemastery 的 union 错误拼成
+ * （`vendor/schemastery/src/index.ts:834` 的 `` `expected ... but got ${JSON.stringify(data)}` ``），
+ * 含**整个 config**——包括展开后的 `env` / `headers` 凭据。插件侧改记 `errorName()`
+ * 只能堵住自己的记录点，堵不住 Cordis 那一处；只有在挂载前自校验才能同时覆盖两者。
+ *
  * 不 await 返回的 fiber：只挂一个拒绝处理器，避免启动失败变成未处理拒绝
- * （`failOnStartupError: false` 时 `mcp-client` 本身不会抛，但 Config 校验失败会）。
+ * （`failOnStartupError: false` 时 `mcp-client` 本身不会抛，但 `apply` 内仍可能抛，
+ * 例如 serverName 在 agent scope 内已被别的实例占用）。
  */
 function mountInto(
   ctx: HostContext,
@@ -212,21 +216,30 @@ function mountInto(
 
   for (const config of configs) {
     if (servers.has(config.serverName)) continue
+
+    // 自校验：不通过就跳过并记安全诊断，绝不交给 ctx.plugin()。诊断只含服务器名与
+    // 字段路径/错误类型，不含任何配置值（红线 3）。
+    const guarded = validateMountConfig(McpClient, config)
+    if (!guarded.ok) {
+      ctx.logger?.error?.(
+        `project-mcp：项目级 MCP 服务器「${config.serverName}」的配置未通过 schema 校验，已跳过挂载（${guarded.reason}）`,
+      )
+      continue
+    }
+
     try {
-      const fiber = agentCtx.plugin(McpClient, config)
+      const fiber = agentCtx.plugin(McpClient, guarded.config)
       // fiber 登记在插件侧：插件卸载时由 apply 的 effect 统一 dispose（见
       // AgentRegistrations）。agent 销毁时 agent.ctx 也会回收它，两条路径都成立。
       servers.set(config.serverName, fiber)
       // 只观察启动结果，不阻塞：`then` 走 `fiber.await()`，不触发 dispose。
       //
       // 刻意**不**透传 `message(error)`：fiber 拒绝的一种来源是 Config 校验失败，而
-      // schemastery 的 union 错误消息是
-      // `` `expected ${toString()} but got ${JSON.stringify(data)}` ``
-      // （`vendor/schemastery/src/index.ts:834`），会把**整个 config** 回显进日志——
-      // 其中含 `env` / `headers` 里展开后的凭据，直接违反红线 3。逐字段核对表明当前
-      // 插件产出的 config 全部通过 mcp-client 的 schema（因此这条路径目前不可达），
-      // 但只要上游给 Config 加一个必填字段，它立刻变成真实泄密。只记固定文本与
-      // `error.name`（不含消息体），保持可诊断又不带出配置内容。
+      // schemastery 的 union 错误消息会把**整个 config**（含展开后的 `env` / `headers`
+      // 凭据）回显进日志，直接违反红线 3。上面的自校验已让**非法 config 不可能**走到
+      // 这里，因此这条日志实际只承载 `apply` 内的启动失败（连接、工具同步、重名等）；
+      // 但校验器将来若放行、或 mcp-client 的 Config 与 schema 分叉，它仍是最后一道
+      // 防线，所以口径保持"只记固定文本与 `error.name`"。
       fiber.then(undefined, (error: unknown) => {
         ctx.logger?.warn?.(
           `project-mcp：项目级 MCP 服务器「${config.serverName}」启动失败（错误类型：${errorName(error)}）`,
