@@ -129,3 +129,74 @@ test('translateServer 使用规范化后的 serverName', () => {
   assert.equal(result.kind, 'ok')
   if (result.kind === 'ok') assert.match(result.serverName, /^[A-Za-z0-9_-]{1,32}$/)
 })
+
+// —— 回归守卫：`env` / `headers` 的 `__proto__` 键不得被静默丢弃 ——
+//
+// 键来自**不受信**的 `.mcp.json`。用朴素的 `record[key] = item` 落盘时，`__proto__`
+// 会命中原型 setter 而被静默丢弃（字符串值 → no-op）：服务器拿到缺一个变量的环境，
+// 认证失败却没有任何诊断，而指纹把该键算在内——用户批准的内容与实际生效的不一致。
+// `trust.ts` 的 `canonicalValue` 出于同一原因用 `Object.fromEntries`，并有对应守卫
+// （`trust.test.mts`）；下面两个用例补上 `translate.ts` 的同一处加固。
+
+test('translateServer 保留 env 里的 __proto__ 键', () => {
+  const entry = JSON.parse('{"command":"x","env":{"__proto__":"X","OK":"v"}}')
+  const result = translateServer('s', entry, { cwd: '/w', env: {} })
+  assert.equal(result.kind, 'ok')
+  if (result.kind === 'ok' && result.config.transport === 'stdio') {
+    const env = result.config.env
+    assert.equal(Object.hasOwn(env, '__proto__'), true)
+    assert.equal(env['__proto__'], 'X')
+    assert.equal(env.OK, 'v')
+    // 键必须是自有数据属性，而不是改写结果对象的原型
+    assert.equal(Object.getPrototypeOf(env), Object.prototype)
+  }
+})
+
+test('translateServer 保留 headers 里的 __proto__ 键', () => {
+  const entry = JSON.parse('{"type":"http","url":"https://x","headers":{"__proto__":"Y","H":"v"}}')
+  const result = translateServer('h', entry, { cwd: '/w', env: {} })
+  assert.equal(result.kind, 'ok')
+  if (result.kind === 'ok' && result.config.transport === 'streamable-http') {
+    const headers = result.config.headers
+    assert.equal(Object.hasOwn(headers, '__proto__'), true)
+    assert.equal(headers['__proto__'], 'Y')
+    assert.equal(headers.H, 'v')
+  }
+})
+
+test('translateServer 保留展开后落在 __proto__ 上的 env 键', () => {
+  const result = translateServer(
+    's',
+    { command: 'x', env: { '${K}': 'v' } },
+    { cwd: '/w', env: { K: '__proto__' } },
+  )
+  assert.equal(result.kind, 'ok')
+  if (result.kind === 'ok' && result.config.transport === 'stdio') {
+    assert.equal(Object.hasOwn(result.config.env, '__proto__'), true)
+    assert.equal(result.config.env['__proto__'], 'v')
+  }
+})
+
+// —— 回归守卫：展开后必须复查非空 ——
+//
+// 非空检查原本在展开**之前**，于是 `${CMD:-}` 展开成空串后照常返回 `ok`。`command`
+// 的 schema 是 `z.string().required()`（不校验非空），空串会一路走到 `spawn('')` 才抛
+// "The argument 'file' cannot be empty"，只落一条日志，而 `/mcp-project` 仍把它列为
+// 已挂载——`behavior.md` §3 承诺的是"跳过该条"。
+
+test('translateServer 在 command 展开为空串时跳过', () => {
+  const result = translateServer('e', { command: '${CMD:-}' }, { cwd: '/w', env: {} })
+  assert.equal(result.kind, 'skip')
+  if (result.kind === 'skip') assert.match(result.reason, /command/)
+})
+
+test('translateServer 在 command 展开为已定义空串时跳过', () => {
+  const result = translateServer('e', { command: '${CMD}' }, { cwd: '/w', env: { CMD: '' } })
+  assert.equal(result.kind, 'skip')
+})
+
+test('translateServer 在 url 展开为空串时跳过', () => {
+  const result = translateServer('u', { type: 'http', url: '${U:-}' }, { cwd: '/w', env: {} })
+  assert.equal(result.kind, 'skip')
+  if (result.kind === 'skip') assert.match(result.reason, /url/)
+})

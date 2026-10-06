@@ -173,9 +173,11 @@ lib, cordis.patch.yml, README.md, README.en.md, LICENSE, docs, !docs/plans,
 src, !src/tests, tsconfig.json, tsconfig.tests.json
 ```
 
-没有 `files` 时 `npm pack` 会把 `.superpowers/`、`src/tests`、`docs/plans/`、
-`tsconfig*.json` 与 `package-lock.json` 全部打包（实测 65 个文件）。加了之后是 56 个，
-且上述内容均不在其中。改动 `files` 后必须重跑 `npm pack --dry-run` 核对。
+没有 `files` 时 `npm pack` 会把 `.superpowers/`、`src/tests`、`docs/plans/` 与
+`package-lock.json` 全部打包（实测 65 个文件）。加了之后是 **61** 个（`npm pack --dry-run`
+实测），且上述内容均不在其中。注意 `tsconfig.json` 与 `tsconfig.tests.json` **在**
+`files` 里、也**确实**在 tarball 里——它们是有意发布的，不要把它们列进"不应含"清单。
+改动 `files` 后必须重跑 `npm pack --dry-run` 核对。
 
 ## 7. 测试策略
 
@@ -189,19 +191,19 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 | 类型 | `tsc --noEmit` | `npm run typecheck` |
 | 打包 | tarball 内容 | `npm pack --dry-run` |
 
-### 7.2 测试文件与用例数（当前 120）
+### 7.2 测试文件与用例数（当前 129）
 
 | 文件 | 用例 | 覆盖 |
 | --- | --- | --- |
 | `profile-modules.test.mts` | 5 | `--profile` 标志、Electron 默认 `desktop`、非 Electron 默认 `web`、伪值忽略、`DSH_HOME/profiles/<name>` 落点 |
 | `discovery.test.mts` | 10 | 向上找最近的 `.git`、无 `.git` 回退 cwd、`absent` / 非法 JSON / 顶层非对象 / `mcpServers` 非对象、缺 `mcpServers` 按空、原文透传用于指纹 |
-| `translate.test.mts` | 23 | `normalizeServerName` 六态、`expandVariables` 六态（含原型链）、`translateServer` 的 stdio / http / 别名 / sse / ws / 无 type 有 url / 非对象 / 缺 command / 变量缺失 / env 展开 / 规范名 |
+| `translate.test.mts` | 29 | `normalizeServerName` 六态、`expandVariables` 六态（含原型链）、`translateServer` 的 stdio / http / 别名 / sse / ws / 无 type 有 url / 非对象 / 缺 command / 变量缺失 / env 展开 / 规范名、**`env` 与 `headers` 的 `__proto__` 键保留三态（含展开后落在该键上）**、**`command` / `url` 展开为空串时跳过** |
 | `trust.test.mts` | 25 | 指纹稳定性与敏感性（空白、键序、新增条目、`__proto__`、超深嵌套）、读写往返、失败关闭四态、`isApproved` 四态、`approve` / `revoke` 不改入参 |
 | `global-rows.test.mts` | 9 | 收集 `mcp-client` 行、忽略非 mcp-client / 缺 `serverName` / 非字符串、`loader` 缺失或形状不符或 `entries()` 抛错时降级空集、嵌套子树 |
-| `session.test.mts` | 14 | 无 cwd、子代理两种判据、无文件静默跳过、未信任、已信任、指纹失配、撞名跳过、损坏文件、结构错误、全候选被跳过时不要求批准、规范化去重、未知传输、变量缺失诊断 |
+| `session.test.mts` | 16 | 无 cwd、子代理判据（`origin` 单条）、**分叉会话（有 `parentSession`、无 `origin`）应当挂载 / 未批准时进入 untrusted**、**两者同时存在时仍跳过**、无文件静默跳过、未信任、已信任、指纹失配、撞名跳过、损坏文件、结构错误、全候选被跳过时不要求批准、规范化去重、未知传输、变量缺失诊断 |
 | `plugin-smoke.test.mts` | 6 | `apply` 注册与注销、`agent/created` 监听可逆、`renderNotice` 四态 |
 | `commands.test.mts` | 14 | 未批准仍显示诊断、部分批准同时可见、空 `configs` 说明、**"已挂载"取自真实记账（计划要挂但没挂上时不谎报）**、**挂载后文件改动仍按记账呈现**、trust 用计划键、幂等（含回报去重）、未知名字报错、untrust 卸载、**untrust 刷新提示段**、**trust 刷新顺序（落盘→挂载→刷新）**、**写盘失败不刷新**、**无项目根不刷新**、未知子命令、无 agent |
-| `mount.test.mts` | 14 | 未批准不挂载（安全断言）、挂载带 `failOnStartupError: false`、loader 传本体、重复 trust 幂等、插件卸载回收、agent 销毁清理、loader 缺失诊断、commands 缺失诊断、`inject` 声明、**批准后提示段被撤下**、**撤销后提示段刷新为待批准**、**文件消失后提示段撤下**、**会话 B 不谎报已挂载**、**trust 回报实际挂载结果** |
+| `mount.test.mts` | 15 | 未批准不挂载（安全断言）、挂载带 `failOnStartupError: false`、loader 传本体、重复 trust 幂等、插件卸载回收、agent 销毁清理、loader 缺失诊断、commands 缺失诊断、`inject` 声明、**批准后提示段被撤下**、**撤销后提示段刷新为待批准**、**文件消失后提示段撤下**、**会话 B 不谎报已挂载**、**trust 回报实际挂载结果**、**挂载失败日志只记错误类型、不回显展开后的 env 值** |
 
 ### 7.3 Review Focus 的守护位置
 
@@ -229,7 +231,7 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 
 ## 8 验证分层与未验证项
 
-**已由测试与命令覆盖**：上表 120 个用例、`npm run typecheck`、`npm pack --dry-run` 的
+**已由测试与命令覆盖**：上表 129 个用例、`npm run typecheck`、`npm pack --dry-run` 的
 tarball 内容。
 
 **未在真实 DSH 运行时验证**（需要真实 profile 与会话，无法在纯单元测试中覆盖）：

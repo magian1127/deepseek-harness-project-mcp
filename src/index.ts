@@ -79,6 +79,18 @@ function message(error: unknown): string {
 }
 
 /**
+ * 取错误的**类型名**，绝不含消息体。
+ *
+ * 供 Config 校验可能失败的日志点使用（见 `mountInto`）：schemastery 的 union 校验错误
+ * 会把整个 config（含展开后的 `env` / `headers` 凭据）拼进 `message`，因此这些位置
+ * 只能记类型名。`String(error)` 对非 Error 抛出物可能回显构造时的入参，同样不用。
+ */
+function errorName(error: unknown): string {
+  if (error instanceof Error) return error.name
+  return typeof error
+}
+
+/**
  * 原子写信任存储：`0600` + 文件锁（规格 §7.1）。
  *
  * `writeTrustStore` 只接受**同步** writer，而 `@deepseek-ai/dsh-atomic-write` 的
@@ -206,14 +218,25 @@ function mountInto(
       // AgentRegistrations）。agent 销毁时 agent.ctx 也会回收它，两条路径都成立。
       servers.set(config.serverName, fiber)
       // 只观察启动结果，不阻塞：`then` 走 `fiber.await()`，不触发 dispose。
+      //
+      // 刻意**不**透传 `message(error)`：fiber 拒绝的一种来源是 Config 校验失败，而
+      // schemastery 的 union 错误消息是
+      // `` `expected ${toString()} but got ${JSON.stringify(data)}` ``
+      // （`vendor/schemastery/src/index.ts:834`），会把**整个 config** 回显进日志——
+      // 其中含 `env` / `headers` 里展开后的凭据，直接违反红线 3。逐字段核对表明当前
+      // 插件产出的 config 全部通过 mcp-client 的 schema（因此这条路径目前不可达），
+      // 但只要上游给 Config 加一个必填字段，它立刻变成真实泄密。只记固定文本与
+      // `error.name`（不含消息体），保持可诊断又不带出配置内容。
       fiber.then(undefined, (error: unknown) => {
         ctx.logger?.warn?.(
-          `project-mcp：项目级 MCP 服务器「${config.serverName}」启动失败：${message(error)}`,
+          `project-mcp：项目级 MCP 服务器「${config.serverName}」启动失败（错误类型：${errorName(error)}）`,
         )
       })
     } catch (error) {
+      // 同步抛出同样可能是 Config 校验（`ctx.plugin()` 内部 resolveConfig 是同步的），
+      // 因此这里的诊断口径与上面一致。
       ctx.logger?.error?.(
-        `project-mcp：挂载项目级 MCP 服务器「${config.serverName}」失败：${message(error)}`,
+        `project-mcp：挂载项目级 MCP 服务器「${config.serverName}」失败（错误类型：${errorName(error)}）`,
       )
     }
   }

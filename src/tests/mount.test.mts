@@ -487,3 +487,52 @@ test('trust 回报的是实际挂载结果，不是请求挂载的 configs', asy
   assert.doesNotMatch(out.text, /本会话已挂载：/, `挂载失败时不得回报"已挂载"：${out.text}`)
   assert.match(out.text, /本会话没有可挂载的服务器/)
 })
+
+// —— 回归守卫：挂载失败的日志不得回显 config ——
+//
+// fiber 拒绝的一种来源是 Config 校验失败，而 schemastery 的 union 错误消息是
+// `` `expected ${toString()} but got ${JSON.stringify(data)}` ``
+// （`vendor/schemastery/src/index.ts:834`），会把**整个 config**——含展开后的
+// `env` / `headers` 凭据——拼进 message。透传 `message(error)` 会让这条日志成为真实
+// 泄密通道（违反红线 3）。逐字段核对表明当前插件产出的 config 全部通过 mcp-client 的
+// schema，因此该路径目前**不可达**；但只要上游给 Config 加一个必填字段它立刻可达。
+//
+// 下面的用例让 fiber 以一个"回显了整个 config"的错误拒绝，断言日志里既留下可查诊断、
+// 又**不含**展开后的值。改回 `message(error)` 会让这条用例变红。
+
+test('挂载失败的日志只记错误类型，不回显展开后的 env 值', async () => {
+  const secret = 'placeholder-token-not-a-real-credential'
+  process.env.PROJECT_MCP_TEST_TOKEN = secret
+  const project = makeProject({
+    alpha: { command: 'node', env: { TOKEN: '${PROJECT_MCP_TEST_TOKEN}' } },
+  })
+  approveAll(project, ['alpha'])
+  const harness = createHarness()
+  apply(harness.host as never, {})
+  const agent = harness.makeAgent(project)
+
+  // 模拟 Config 校验失败：错误消息里带整个 config（含已展开的 env）。
+  agent.ctx.plugin = (_module: unknown, config: unknown) => {
+    const error = new Error(`expected Config but got ${JSON.stringify(config)}`)
+    error.name = 'ValidationError'
+    const fiber = {
+      disposed: 0,
+      dispose: async () => { fiber.disposed += 1 },
+      then: (_onOk?: unknown, onErr?: (e: unknown) => unknown) =>
+        Promise.resolve().then(() => { throw error }).catch(onErr as never),
+    }
+    return fiber
+  }
+
+  harness.fire('agent/created', { agent })
+  await new Promise(resolve => setTimeout(resolve, 0))
+
+  const joined = harness.logs.map(entry => entry.message).join('\n')
+  assert.match(joined, /启动失败/, `应留下可查诊断：${joined}`)
+  assert.match(joined, /ValidationError/, `诊断应含错误类型：${joined}`)
+  assert.equal(
+    joined.includes(secret),
+    false,
+    `日志不得回显展开后的环境变量值：${joined}`,
+  )
+})

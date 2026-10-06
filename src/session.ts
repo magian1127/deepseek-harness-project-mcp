@@ -15,6 +15,12 @@ import type { TrustStore } from './trust.js'
 import type { McpClientConfig } from './types.js'
 
 export interface SessionMountInput {
+  /**
+   * 会话 header 的最小投影。
+   *
+   * `parentSession` 只作为**形状**保留（真实 header 里存在该字段，测试夹具也用它构造
+   * 分叉会话），**不是**判据——见 `planSessionMount` 第 2 步。
+   */
   header: { cwd?: string; parentSession?: unknown; origin?: string }
   projectExists: (p: string) => boolean
   readFile: (p: string) => string
@@ -40,14 +46,27 @@ interface Candidate {
 type SkipNote = { name: string; reason: string }
 
 export function planSessionMount(input: SessionMountInput): SessionMountPlan {
-  const { cwd, parentSession, origin } = input.header
+  const { cwd, origin } = input.header
 
   // 1. 没有工作区就无从定位项目（规格 §5）。
   if (cwd === undefined) return { kind: 'skip', reason: '会话没有工作区（header.cwd 缺失）' }
 
   // 2. 子代理与父会话共享工作区，重复建连接与子进程没有意义（规格 §9）。
-  if (parentSession !== undefined || origin === 'subagent') {
-    return { kind: 'skip', reason: '子代理会话（parentSession 或 origin=subagent）不挂载项目 MCP' }
+  //
+  //    判据是 `origin === 'subagent'` **单条**，`parentSession` 不参与。原因：分叉会话
+  //    （fork）也会写 `parentSession`，但它**不带** `origin`，是独立会话——DSH 注释
+  //    "A fork shares the lineage field without the origin and is an independent
+  //    conversation"（`packages/subagent/subagent/src/archive-admission.ts:45-46`），
+  //    fork 的创建路径只写 `parentSession: source.header.id`
+  //    （`packages/api/session-controller/src/commands.ts:274-281`）。仓库既有的正确判据
+  //    同样是"两者都要"：`archive-admission.ts:53` 写
+  //    `if (parentSession === undefined || origin !== 'subagent') continue`。
+  //
+  //    旧实现用 `parentSession !== undefined || origin === 'subagent'`，把用户可见的
+  //    分叉会话误判成子代理：既不挂载项目 MCP，也不注入提示（skip 是静默的），
+  //    `/mcp-project` 还会给出错误理由。
+  if (origin === 'subagent') {
+    return { kind: 'skip', reason: '子代理会话（origin=subagent）不挂载项目 MCP' }
   }
 
   // 3. 从工作区向上找项目根；走到根都没有则用 cwd 本身。

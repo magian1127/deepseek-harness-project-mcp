@@ -79,10 +79,15 @@ src/
   discovery.ts        项目根发现、.mcp.json 读取与解析
   translate.ts        .mcp.json 条目 → McpClient.Config
   trust.ts            信任存储读写（原子写 + 文件锁）
+  global-rows.ts      从 Loader 树收集全局 mcp-client 行的 serverName（§8）
   session.ts          agent/created 钩子：解析 → 查信任 → 挂载
   commands.ts         /mcp-project 斜杠命令
-  notice.ts           未信任 / 跳过原因的系统提示注入
+  notice.ts           系统提示注入（只在用户需行动时非空：未信任 / 无法解析）
 ```
+
+`notice.ts` 的 `renderNotice` 只对 `untrusted` 与 `invalid` 返回非空文本——**跳过原因
+不进提示**，它们只走 `/mcp-project`（§12）。`global-rows.ts` 与 `session.ts` 等模块一样
+只承担一件事、互不依赖，通过注入 I/O 保持可彻底单测。
 
 `apply` 只做三件事：注册命令、订阅 `agent/created`、注册系统提示段。**它自己不连接任何 MCP，也不缓存全局名单**（§8.1）。
 
@@ -121,7 +126,7 @@ DSH 运行时模块（`@deepseek-ai/dsh-*`、`@deepseek-ai/schemastery`）**不�
 ```
 agent/created（串行事件，在排队输入运行前完成）
   │
-  ├─ 子代理？ header.origin === 'subagent' → 跳过（§9）
+  ├─ 子代理？ header.origin === 'subagent' → 跳过（§9；分叉会话不带 origin，照常判定）
   │
   ├─ cwd = agent.session.header.cwd
   │    undefined → 跳过（无工作区无法定位项目）
@@ -266,14 +271,26 @@ HMR 重载本插件自身时，`apply` 重新执行，名单自然重建。
 
 `agent/created` 的 `source` 参数只有 `'startup' | 'resume' | 'clear' | 'compact'`，**不区分主会话与子代理**。
 
-子代理靠 session header 判断（仓库既有做法，`packages/subagent/subagent/src/archive-admission.ts:52-53`）：
+子代理靠 session header 的 `origin` 判断（仓库既有做法，`packages/subagent/subagent/src/archive-admission.ts:52-53`）：
 
 ```ts
-const { parentSession, origin } = agent.session.header
-if (parentSession !== undefined || origin === 'subagent') → 跳过
+const { origin } = agent.session.header
+if (origin === 'subagent') → 跳过
 ```
 
-理由：子代理与父会话共享工作区，重复建连接与子进程没有意义。
+**判据是 `origin === 'subagent'` 单条，`parentSession` 不参与。** 分叉会话（fork）同样写
+`parentSession`，但它**不带** `origin`，是独立会话：DSH 注释 "A fork shares the lineage field
+without the origin and is an independent conversation"（`archive-admission.ts:45-46`），fork 的
+创建路径只写 `parentSession: source.header.id`（`packages/api/session-controller/src/commands.ts:274-281`）。
+仓库既有的判据同样是"两者都要"：`archive-admission.ts:53` 写
+`if (parentSession === undefined || origin !== 'subagent') continue`。
+
+> 修订记录：本规格早期版本写成 `parentSession !== undefined || origin === 'subagent'`，并误引
+> `archive-admission.ts` 为依据。那会把用户可见的**分叉会话**误判成子代理——既不挂载项目 MCP
+> 也不注入提示（skip 是静默的），`/mcp-project` 还会给出错误理由。判据已按上述修正。
+
+理由：子代理与父会话共享工作区，重复建连接与子进程没有意义。分叉会话是独立会话，有自己的
+工作区生命周期，因此照常参与挂载判定。
 
 ## 10. 环境变量展开与凭据
 
@@ -286,6 +303,15 @@ if (parentSession !== undefined || origin === 'subagent') → 跳过
   理由：带未展开的 `${VAR}` 字面量启动，几乎必然导致服务器认证失败，且错误难以理解。
 - **空串是已定义的值**：`${VAR:-default}` 在 `VAR=''` 时取空串，**不**取 default。这与 bash 的 `${VAR-default}`（不带冒号）一致，与 `${VAR:-default}`（带冒号，空串也取 default）不同。
   理由：判定条件是 `Object.hasOwn(env, VAR) && env[VAR] !== undefined`（只认自有属性，避免命中原型链成员如 `toString`），与"未定义"的字面语义一致；且空串往往是用户显式设置的结果，静默替换成 default 会掩盖配置意图。
+- **展开后必须复查非空**：`command` 与 `url` 的类型检查在展开**之前**，因此展开结果可能是空串
+  （`${CMD:-}`、或 `CMD=''` 时的 `${CMD}`）。下游 schema（`z.string().required()`）只要求字符串、
+  **不**校验非空，空 `command` 会一路走到 `spawn('')` 才抛 `The argument 'file' cannot be empty`，
+  只落一条日志，而 `/mcp-project` 仍把它列为已挂载。因此展开为空串时按"变量未定义"同样处理：
+  **跳过该条 + 诊断**（`behavior.md` §3 的字段表承诺的就是这个行为）。
+- **`env` / `headers` 的键是普通数据键**：展开后的键与值用 `Object.fromEntries` 落盘，
+  `__proto__` 这类键名必须是自有数据属性而不是改写结果对象的原型。否则朴素赋值会静默丢弃
+  该键——服务器拿到缺一个变量的环境、认证失败却无诊断，而指纹把该键算在内（`trust.ts` 的
+  `canonicalValue` 出于同一原因用 `fromEntries`，`translate.ts` 此处是同一处加固）。
 - 展开在内存中进行，不落盘。
 
 ## 11. 命令
@@ -323,6 +349,7 @@ if (parentSession !== undefined || origin === 'subagent') → 跳过
 
 - **会话提示**（`ctx.systemPrompt.section()`）只用于**用户需要采取行动**的情形：`.mcp.json` 解析失败（`invalid`）、有可挂载项但尚未批准（`untrusted`）。理由：提示会占用模型上下文，只在用户需要做决定时才值得。
 - **`/mcp-project` 命令输出**承载**诊断信息**：每条服务器的跳过原因、规范化重命名、`mcpServers` 缺失、"文件里没有可用服务器"等。用户主动查询时看到，不打扰会话。
+- **挂载失败的日志只记错误类型**，不透传 `message(error)`：fiber 拒绝的一种来源是 Config 校验失败，而 schemastery 的 union 错误消息是 `` `expected ${toString()} but got ${JSON.stringify(data)}` ``（`vendor/schemastery/src/index.ts:834`），会把**整个 config**——含展开后的 `env` / `headers` 凭据——回显进日志，违反红线 3。逐字段核对表明插件当前产出的 config 全部通过 `mcp-client` 的 schema，因此该路径目前**不可达**；但只要上游给 Config 加一个必填字段它立刻可达。因此这条日志固定为"服务器名 + `error.name`"，既保留可查诊断，又不带出配置内容。其余 `message(error)` 调用点（dispose / 提示段拆除 / agent 清理）的异常来自 Cordis 内部而非 Config 校验，不涉配置内容，保持原样。
 
 因此"跳过 + 警告"里的"警告"一律指 `/mcp-project` 的可见条目（外加必要时的一条 `ctx.logger.warn`），**不是**会话提示。这条区分是任务 6 评审发现的缺口：`mcpServers` 缺失时计划形状是 `mount` + 空 `configs` + 空 `skipped`，两个面都没有落点，用户无从知晓自己的 `.mcp.json` 是空的。
 
@@ -347,7 +374,7 @@ if (parentSession !== undefined || origin === 'subagent') → 跳过
 - 创建带 cwd 的 agent，断言 `mcp__<name>__<tool>` 出现 / 不出现
 - 批准路径：批准 → 挂载；改文件 → 不挂载；撤销 → 卸载
 - 撞名：全局行存在时，同名项目服务器不挂载
-- 子代理：子代理不重复挂载
+- 子代理：子代理（`origin === 'subagent'`）不重复挂载；分叉会话不带 `origin`，照常参与
 
 ### 13.3 非阻塞
 

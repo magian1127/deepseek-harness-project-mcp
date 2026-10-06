@@ -72,13 +72,14 @@ index.ts ──> session.ts ──> discovery.ts, translate.ts, trust.ts, global
 ```powershell
 npm install
 npm run typecheck                        # tsc -p tsconfig.json --noEmit
-npm test                                 # 120 个用例，9 个测试文件
+npm test                                 # 129 个用例，9 个测试文件
 npm pack --dry-run                       # 核对 tarball 内容（files 字段）
 (Get-Content AGENTS.md).Count            # 必须 ≤ 200
 ```
 
 改动 `package.json` 的 `files` 字段后**必须**重跑 `npm pack --dry-run`，确认 tarball 不含
-`.superpowers/`、`src/tests`、`docs/plans/`、`tsconfig*.json` 与 `package-lock.json`。
+`.superpowers/`、`src/tests`、`docs/plans/` 与 `package-lock.json`（`tsconfig.json` 与
+`tsconfig.tests.json` 在 `files` 里，**应当**在 tarball 里）。
 
 单独跑一个测试文件：
 

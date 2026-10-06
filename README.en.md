@@ -22,7 +22,7 @@ approve it per project.
 | Two transports | `stdio` and `streamable-http` (`http` is an alias) |
 | Variable expansion | `command` / `args` / `env` / `url` / `headers` support `${VAR}` and `${VAR:-default}` |
 | Global name-collision guard | A project server sharing a name with a global profile MCP row is not mounted twice |
-| No double mount for subagents | Subagents share their parent's workspace, so no extra connection or child process is created |
+| No double mount for subagents | A subagent session (`origin === 'subagent'`) shares its parent's workspace, so no extra connection or child process is created; a forked session is an independent conversation and is mounted normally |
 | Non-intrusive | With no `.mcp.json` the plugin stays completely silent; session notices appear only when you need to act |
 
 ## Requirements

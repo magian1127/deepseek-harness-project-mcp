@@ -28,9 +28,44 @@ test('子代理被跳过', () => {
   if (plan.kind === 'skip') assert.match(plan.reason, /subagent/i)
 })
 
-test('有 parentSession 的会话被跳过', () => {
+// —— 回归守卫：`parentSession` 不是子代理判据 ——
+//
+// fork（分叉会话）同样写 `parentSession`，但**不带** `origin`，是独立会话：DSH 注释
+// "A fork shares the lineage field without the origin and is an independent
+// conversation"（`packages/subagent/subagent/src/archive-admission.ts:45-46`），fork
+// 的创建路径只写 `parentSession: source.header.id`
+// （`packages/api/session-controller/src/commands.ts:274-281`）。仓库既有的正确判据是
+// 两者都要（`archive-admission.ts:53`）。
+//
+// 旧实现用 `parentSession !== undefined || origin === 'subagent'`，把用户可见的分叉
+// 会话误判成子代理：既不挂载项目 MCP 也不注入提示，且 skip 是静默的。下面的用例把
+// 正确行为钉死——只改判据、不删用例。
+
+test('fork 会话（有 parentSession、无 origin）应当挂载', () => {
+  const raw = '{"mcpServers":{"gh":{"command":"npx","args":["-y","srv"]}}}'
+  const trust = approve(EMPTY_TRUST, '/repo', fingerprint(raw), ['gh'], 't')
+  const plan = planSessionMount(inputOf({
+    header: { cwd: '/repo', parentSession: 'p1' },
+    trust,
+  }))
+  assert.equal(plan.kind, 'mount')
+  if (plan.kind === 'mount') {
+    assert.deepEqual(plan.configs.map(c => c.serverName), ['gh'])
+  }
+})
+
+test('fork 会话未批准时进入 untrusted（不静默跳过）', () => {
   const plan = planSessionMount(inputOf({ header: { cwd: '/repo', parentSession: 'p1' } }))
+  assert.equal(plan.kind, 'untrusted')
+  if (plan.kind === 'untrusted') assert.deepEqual(plan.pending, ['gh'])
+})
+
+test('同时带 parentSession 与 origin=subagent 时仍被跳过', () => {
+  const plan = planSessionMount(inputOf({
+    header: { cwd: '/repo', parentSession: 'p1', origin: 'subagent' },
+  }))
   assert.equal(plan.kind, 'skip')
+  if (plan.kind === 'skip') assert.match(plan.reason, /subagent/i)
 })
 
 test('无 .mcp.json 时静默跳过', () => {

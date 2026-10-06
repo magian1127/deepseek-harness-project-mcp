@@ -98,31 +98,45 @@ function asStringArray(value: unknown): string[] | null {
   return items
 }
 
-/** 校验并复制字符串记录（`env` / `headers`）；形状不对返回 null。 */
+/**
+ * 校验并复制字符串记录（`env` / `headers`）；形状不对返回 null。
+ *
+ * 用 `Object.fromEntries` 而不是 `record[key] = item`：键来自**不受信**的 `.mcp.json`，
+ * 字面写 `"__proto__": "X"` 时，朴素赋值会命中原型 setter 而被静默丢弃（字符串值
+ * 不满足 setter 的对象要求 → no-op），服务器拿到缺一个变量的环境，认证失败却没有任何
+ * 诊断；而指纹把该键算在内，用户批准的内容与实际生效的内容不一致。`trust.ts` 的
+ * `canonicalValue` 出于同一原因用 `fromEntries`（见该处注释与 `trust.test.mts` 的
+ * `__proto__` 用例），本模块此前漏了同一处加固。
+ */
 function asStringRecord(value: unknown): Record<string, string> | null {
   if (!isPlainObject(value)) return null
-  const record: Record<string, string> = {}
+  const pairs: [string, string][] = []
   for (const [key, item] of Object.entries(value)) {
     if (typeof item !== 'string') return null
-    record[key] = item
+    pairs.push([key, item])
   }
-  return record
+  return Object.fromEntries(pairs)
 }
 
-/** 展开字符串记录（`env` / `headers`）的键与值；任一变量缺失即返回其名字。 */
+/**
+ * 展开字符串记录（`env` / `headers`）的键与值；任一变量缺失即返回其名字。
+ *
+ * 展开后的**键**同样可能撞上 `__proto__`（`"${K}"` 在 `K='__proto__'` 时展开出该名字），
+ * 因此落盘同样走 `Object.fromEntries`，理由与 `asStringRecord` 相同。
+ */
 function expandRecord(
   record: Record<string, string>,
   env: Record<string, string | undefined>,
 ): { value: Record<string, string> } | { missing: string } {
-  const expanded: Record<string, string> = {}
+  const pairs: [string, string][] = []
   for (const [key, raw] of Object.entries(record)) {
     const expandedKey = expandVariables(key, env)
     if ('missing' in expandedKey) return expandedKey
     const expandedValue = expandVariables(raw, env)
     if ('missing' in expandedValue) return expandedValue
-    expanded[expandedKey.value] = expandedValue.value
+    pairs.push([expandedKey.value, expandedValue.value])
   }
-  return { value: expanded }
+  return { value: Object.fromEntries(pairs) }
 }
 
 /** 展开字符串列表（`args`）；任一变量缺失即返回其名字。 */
@@ -171,6 +185,13 @@ function translateStdio(
 
   const expandedCommand = expandVariables(command, options.env)
   if ('missing' in expandedCommand) return missingVariable(expandedCommand.missing)
+  // 展开**之后**必须复查非空：`${CMD:-}`（或 `${CMD}` 且 `CMD=''`）会展开成空串，
+  // 而 `command` 的 schema 是 `z.string().required()`，**不**校验非空——空串会一路
+  // 走到 `spawn('')` 才抛 "The argument 'file' cannot be empty"，只落一条日志，
+  // 而 `/mcp-project` 仍把它列为已挂载。此处按 §3 的承诺跳过并给出诊断。
+  if (expandedCommand.value === '') {
+    return { kind: 'skip', reason: 'command 展开后为空字符串' }
+  }
   const expandedArgs = expandList(rawArgs, options.env)
   if ('missing' in expandedArgs) return missingVariable(expandedArgs.missing)
   const expandedEnv = expandRecord(rawEnv, options.env)
@@ -212,6 +233,11 @@ function translateHttp(
 
   const expandedUrl = expandVariables(url, options.env)
   if ('missing' in expandedUrl) return missingVariable(expandedUrl.missing)
+  // 同 `translateStdio`：`${URL:-}` 会展开成空串，而 `url` 的 schema 同样只要求
+  // 是字符串，空串要到连接阶段才失败，且 `/mcp-project` 会误报已挂载。
+  if (expandedUrl.value === '') {
+    return { kind: 'skip', reason: 'url 展开后为空字符串' }
+  }
   const expandedHeaders = expandRecord(rawHeaders, options.env)
   if ('missing' in expandedHeaders) return missingVariable(expandedHeaders.missing)
 

@@ -21,7 +21,7 @@ DSH 的 MCP 配置原本只有 profile（进程）作用域：写进 profile 补
 | 两种传输 | `stdio` 与 `streamable-http`（`http` 是别名） |
 | 变量展开 | `command` / `args` / `env` / `url` / `headers` 支持 `${VAR}` 与 `${VAR:-default}` |
 | 全局撞名保护 | 与 profile 全局 MCP 行同名的项目服务器不重复挂载 |
-| 子代理不重复挂载 | 子代理会话与父会话共享工作区，不重复建连接与子进程 |
+| 子代理不重复挂载 | 子代理会话（`origin === 'subagent'`）与父会话共享工作区，不重复建连接与子进程；分叉会话是独立会话，照常挂载 |
 | 不打扰 | 没有 `.mcp.json` 时完全静默；只有需要你采取行动时才注入会话提示 |
 
 ## 环境要求

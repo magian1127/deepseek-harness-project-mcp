@@ -902,9 +902,13 @@ test('子代理被跳过', () => {
   if (plan.kind === 'skip') assert.match(plan.reason, /subagent/i)
 })
 
-test('有 parentSession 的会话被跳过', () => {
-  const plan = planSessionMount(inputOf({ header: { cwd: '/repo', parentSession: 'p1' } }))
-  assert.equal(plan.kind, 'skip')
+// 已修正：分叉会话（有 parentSession、无 origin）是独立会话，**应当挂载**。
+// 原计划里的「有 parentSession 的会话被跳过」用例把错误行为锁死了，已改写为正确断言。
+test('fork 会话（有 parentSession、无 origin）应当挂载', () => {
+  const raw = '{"mcpServers":{"gh":{"command":"npx","args":["-y","srv"]}}}'
+  const trust = approve(EMPTY_TRUST, '/repo', fingerprint(raw), ['gh'], 't')
+  const plan = planSessionMount(inputOf({ header: { cwd: '/repo', parentSession: 'p1' }, trust }))
+  assert.equal(plan.kind, 'mount')
 })
 
 test('无 .mcp.json 时静默跳过', () => {
@@ -1040,7 +1044,10 @@ export type SessionMountPlan =
 纯函数，不做任何 I/O——所有副作用由调用方注入，便于测试。算法（规格 §5）：
 
 1. `header.cwd` 缺失 → `skip`
-2. `header.parentSession !== undefined || header.origin === 'subagent'` → `skip`（子代理，规格 §9）
+2. ~~`header.parentSession !== undefined || header.origin === 'subagent'` → `skip`（子代理，规格 §9）~~
+   **已修正：判据只有 `header.origin === 'subagent'` 一条**（`parentSession` 不参与——分叉会话
+   带 `parentSession` 但无 `origin`，是独立会话，应当挂载）。理由与依据见
+   [`docs/design.md` 第 9 节](../design.md#9-子代理)。
 3. `findProjectRoot(cwd, projectExists)`
 4. `readProjectMcpFile(projectRoot, readFile)`：`absent` → `skip` 且 `silent: true`；`invalid` → `invalid`
 5. `fp = fingerprint(raw)`
