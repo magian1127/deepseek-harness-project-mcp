@@ -73,7 +73,7 @@ deepseek-harness-project-mcp/
 └── AGENTS.md
 ```
 
-**职责边界**：`session.ts` 是纯函数（无 I/O），全部副作用经参数注入——这是它可被彻底单测的原因。`index.ts` 是唯一做真实 I/O 与 Cordis 交互的模块，因此它的测试是"假 ctx"冒烟而非穷尽单测。`discovery.ts` / `translate.ts` / `trust.ts` / `global-rows.ts` 各自只承担一件事，互不依赖，可并行实现。
+**职责边界**：`session.ts` 是纯函数（无 I/O），全部副作用经参数注入——这是它可被彻底单测的原因。`index.ts` 是唯一做**会话数据** I/O 与 Cordis 交互的模块，因此它的测试是"假 ctx"冒烟而非穷尽单测（`profile-modules.ts` 做 profile 模块解析的真实 I/O，是显式例外，见 `AGENTS.md` 的"唯一做 I/O"的准确范围）。`discovery.ts` / `translate.ts` / `trust.ts` / `global-rows.ts` 各自只承担一件事，互不依赖，可并行实现。
 
 **依赖方向**（单向，无环）：
 
