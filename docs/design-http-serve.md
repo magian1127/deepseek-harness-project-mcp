@@ -113,16 +113,55 @@ HTTP 模式下 DSH **不 spawn 子进程**（`packages/mcp/mcp-client/src/transp
 
 **但仍需在文档中明示**：`serve` 模式下，首次打开会话可能等待最多 `readyTimeoutMs`。
 
-### 4.3 spawn 方式：detached
+### 4.3 spawn 方式：必须脱离 DSH 存活（硬要求）
 
-**必须 detached**，理由：
-- 服务要**跨 DSH 会话存活**（多会话共享）
-- 服务要**在 DSH 退出后仍可存活**（由服务自己空闲自退，用户决策 ③）
-- 若绑定 DSH 进程树，DSH 退出会带走它——但用户已选择"服务自己管"
+**用户明确要求**：*"拉起服务的方式不要用子进程的方式，要保证 DSH 关掉 MCP 服务还在"*。
 
-**实测发现**：用 PowerShell `Start-Process` 启动的服务，在调用者进程退出后**会死**（第一次实验 PID 17068 消失）。所以必须用真正的 detached 方式（Node 的 `child_process.spawn` + `detached: true` + `stdio: 'ignore'` + `unref()`）。
+服务必须**跨 DSH 进程存活**，理由：
+- 多个 DSH 实例（或 DSH 重启）应复用同一个服务
+- 服务自己管生命周期（空闲自退），DSH 不该是它的 owner
 
-**启动后不持有子进程句柄**：插件不 `kill` 它、不 await 它退出——生命周期归服务自己。
+#### 已验证的事实
+
+| 事实 | 证据 |
+| --- | --- |
+| Node `spawn({detached:true, stdio:'ignore'})` + `unref()` **能让服务脱离直接父进程存活** | 实测：spawn 后父脚本退出，服务 PID 43448 仍存活、`/health/live`=Healthy |
+| **DSH 的 Job 对象不影响独立 spawn** | `createKillOnCloseJob`（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`）只用于 `spawnJobProcess`（`packages/subprocess/win32-process/src/process.ts:340,422`），出口是 `spawnInheritedJobProcess` / `spawnCurrentTokenJobProcess` —— **DSH 自己的沙箱子进程**，不是任意外部 spawn |
+| 当前 DSH 不在 Job 里 | 进程链 `node.exe ← cmd.exe ← powershell.exe ← pwsh.exe ← explorer.exe`（普通 explorer 启动链） |
+| 孤儿进程确实能长期存活 | 当前 MudMCP 服务 PID 44696 的父进程已退出，它仍运行 10+ 分钟 |
+
+#### 实现要求
+
+```js
+const child = spawn(command, args, {
+  detached: true,          // 新进程组，不随父进程的信号
+  stdio: 'ignore',         // 不继承任何管道（否则父进程退出会触发 EPIPE / 阻塞）
+  windowsHide: true,       // 不弹控制台窗口
+  env: { ...process.env, ...serveEnv },
+})
+child.unref()              // 不持有句柄，不阻塞事件循环
+```
+
+**启动后立即 `unref()` 并丢弃 `child` 引用**：插件**不** kill 它、**不** await 它退出、**不**监听它的 exit 事件。生命周期完全归服务自己。
+
+#### 参考实现：AIVC 的三层策略
+
+`D:\Projects\My\AIVirtualCompany` 的 `DaemonLaunchers.cs` 用了更完整的三层（本插件**不需要**这么复杂，但值得记录）：
+
+| 层 | 方式 | 位置 |
+| --- | --- | --- |
+| 1 | **计划任务**（`schtasks /create /run`）—— 最强脱离 | `ScheduledTaskDaemonLauncher.cs:108-171` |
+| 2 | 直接 `CreateProcess`（`CREATE_BREAKAWAY_FROM_JOB` + 新进程组 + 不继承句柄） | `WindowsProcessStarter.cs:20,44` |
+| 3 | 退化子进程 | `DaemonLaunchers.cs:405` |
+
+**为什么本插件用 Node 的 detached 就够**：AIVC 的守护进程是被**IDE**（VS Code / ZCode 等）启动的，那些 IDE 可能把自己放进 Job 对象，所以需要 `BREAKAWAY`。而 DSH 从 explorer 启动、不在 Job 里（已实测），Node 的 `detached` 已足够。
+
+**但要在文档中标注这个前提**：若将来 DSH 被放入 Job（例如由某个 IDE 或计划任务启动），脱离可能失败。届时需要退化为 AIVC 那样的方案，或接受"服务随 DSH 退出"。
+
+#### 待实测（实现后必须验证）
+
+**"DSH 退出时，由 DSH spawn 的服务能否存活"** —— 这条**只能等 `serve` 实现后实测**（当前的 44696 是我手动启的，不能证明 DSH spawn 的情形）。
+
 
 ### 4.4 并发保护
 
