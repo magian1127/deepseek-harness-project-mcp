@@ -23,6 +23,7 @@
 | 模块 | 职责 | I/O |
 | --- | --- | --- |
 | `index.ts` | 插件入口 `apply`：装配命令、订阅 `agent/created` 与 `agent/disposed`、挂载与卸载、写信任存储 | **唯一做真实 I/O 与 Cordis 交互的模块** |
+| `config-guard.ts` | 挂载前的 Config 自校验（`validateMountConfig`）与只记类型名的 `errorName` | 纯函数 |
 | `types.ts` | 宿主服务的最小鸭子类型（`HostContext` / `AgentContext` / `CommandsService` / `SystemPromptService` / `LoaderService` / `AgentShape` / `McpClientConfig`） | 无 |
 | `profile-modules.ts` | 从当前 profile 的模块解析上下文解析并预载 DSH 运行时模块 | 模块解析 + 文件读 |
 | `discovery.ts` | 项目根发现（向上找 `.git`）、`.mcp.json` 读取与解析 | 纯函数 + 注入 I/O |
@@ -39,6 +40,7 @@
 index.ts ──> session.ts ──> discovery.ts, translate.ts, trust.ts, global-rows.ts
    │                              │
    ├──> commands.ts, notice.ts    └──> types.ts
+   ├──> config-guard.ts ──> types.ts
    └──> profile-modules.ts
 ```
 
@@ -185,17 +187,20 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 
 | 层 | 覆盖 | 命令 |
 | --- | --- | --- |
-| 纯函数单测 | `discovery` / `translate` / `trust` / `global-rows` / `session` / `notice` | `npm test` |
-| 装配集成 | `plugin-smoke`（假 ctx，验证注册与清理可逆）、`commands`（注入 `CommandDeps`，验证命令输出）、`mount`（真实 fs + 假 agent ctx，验证挂载路径） | `npm test` |
-| 模块解析 | `profile-modules`（`--profile` 解析、`DSH_HOME` 落点） | `npm test` |
+| 纯函数单测 | `discovery` / `translate` / `trust` / `global-rows` / `session` / `notice` / `config-guard` | `npm test` |
+| 装配集成 | `plugin-smoke`（假 ctx，验证注册与清理可逆）、`commands`（注入 `CommandDeps`，验证命令输出）、`mount`（真实 fs + 假 agent ctx，验证挂载路径）、`mount-guard`（真实 fs + 假 mcp-client，验证非法 config 被拦在 `ctx.plugin()` 之前） | `npm test` |
+| 模块解析 | `profile-modules`（`--profile` 解析、`DSH_HOME` 落点）、`profile-config-contract`（对**已安装的 profile 模块**断言 `Config['~standard']` 契约） | `npm test` |
 | 类型 | `tsc --noEmit` | `npm run typecheck` |
 | 打包 | tarball 内容 | `npm pack --dry-run` |
 
-### 7.2 测试文件与用例数（当前 129）
+### 7.2 测试文件与用例数（当前 159）
 
 | 文件 | 用例 | 覆盖 |
 | --- | --- | --- |
 | `profile-modules.test.mts` | 5 | `--profile` 标志、Electron 默认 `desktop`、非 Electron 默认 `web`、伪值忽略、`DSH_HOME/profiles/<name>` 落点 |
+| `config-guard.test.mts` | 20 | 合法放行与规范化值回传、`value` 缺失时退回原配置、非法 `serverName` / 缺失 `command` 的诊断只含字段路径、无 `path` 时的通用摘要、`env` 键名可入诊断、不可信 path 段整条作废（含 `=`、超长、换行、非原始值、symbol）、数组下标合法、段数上限截断、**根级 union 无 `path` 时下钻 union 成员取字段**、成员抛错/返回 thenable 不影响主判定、非 union 不下钻、空 `issues` 视为失败、异步校验拦下、校验抛错只记类型名、非对象结果拦下、schema 缺失放行、`validate` 以 `~standard` 为接收者调用、`errorName` 只回类型名 |
+| `mount-guard.test.mts` | 4 | **schema 不通过时非法 config 被拦在 `ctx.plugin()` 之前且日志不含敏感值**、**多条非法配置全部拦下**、**被拦下的项不进挂载记账**、**命令层 trust 路径共用同一守卫** |
+| `profile-config-contract.test.mts` | 6 | 对**已安装的 profile 模块**断言：`Config` 是带 `~standard` 的 schemastery union、`validate` 同步、合法返回补齐默认值的 `value`、**非法时 `issue.message` 回显整个 config（泄密源）**、`validateMountConfig` 在真实 schema 上放行合法/拦下非法且不泄漏 |
 | `discovery.test.mts` | 10 | 向上找最近的 `.git`、无 `.git` 回退 cwd、`absent` / 非法 JSON / 顶层非对象 / `mcpServers` 非对象、缺 `mcpServers` 按空、原文透传用于指纹 |
 | `translate.test.mts` | 29 | `normalizeServerName` 六态、`expandVariables` 六态（含原型链）、`translateServer` 的 stdio / http / 别名 / sse / ws / 无 type 有 url / 非对象 / 缺 command / 变量缺失 / env 展开 / 规范名、**`env` 与 `headers` 的 `__proto__` 键保留三态（含展开后落在该键上）**、**`command` / `url` 展开为空串时跳过** |
 | `trust.test.mts` | 25 | 指纹稳定性与敏感性（空白、键序、新增条目、`__proto__`、超深嵌套）、读写往返、失败关闭四态、`isApproved` 四态、`approve` / `revoke` 不改入参 |
@@ -216,6 +221,22 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 | 同名服务器同时存在于全局行与 `.mcp.json` | `session.test.mts`「与全局行撞名的服务器被跳过」+ `mount.test.mts`「loader 传的是 Loader 本体」 |
 | 信任文件损坏或未知版本 | `trust.test.mts` 四条失败关闭用例 |
 | 批准后文件被修改（含 `git pull` 拉入新条目） | `trust.test.mts`「对新增条目敏感」+ `session.test.mts`「指纹不匹配时回到未信任」 |
+| 上游给 `Config` 加了必填字段 → 插件产出的配置不再满足 schema | `profile-config-contract.test.mts`（对真实 schema 断言）+ `mount-guard.test.mts`（非法 config 被拦在 `ctx.plugin()` 之前，日志不含展开后的 env 值） |
+
+### 7.3.1 为什么自校验必须在 `mountInto` 里
+
+`ctx.plugin()` 内部先跑 `resolveConfig`（`vendor/cordis/src/fiber.ts:641-644`），失败即抛
+`ValidationError`，而 **Cordis 自己在 `_reload` 的 catch 里把该异常整条记进日志**
+（同文件 `:659-663`）。schemastery 的 union 错误消息是
+`` `expected ${toString()} but got ${JSON.stringify(data)}` ``
+（`vendor/schemastery/src/index.ts:834`），会把**整个 config**——含展开后的 `env` /
+`headers` 凭据——写进日志。因此：
+
+- 只在插件**自己**的日志点改记 `errorName()` 是不够的，堵不住 Cordis 那一处；
+- 唯一根治办法是让非法 config **永远到不了** `ctx.plugin()`：`config-guard.ts` 在挂载前
+  用同一份 schema 先校验，不通过就跳过并记一条只含服务器名与字段路径的诊断；
+- 守卫放在 `mountInto`（而不是事件回调）里，因为挂载有**两个入口**
+  （`agent/created` 与 `/mcp-project trust`），放错位置只堵住一半。
 
 ### 7.4 测试夹具手法
 
@@ -231,7 +252,7 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 
 ## 8 验证分层与未验证项
 
-**已由测试与命令覆盖**：上表 129 个用例、`npm run typecheck`、`npm pack --dry-run` 的
+**已由测试与命令覆盖**：上表 159 个用例、`npm run typecheck`、`npm pack --dry-run` 的
 tarball 内容。
 
 **未在真实 DSH 运行时验证**（需要真实 profile 与会话，无法在纯单元测试中覆盖）：

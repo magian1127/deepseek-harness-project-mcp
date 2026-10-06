@@ -45,6 +45,7 @@
 | 模块 | 职责 |
 | --- | --- |
 | `src/index.ts` | 插件入口 `apply`：装配命令、订阅 `agent/created` / `agent/disposed`、挂载与卸载、写信任存储。**唯一做真实 I/O 与 Cordis 交互的模块** |
+| `src/config-guard.ts` | 挂载前的 Config 自校验（非法配置拦在 `ctx.plugin()` 之前）与只记类型名的 `errorName` |
 | `src/types.ts` | 宿主服务的最小鸭子类型（不 import `@deepseek-ai/*`） |
 | `src/profile-modules.ts` | 从当前 profile 解析并预载 DSH 运行时模块 |
 | `src/discovery.ts` | 项目根发现（向上找 `.git`）、`.mcp.json` 读取与解析 |
@@ -61,18 +62,19 @@
 index.ts ──> session.ts ──> discovery.ts, translate.ts, trust.ts, global-rows.ts
    │                              │
    ├──> commands.ts, notice.ts    └──> types.ts
+   ├──> config-guard.ts ──> types.ts
    └──> profile-modules.ts
 ```
 
-`session.ts` / `translate.ts` / `discovery.ts` / `trust.ts` / `global-rows.ts` 各自只承担
-一件事、互不依赖，全部通过注入 I/O 保持可彻底单测。
+`session.ts` / `translate.ts` / `discovery.ts` / `trust.ts` / `global-rows.ts` /
+`config-guard.ts` 各自只承担一件事、互不依赖，全部通过注入 I/O 保持可彻底单测。
 
 ## 本地验证命令
 
 ```powershell
 npm install
 npm run typecheck                        # tsc -p tsconfig.json --noEmit
-npm test                                 # 129 个用例，9 个测试文件
+npm test                                 # 159 个用例，12 个测试文件
 npm pack --dry-run                       # 核对 tarball 内容（files 字段）
 (Get-Content AGENTS.md).Count            # 必须 ≤ 200
 ```
