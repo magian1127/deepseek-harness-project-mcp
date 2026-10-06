@@ -139,7 +139,7 @@ server") live in `/mcp-project` output rather than session notices. Session noti
 | Global rows are out of scope | MCP rows in profile patches still connect at DSH startup; this plugin can detect and warn, not prevent |
 | Exact module-name match | Global-row detection requires the row's module name to be **exactly** `@deepseek-ai/dsh-mcp-client`; subpath or relative forms are missed |
 | Profiles without a `commands` service | This plugin injects `commands` / `loader` / `systemPrompt`; on a profile lacking one (e.g. `sdk-minimal`) it stays inactive, so `/mcp-project` does not appear either |
-| Session notices do not refresh on approval | A notice is generated when the session is **created**, so an older notice stays until the session restarts; trust `/mcp-project` output instead |
+| Mounting happens only at session creation or on this session's own approval | After another session approves, this session's plan already reads "approved" but the servers are not mounted into it automatically; `/mcp-project` lists them under "approved but not mounted in this session", and running `/mcp-project trust` mounts them |
 
 ## Uninstall
 

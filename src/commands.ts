@@ -53,6 +53,19 @@ export interface ProjectInspection {
    * 此时计划是 `skip`）时回退到 `plan.skipped`。
    */
   skipped: Array<{ name: string; reason: string }>
+  /**
+   * 本会话**实际**挂载的项目服务器名（插件侧挂载记账，按挂载顺序）。
+   *
+   * 刻意不取 `plan.configs`：计划回答"按当前信任状态**应当**挂什么"，与"现在什么是
+   * 活的"是两件事。会话 A 批准后，此前已创建、`agent/created` 早已触发过的会话 B 的
+   * 计划同样是 `mount`，但 B 一个服务器都没挂上——按计划渲染会让 `/mcp-project` 把
+   * "计划要挂"报成"已挂载"，而这条命令的唯一职责就是回答后者。
+   *
+   * 反方向的偏差同样存在：会话存续期间 `.mcp.json` 被改动或删除后，计划会退回
+   * `untrusted` / `skip`，而先前挂上的服务器仍在（本插件不监听文件变化）。因此状态行
+   * 与这份名单是**两个独立口径**，不一致时必须并列呈现，不能相互代言。
+   */
+  mounted: string[]
 }
 
 /** 命令执行结果，对齐 DSH `CommandResult`（本插件只产出这两态）。 */
@@ -72,6 +85,30 @@ export interface CommandDeps {
   mountInto(agent: AgentShape, configs: McpClientConfig[]): void
   /** 卸载该 agent 已挂载的全部项目服务器。 */
   unmountFrom(agent: AgentShape): void
+  /**
+   * 读该 agent **当前实际挂载**的项目服务器名（插件侧记账，无 I/O）。
+   *
+   * 与 `inspect().mounted` 同源，单独暴露是为了让 `runTrust` 在挂载之后如实回报
+   * "这次到底挂上了什么"，而不是照抄它请求挂载的 `configs`——两者在 mcp-client
+   * 缺失、`ctx.plugin` 抛错或同名已挂载时会分叉。
+   */
+  mountedServers(agent: AgentShape): string[]
+  /**
+   * 把该会话的提示段刷新到**当前计划**：先撤下旧段，再按新计划重注入或留空。
+   *
+   * 为什么必须由命令层调用：`injectNotice` 原本只在 `agent/created` 触发，于是用户
+   * 走完主流程（首次会话 → 提示未批准 → `/mcp-project trust` → 挂载成功）后，提示段
+   * 仍写着"本会话未启用任何项目级 MCP"——模型在整个会话剩余时间里被持续误导，而这
+   * 恰恰是最常见的路径。
+   *
+   * 实现按 `renderNotice(当前计划)` 重新求值，因此批准与撤销走同一条路径：批准后
+   * `mount` 计划渲染出空串（撤下旧段），撤销后 `untrusted` 计划渲染出新的待批准文本
+   * （替换旧段）。两个方向都收敛到"提示段 == 当前计划"，与会话创建时的口径一致。
+   *
+   * 撤下与重注入必须成对：同一 scope 内重名 section 会抛错，不先拆除旧段就无法用新
+   * 文本替换它。
+   */
+  refreshNotice(agent: AgentShape): void
 }
 
 const COMMAND_NAME = 'mcp-project'
@@ -156,7 +193,13 @@ function renderList(view: ProjectInspection, store: TrustStore): CommandOutcome 
   const { plan, projectRoot } = view
   const approved = approvedNames(view, store)
   const approvedSet = new Set(approved)
-  const mounted = plan.kind === 'mount' ? plan.configs.map(config => config.serverName) : []
+  // 取自**真实挂载记账**（`index.ts` 的 `AgentRegistrations.servers`），不是 `plan.configs`：
+  // 计划回答"按当前信任状态应当挂什么"，本命令回答"现在什么是活的"。两者可以合法地
+  // 不一致（别的会话批准后本会话的计划变成 `mount` 却什么都没挂；或挂载之后
+  // `.mcp.json` 被改动，计划退回 `untrusted` 而旧挂载仍在），因此下面分别呈现，
+  // 不用一个口径去代言另一个。
+  const mounted = view.mounted
+  const mountedSet = new Set(mounted)
   const unapproved = view.mountable.filter(name => !approvedSet.has(name))
   const skipped = skippedNotes(view)
 
@@ -167,6 +210,14 @@ function renderList(view: ProjectInspection, store: TrustStore): CommandOutcome 
   if (mounted.length > 0) {
     lines.push('已挂载（模型可见的工具名为 mcp__<名称>__*）：')
     for (const name of mounted) lines.push(`  - ${name}`)
+  }
+
+  // 计划要挂、但本会话实际没挂上的项：必须在"已挂载"之外单独说明，否则用户会按
+  // 计划误以为工具已就位（会话 B 的典型情形：批准发生在别处，本会话从未挂载）。
+  const plannedNotMounted = approved.filter(name => !mountedSet.has(name))
+  if (plannedNotMounted.length > 0) {
+    lines.push('已批准但本会话未挂载（挂载只发生在会话创建时或本会话执行 trust 时）：')
+    for (const name of plannedNotMounted) lines.push(`  - ${name}`)
   }
 
   if (unapproved.length > 0) {
@@ -184,7 +235,13 @@ function renderList(view: ProjectInspection, store: TrustStore): CommandOutcome 
     for (const item of view.renamed) lines.push(`  - ${item.originalName} → ${item.serverName}`)
   }
 
-  if (mounted.length === 0 && unapproved.length === 0 && skipped.length === 0 && plan.kind === 'mount') {
+  if (
+    mounted.length === 0 &&
+    plannedNotMounted.length === 0 &&
+    unapproved.length === 0 &&
+    skipped.length === 0 &&
+    plan.kind === 'mount'
+  ) {
     // `mcpServers` 缺失与空对象在 `readProjectMcpFile` 里归一到同一个 `{}`，此处无法
     // 区分，如实并列说明，不猜。
     lines.push('（.mcp.json 里没有声明任何服务器。）')
@@ -245,18 +302,27 @@ async function runTrust(
     return { kind: 'error', text: `写入信任存储失败，未做任何改动：${message(error)}` }
   }
 
-  // 按新状态重新检视再挂载：走同一条计划路径，保证 `/mcp-project` 显示与实际挂载一致。
+  // 按新状态重新检视再挂载：走同一条计划路径，保证挂载集合与 `/mcp-project` 同源。
   const after = deps.inspect(agent)
   const configs = after.plan.kind === 'mount' ? after.plan.configs : []
   deps.mountInto(agent, configs)
 
+  // 提示段必须在挂载之后刷新，且刷新的判据是**挂载后的当前计划**：
+  // 走完主流程（首次会话注入"尚未批准" → 这里批准 → 挂载成功）之后，旧提示若留着，
+  // 模型会在整个会话剩余时间里被"本会话未启用任何项目级 MCP"持续误导。
+  // `refreshNotice` 内部按 `renderNotice(新计划)` 求值：`mount` 计划渲染空串 → 撤下。
+  deps.refreshNotice(agent)
+
+  // 如实回报**实际**挂载结果而不是请求挂载的 `configs`：两者在 mcp-client 缺失、
+  // `ctx.plugin` 抛错时会分叉，照抄 `configs` 会让"批准成功但没挂上"变成假象。
+  const mounted = deps.mountedServers(agent)
   const added = servers.filter(name => !already.has(name))
   const lines = [
     added.length === 0
       ? `已批准（无新增）：${servers.join('、')}`
       : `已批准：${added.join('、')}`,
   ]
-  if (configs.length > 0) lines.push(`本会话已挂载：${configs.map(c => c.serverName).join('、')}`)
+  if (mounted.length > 0) lines.push(`本会话已挂载：${mounted.join('、')}`)
   else lines.push('本会话没有可挂载的服务器，运行 /mcp-project 查看原因。')
   return { kind: 'success', text: lines.join('\n') }
 }
@@ -276,6 +342,12 @@ async function runUntrust(agent: AgentShape, deps: CommandDeps): Promise<Command
     return { kind: 'error', text: `写入信任存储失败，未做任何改动：${message(error)}` }
   }
   deps.unmountFrom(agent)
+
+  // 撤销后旧提示同样是错的陈述：会话创建时注入的"尚未批准"已经不再成立（撤销把状态
+  // 推回 `untrusted`，文本其实仍然正确），而更常见的情形是撤销前根本没有提示、撤销后
+  // 反而需要一条。刷新按撤销后的计划重算：`skip`（无 `.mcp.json`）渲染空串 → 撤下；
+  // `untrusted` 渲染新的待批准文本 → 替换旧段。
+  deps.refreshNotice(agent)
 
   return {
     kind: 'success',

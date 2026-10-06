@@ -189,7 +189,7 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 | 类型 | `tsc --noEmit` | `npm run typecheck` |
 | 打包 | tarball 内容 | `npm pack --dry-run` |
 
-### 7.2 测试文件与用例数（当前 110）
+### 7.2 测试文件与用例数（当前 120）
 
 | 文件 | 用例 | 覆盖 |
 | --- | --- | --- |
@@ -200,8 +200,8 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 | `global-rows.test.mts` | 9 | 收集 `mcp-client` 行、忽略非 mcp-client / 缺 `serverName` / 非字符串、`loader` 缺失或形状不符或 `entries()` 抛错时降级空集、嵌套子树 |
 | `session.test.mts` | 14 | 无 cwd、子代理两种判据、无文件静默跳过、未信任、已信任、指纹失配、撞名跳过、损坏文件、结构错误、全候选被跳过时不要求批准、规范化去重、未知传输、变量缺失诊断 |
 | `plugin-smoke.test.mts` | 6 | `apply` 注册与注销、`agent/created` 监听可逆、`renderNotice` 四态 |
-| `commands.test.mts` | 9 | 未批准仍显示诊断、部分批准同时可见、空 `configs` 说明、trust 用计划键、幂等、未知名字报错、untrust 卸载、未知子命令、无 agent |
-| `mount.test.mts` | 9 | 未批准不挂载（安全断言）、挂载带 `failOnStartupError: false`、loader 传本体、重复 trust 幂等、插件卸载回收、agent 销毁清理、loader 缺失诊断、commands 缺失诊断、`inject` 声明 |
+| `commands.test.mts` | 14 | 未批准仍显示诊断、部分批准同时可见、空 `configs` 说明、**"已挂载"取自真实记账（计划要挂但没挂上时不谎报）**、**挂载后文件改动仍按记账呈现**、trust 用计划键、幂等（含回报去重）、未知名字报错、untrust 卸载、**untrust 刷新提示段**、**trust 刷新顺序（落盘→挂载→刷新）**、**写盘失败不刷新**、**无项目根不刷新**、未知子命令、无 agent |
+| `mount.test.mts` | 14 | 未批准不挂载（安全断言）、挂载带 `failOnStartupError: false`、loader 传本体、重复 trust 幂等、插件卸载回收、agent 销毁清理、loader 缺失诊断、commands 缺失诊断、`inject` 声明、**批准后提示段被撤下**、**撤销后提示段刷新为待批准**、**文件消失后提示段撤下**、**会话 B 不谎报已挂载**、**trust 回报实际挂载结果** |
 
 ### 7.3 Review Focus 的守护位置
 
@@ -229,7 +229,7 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 
 ## 8 验证分层与未验证项
 
-**已由测试与命令覆盖**：上表 110 个用例、`npm run typecheck`、`npm pack --dry-run` 的
+**已由测试与命令覆盖**：上表 120 个用例、`npm run typecheck`、`npm pack --dry-run` 的
 tarball 内容。
 
 **未在真实 DSH 运行时验证**（需要真实 profile 与会话，无法在纯单元测试中覆盖）：
@@ -246,15 +246,27 @@ Host 半边没有热通道，验证这些需要由使用者重启一次 DSH。**
 ### 8.1 文档与已提交代码的一致性
 
 本文件与 [`behavior.md`](behavior.md) 描述的是 **HEAD 中实际存在的代码**，不是计划或评审
-记录里声称的行为。已发现两处声称与代码不符（文档按代码写，并记为局限）：
+记录里声称的行为。
 
-- 评审记录声称"批准后刷新会话提示段"已修复，但 HEAD 的 `injectNotice` 只在
-  `agent/created` 调用，`commands.ts` 中无任何刷新调用；
-- 评审记录声称"已挂载"一列改读真实挂载记账，但 HEAD 的 `renderList` 仍取
-  `plan.configs`。
+历史上这里记录过两处"评审记录声称已修复、代码里并不存在"的失配（评审者 A 提出、因分发
+失误未落地），**现已补修并有测试守护**：
 
-核对方法：`Select-String -Path src\*.ts -Pattern 'injectNotice'` 应只命中
-`index.ts` 的定义与 `agent/created` 中的调用点。
+- 批准后刷新会话提示段：`CommandDeps.refreshNotice` 在 `runTrust` / `runUntrust` 写盘之后
+  调用，内部"先撤下、再按 `renderNotice(当前计划)` 重注入或留空"（`index.ts`）；
+- "已挂载"一列改读真实挂载记账：`ProjectInspection.mounted` 由 `index.ts` 的
+  `AgentRegistrations.servers` 提供，`renderList` 不再取 `plan.configs`。
+
+核对方法：
+
+```powershell
+# 刷新必须由命令层调用，而不是只有 agent/created 一处
+Select-String -Path src\*.ts -Pattern 'refreshNotice'
+# "已挂载"不得退回读计划
+Select-String -Path src\commands.ts -Pattern 'plan\.configs'
+```
+
+第一条应命中 `commands.ts`（接口 + 两处调用）与 `index.ts`（定义 + 注入）；第二条应**无**
+命中。守护用例见 §7.2 的 `commands.test.mts` 与 `mount.test.mts` 行。
 
 ## 9. 已知局限（实现层面）
 
@@ -264,8 +276,7 @@ Host 半边没有热通道，验证这些需要由使用者重启一次 DSH。**
 | 模块名精确匹配 | `global-rows.ts` | 行名写成子路径或相对路径时漏检 |
 | `readProjectMcpFile` 把任何读错误当作 `absent` | `discovery.ts` | 无法区分 `ENOENT` 与 `EACCES`；方向是 fail-safe |
 | 每会话独立连接 | `index.ts` | N 个会话 = N 份连接与子进程 |
-| 会话提示不随批准刷新 | `notice.ts` + `index.ts` | 提示段在 `agent/created` 时按当时计划注册一次；`trust` 不重建它，旧提示留存到会话重启。`injectNotice` 对已注入的会话直接返回（同 scope 重名 section 会抛错），因此刷新需要先拆除再注册，尚未实现 |
-| "已挂载"取自计划而非实际挂载记账 | `commands.ts` | 正常路径一致；`untrust` 后 `dispose()` 未完成时立刻重新批准是已知偏差窗口 |
+| 挂载只发生在会话创建时或本会话批准时 | `index.ts` | 别的会话批准后，本会话的计划已是"已批准"但不会自动挂载；`/mcp-project` 把它列在"已批准但本会话未挂载"下，`/mcp-project trust` 即挂上。这是**如实呈现**，不再是口径错误 |
 | 首条消息可能赶不上工具 | `index.ts` | 非阻塞挂载的固有代价 |
 | `findProjectRoot` 不规范化路径 | `discovery.ts` | 同一目录的反斜杠与正斜杠写法在信任存储里是两个键 |
 | `runTrust` 在锁外读、锁内写 | `commands.ts` + `index.ts` | 并发批准不同项目理论上会丢更新 |

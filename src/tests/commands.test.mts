@@ -60,6 +60,8 @@ function deps(overrides: Partial<CommandDeps> & { view: ProjectInspection }): Co
     inspect: () => view,
     mountInto: () => {},
     unmountFrom: () => {},
+    mountedServers: () => [],
+    refreshNotice: () => {},
     ...rest,
   }
 }
@@ -74,6 +76,7 @@ test('未批准状态下仍显示跳过原因与重命名（诊断不被信任�
       mountable: ['ok'],
       renamed: [{ originalName: 'my server', serverName: 'my_server_ab12cd34' }],
       skipped: [{ name: 'global-only', reason: '与全局 MCP 行同名（global-only），已被全局配置提供，跳过' }],
+      mounted: [],
     },
   }))
 
@@ -99,6 +102,9 @@ test('部分批准时未批准项与已挂载项同时可见', async () => {
       mountable: ['alpha', 'beta'],
       renamed: [],
       skipped: [],
+      // "已挂载"一列现在取自**真实挂载记账**（`view.mounted`），不再取 `plan.configs`。
+      // alpha 已批准且本会话确实挂上了，beta 未批准。
+      mounted: ['alpha'],
     },
     readStore: () => ({
       version: 1,
@@ -121,11 +127,65 @@ test('mount 且 configs 为空时说明这份文件没有可挂载的服务器',
       mountable: [],
       renamed: [],
       skipped: [],
+      mounted: [],
     },
   }))
 
   const out = await run('')
   assert.match(out.text, /没有可挂载的服务器/)
+})
+
+test('"已挂载"取自真实挂载记账：计划要挂但本会话没挂上时不谎报', async () => {
+  // 会话 B 的典型情形：会话 A 批准后，B 的计划同样是 `mount`（信任是全局的），
+  // 但 B 的 `agent/created` 早在批准之前就触发过，一个服务器都没挂上。
+  // 若 renderList 退回 `plan.configs`，这里会把"计划要挂"报成"已挂载"，
+  // 而本命令的唯一职责就是回答"现在什么是活的"。
+  const run = harness(deps({
+    view: {
+      projectRoot: '/repo',
+      plan: {
+        kind: 'mount',
+        projectRoot: '/repo',
+        fingerprint: 'sha256:x',
+        configs: [config('alpha')],
+        skipped: [],
+      },
+      mountable: ['alpha'],
+      renamed: [],
+      skipped: [],
+      mounted: [], // ← 真实记账：什么都没挂
+    },
+    readStore: () => ({
+      version: 1,
+      projects: { '/repo': { approvedAt: 't', fingerprint: 'sha256:x', servers: ['alpha'] } },
+    }),
+  }))
+
+  const out = await run('')
+  assert.equal(out.kind, 'success')
+  assert.doesNotMatch(out.text, /已挂载（模型可见的工具名为/, `不得谎报已挂载：${out.text}`)
+  assert.match(out.text, /已批准但本会话未挂载/, `应说明计划已批准但本会话未挂载：${out.text}`)
+  assert.match(out.text, /alpha/)
+})
+
+test('已挂载集合与计划不一致时（挂载后文件被改动）也按记账呈现', async () => {
+  // 反方向偏差：服务器挂上之后 `.mcp.json` 被删除/改动，计划退回 `skip`，
+  // 但先前挂上的服务器仍在（本插件不监听文件变化）。
+  const run = harness(deps({
+    view: {
+      projectRoot: '/repo',
+      plan: { kind: 'skip', reason: '未批准' },
+      mountable: ['alpha'],
+      renamed: [],
+      skipped: [],
+      mounted: ['alpha'], // ← 真实记账：仍活着
+    },
+  }))
+
+  const out = await run('')
+  assert.equal(out.kind, 'success')
+  assert.match(out.text, /已挂载/)
+  assert.match(out.text, /alpha/)
 })
 
 test('trust 用计划携带的 projectRoot 与 fingerprint 写存储', async () => {
@@ -136,6 +196,7 @@ test('trust 用计划携带的 projectRoot 与 fingerprint 写存储', async () 
     mountable: ['gh'],
     renamed: [],
     skipped: [],
+    mounted: [],
   }
   const run = harness(deps({
     view,
@@ -167,6 +228,7 @@ test('trust 幂等：重复批准不重复挂载同一 serverName', async () => 
     mountable: ['gh'],
     renamed: [],
     skipped: [],
+    mounted: ['gh'],
   })
   const run = harness(deps({
     view: view(),
@@ -174,15 +236,21 @@ test('trust 幂等：重复批准不重复挂载同一 serverName', async () => 
     readStore: () => store,
     writeStore: async next => { store = next },
     mountInto: (_agent, configs) => { for (const c of configs) mounted.push(c.serverName) },
+    // 挂载记账去重后与 `mountInto` 的调用次数无关：真实层里同名 fiber 只登记一次。
+    mountedServers: () => [...new Set(mounted)],
   }))
 
-  await run('trust')
-  await run('trust')
+  const first = await run('trust')
+  const second = await run('trust')
   // 命令层**刻意**每次都按当前计划调用 `mountInto`：它不知道也不需要知道哪些
   // serverName 已经在 agent scope 里挂过。幂等由挂载层负责，其回归守护在
   // `mount.test.mts` 的「重复 trust 只挂载一次（幂等）」——那里注入真实的
   // `agent.ctx.plugin` 假实现，直接断言 plugin 的调用次数。
   assert.deepEqual(mounted, ['gh', 'gh'], '命令层每次都按当前计划挂载，幂等由挂载层负责')
+  // 但**回报**必须按记账去重后的真实集合，否则用户会以为挂了两次。
+  assert.match(first.text, /本会话已挂载：gh/)
+  assert.match(second.text, /本会话已挂载：gh/)
+  assert.equal(second.text.match(/gh/g)?.length, 2, `回报不应重复列出 gh：${second.text}`)
 })
 
 test('trust 指定未知服务器名时报错，不写存储', async () => {
@@ -194,6 +262,7 @@ test('trust 指定未知服务器名时报错，不写存储', async () => {
       mountable: ['gh'],
       renamed: [],
       skipped: [],
+      mounted: [],
     },
     writeStore: async () => { writes += 1 },
   }))
@@ -204,12 +273,13 @@ test('trust 指定未知服务器名时报错，不写存储', async () => {
   assert.equal(writes, 0, '未知名字不得写入信任存储')
 })
 
-test('untrust 撤销批准并卸载本会话挂载', async () => {
+test('untrust 撤销批准、卸载本会话挂载，并刷新提示段', async () => {
   let store: TrustStore = {
     version: 1,
     projects: { '/repo': { approvedAt: 't', fingerprint: 'sha256:x', servers: ['gh'] } },
   }
   let unmounted = 0
+  const refreshes: string[] = []
   const run = harness(deps({
     view: {
       projectRoot: '/repo',
@@ -217,16 +287,95 @@ test('untrust 撤销批准并卸载本会话挂载', async () => {
       mountable: ['gh'],
       renamed: [],
       skipped: [],
+      mounted: [],
     },
     readStore: () => store,
     writeStore: async next => { store = next },
     unmountFrom: () => { unmounted += 1 },
+    refreshNotice: () => { refreshes.push('untrust') },
   }))
 
   const out = await run('untrust')
   assert.equal(out.kind, 'success', out.text)
   assert.equal(Object.hasOwn(store.projects, '/repo'), false)
   assert.equal(unmounted, 1)
+  // 撤销后提示段必须跟着变：旧提示（若有）与新状态不再一致。
+  assert.deepEqual(refreshes, ['untrust'], 'untrust 必须刷新提示段')
+})
+
+test('trust 成功后刷新提示段（批准后旧提示必须被撤下或替换）', async () => {
+  let store: TrustStore = { version: 1, projects: {} }
+  const order: string[] = []
+  /** 假挂载记账：与 `index.ts` 的 `AgentRegistrations.servers` 同语义（同名只登记一次）。 */
+  const ledger = new Set<string>()
+  const view = (): ProjectInspection => ({
+    projectRoot: '/repo',
+    plan: {
+      kind: 'mount',
+      projectRoot: '/repo',
+      fingerprint: 'sha256:x',
+      configs: [config('gh')],
+      skipped: [],
+    },
+    mountable: ['gh'],
+    renamed: [],
+    skipped: [],
+    mounted: [...ledger],
+  })
+  const run = harness(deps({
+    view: view(),
+    inspect: view,
+    readStore: () => store,
+    writeStore: async next => { store = next; order.push('write') },
+    mountInto: (_agent, configs) => { order.push('mount'); for (const c of configs) ledger.add(c.serverName) },
+    mountedServers: () => [...ledger],
+    refreshNotice: () => { order.push('refresh') },
+  }))
+
+  const out = await run('trust')
+  assert.equal(out.kind, 'success', out.text)
+  // 顺序：先落盘、再挂载、最后刷新——刷新必须看到挂载**之后**的状态。
+  assert.deepEqual(order, ['write', 'mount', 'refresh'])
+  assert.match(out.text, /本会话已挂载：gh/)
+})
+
+test('trust 报错时不动挂载也不刷新提示段', async () => {
+  let refreshed = 0
+  const run = harness(deps({
+    view: {
+      projectRoot: '/repo',
+      plan: { kind: 'untrusted', projectRoot: '/repo', fingerprint: 'sha256:x', pending: ['gh'] },
+      mountable: ['gh'],
+      renamed: [],
+      skipped: [],
+      mounted: [],
+    },
+    writeStore: async () => { throw new Error('disk full') },
+    refreshNotice: () => { refreshed += 1 },
+  }))
+
+  const out = await run('trust')
+  assert.equal(out.kind, 'error')
+  assert.match(out.text, /disk full/)
+  assert.equal(refreshed, 0, '写盘失败不得改变提示段')
+})
+
+test('untrust 无法定位项目根时不刷新提示段', async () => {
+  let refreshed = 0
+  const run = harness(deps({
+    view: {
+      plan: { kind: 'skip', reason: 'no cwd' },
+      mountable: [],
+      renamed: [],
+      skipped: [],
+      mounted: [],
+    },
+    refreshNotice: () => { refreshed += 1 },
+  }))
+
+  const out = await run('untrust')
+  assert.equal(out.kind, 'error')
+  assert.equal(refreshed, 0)
 })
 
 test('未知子命令报错并给出用法', async () => {
@@ -237,6 +386,7 @@ test('未知子命令报错并给出用法', async () => {
       mountable: [],
       renamed: [],
       skipped: [],
+      mounted: [],
     },
   }))
 
@@ -262,6 +412,7 @@ test('没有 agent 时拒绝执行', async () => {
       mountable: [],
       renamed: [],
       skipped: [],
+      mounted: [],
     },
   }))
 

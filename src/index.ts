@@ -289,9 +289,10 @@ function collectMountable(
   return { mountable, renamed, skipped: probe.skipped }
 }
 
-/** 检视该 agent 所在项目：当前计划 + 展示所需的完整名单。 */
+/** 检视该 agent 所在项目：当前计划 + 展示所需的完整名单 + 真实挂载记账。 */
 function inspectAgent(
   ctx: HostContext,
+  agents: Map<AgentShape, AgentRegistrations>,
   agent: AgentShape,
 ): ProjectInspection {
   const header = agent.session?.header ?? {}
@@ -321,7 +322,41 @@ function inspectAgent(
   const projectRoot =
     plan.kind === 'mount' || plan.kind === 'untrusted' ? plan.projectRoot : fallbackRoot
 
-  return { projectRoot, plan, ...collectMountable(input, projectRoot) }
+  return {
+    projectRoot,
+    plan,
+    ...collectMountable(input, projectRoot),
+    // 真实挂载记账，而不是计划：`/mcp-project` 的"已挂载"一列必须回答"现在什么是活的"。
+    // 会话 A 批准后，此前已创建、`agent/created` 早已触发过的会话 B 计划同样是
+    // `mount`，但 B 一个服务器都没挂上——按计划渲染会把"计划要挂"报成"已挂载"。
+    mounted: mountedServers(agents, agent),
+  }
+}
+
+/**
+ * 撤下该会话的提示段（若已注入）。
+ *
+ * 必须先撤下再重注入：同一 scope 内重名 section 会抛错，而 `injectNotice` 原本对
+ * 已注入的会话**直接 return**——这正是"批准后提示段不刷新"的另一半成因。
+ *
+ * 只清 `record.notice` 而**不**删登记项：`servers` 记账必须留着（见 `AgentRegistrations`）。
+ * 重复调用幂等（`notice` 已清空时直接返回）。
+ */
+function removeNotice(
+  ctx: HostContext,
+  agents: Map<AgentShape, AgentRegistrations>,
+  agent: AgentShape,
+): void {
+  const record = agents.get(agent)
+  if (record?.notice === undefined) return
+  const dispose = record.notice
+  record.notice = undefined
+  try {
+    dispose()
+  } catch (error) {
+    // 撤下失败降级为警告：提示段陈旧会误导模型，但不该反过来打断命令执行。
+    ctx.logger?.warn?.(`project-mcp：移除会话提示段失败：${message(error)}`)
+  }
 }
 
 /**
@@ -365,6 +400,45 @@ function injectNotice(
 }
 
 /**
+ * 把该会话的提示段对齐到**当前**计划（缺陷修复：批准/撤销后提示必须刷新）。
+ *
+ * 主流程是"首次会话 → 提示尚未批准 → `/mcp-project trust` → 挂载成功"，而
+ * `injectNotice` 原本只在 `agent/created` 触发，于是挂载成功后提示段仍写着"本会话
+ * 未启用任何项目级 MCP"——模型在整个会话剩余时间里被持续误导。
+ *
+ * 修法是"先撤下、再按新计划重注入或留空"：同一 scope 内重名 section 会抛错，不先
+ * 拆除旧段就无法替换文本。判据刻意复用 `renderNotice` 而不是在命令层另写一套：
+ * 提示文本与会话创建时**同源**，两条路径不可能分叉。
+ *
+ * 不抛异常：本函数由同步命令处理器调用，抛错会让 `/mcp-project trust` 在信任存储
+ * 已写入之后报失败——批准其实生效了，报错会让用户以为没生效。
+ */
+function refreshNotice(
+  ctx: HostContext,
+  agents: Map<AgentShape, AgentRegistrations>,
+  agent: AgentShape,
+): void {
+  try {
+    removeNotice(ctx, agents, agent)
+    const view = inspectAgent(ctx, agents, agent)
+    const text = renderNotice(view.plan, view.projectRoot ?? '')
+    if (text !== '') injectNotice(ctx, agents, agent, text)
+  } catch (error) {
+    ctx.logger?.warn?.(`project-mcp：刷新会话提示段失败：${message(error)}`)
+  }
+}
+
+/** 读该 agent 当前实际挂载的项目服务器名（插件侧记账，无 I/O，无副作用）。 */
+function mountedServers(
+  agents: Map<AgentShape, AgentRegistrations>,
+  agent: AgentShape,
+): string[] {
+  const record = agents.get(agent)
+  if (record === undefined) return []
+  return [...record.servers.keys()]
+}
+
+/**
  * 插件入口。
  *
  * 装配顺序刻意是"先命令、后监听"：命令注册是同步的，`apply` 返回后立刻可用；
@@ -392,9 +466,11 @@ export function apply(ctx: HostContext, config: unknown): void {
   const deps: CommandDeps = {
     readStore: () => readTrustStore(readFileUtf8),
     writeStore: writeStoreAtomic,
-    inspect: agent => inspectAgent(ctx, agent),
+    inspect: agent => inspectAgent(ctx, agents, agent),
     mountInto: (agent, configs) => mountInto(ctx, agents, McpClient, agent, configs),
     unmountFrom: agent => unmountFrom(ctx, agents, agent),
+    mountedServers: agent => mountedServers(agents, agent),
+    refreshNotice: agent => refreshNotice(ctx, agents, agent),
   }
 
   // 所有注册走 ctx.effect，随 fiber 卸载可逆清理（宿主 ctx 与 agent ctx 皆是）。
@@ -408,7 +484,7 @@ export function apply(ctx: HostContext, config: unknown): void {
           const agent = (payload as { agent?: AgentShape } | undefined)?.agent
           if (agent === undefined || agent.session === undefined) return
 
-          const view = inspectAgent(ctx, agent)
+          const view = inspectAgent(ctx, agents, agent)
           if (view.plan.kind === 'mount') {
             mountInto(ctx, agents, McpClient, agent, view.plan.configs)
           }

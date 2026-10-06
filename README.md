@@ -132,7 +132,7 @@ dsh plugin --profile web list
 | 全局行不受管辖 | 写在 profile 补丁里的 MCP 行仍会在 DSH 启动时连接；本插件只能检测与警告，无法阻止 |
 | 模块名精确匹配 | 全局行检测要求行的模块名**精确等于** `@deepseek-ai/dsh-mcp-client`；写成子路径或相对路径时漏检 |
 | 无 `commands` 服务的 profile | 本插件声明依赖 `commands` / `loader` / `systemPrompt`；在缺服务的 profile（如 `sdk-minimal`）上会保持未激活，`/mcp-project` 命令也不出现 |
-| 会话提示不随批准刷新 | 提示段在**会话创建时**生成，批准之后旧提示仍在，直到会话重启；请以 `/mcp-project` 的输出为准 |
+| 挂载只发生在会话创建时或本会话批准时 | 别的会话批准后，本会话的计划已是"已批准"，但服务器不会自动挂进本会话；`/mcp-project` 会把它列在"已批准但本会话未挂载"下，运行 `/mcp-project trust` 即挂上 |
 
 ## 卸载
 
