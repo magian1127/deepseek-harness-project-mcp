@@ -8,7 +8,9 @@
  * `.mcp.json` 可能含凭据（规格 §10）。
  */
 import { createHash } from 'node:crypto'
-import type { McpClientConfig } from './types.js'
+import { asStringArray, asStringRecord, expandList, expandRecord, expandVariables, isPlainObject } from './values.js'
+import { planServeStart } from './serve.js'
+import type { McpClientConfig, ServeMetadata } from './types.js'
 
 /** 翻译结果：`ok` 携带可直接传给 `ctx.plugin()` 的配置，`skip` 携带可读原因。 */
 export type TranslateResult =
@@ -25,12 +27,14 @@ const SLUG_LIMIT = 20
 const TYPE_ECHO_LIMIT = 32
 
 /**
- * `${VAR}` 与 `${VAR:-default}`；变量名沿用 POSIX 形状，其余原样保留。
+ * 展开语义与形状守卫（`expandVariables` / `expandRecord` / `asStringRecord` 等）搬到了
+ * `values.ts`：`serve.ts` 需要**同一套**语义，复制一份出来迟早分叉。
  *
- * 模块级 `g` 正则只喂给 `String.replace`（每次调用自行重置 `lastIndex`），
- * 不用于 `exec` / `test`，因此不跨调用残留状态。
+ * 这里重新导出 `expandVariables` 是**兼容性**考虑，不是新用法：它是本模块的既有公开
+ * 出口（`translate.test.mts` 直接 import 它），下游也可能在用。新代码请从 `values.js`
+ * 导入，本模块保留出口只为不破坏既有调用方。
  */
-const VARIABLE_PATTERN = /\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}/g
+export { expandVariables }
 
 /**
  * 把 `.mcp.json` 的键规范成合法的 `serverName`。
@@ -56,102 +60,14 @@ export function normalizeServerName(name: string): string {
 /**
  * 展开 `${VAR}` 与 `${VAR:-default}`。
  *
- * 未定义且无默认值时返回 `{ missing: 变量名 }`——只回变量名，绝不回值：调用方
- * 会把结果写进诊断。值为空串也算"已定义"，此时优先于默认值。
- *
- * 只认 `env` 的**自有属性**（`Object.hasOwn`）：`env` 是普通对象，直接 `env[name]`
- * 会命中原型链，把 `Object.prototype` 的成员（`toString` / `constructor` / `valueOf`
- * 等）当成"已定义值"，从而把一段 JS 源码展开进 `command` / `url` / `env`，而不是
- * 按契约报告变量缺失。`.mcp.json` 是外部输入，字面写 `${toString}` 即可触发。
- *
- * 多处缺变量时只报**第一个**：诊断要短，且多变量名对排查没有增量信息。
+ * 实现见 `values.ts`（本模块重新导出以保持既有出口）。
  */
-export function expandVariables(
-  text: string,
-  env: Record<string, string | undefined>,
-): { value: string } | { missing: string } {
-  let missing: string | null = null
-  const value = text.replace(VARIABLE_PATTERN, (match, name: string, fallback: string | undefined) => {
-    // 只认自有属性：`env[name]` 会命中原型链（见函数注释）。
-    const defined = Object.hasOwn(env, name) ? env[name] : undefined
-    if (defined !== undefined) return defined
-    if (fallback !== undefined) return fallback
-    missing ??= name
-    return match
-  })
-  return missing === null ? { value } : { missing }
-}
-
-/** 非 null 的普通对象（排除数组与原始值）。 */
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
-/** 校验并复制字符串数组；形状不对返回 null。 */
-function asStringArray(value: unknown): string[] | null {
-  if (!Array.isArray(value)) return null
-  const items: string[] = []
-  for (const item of value) {
-    if (typeof item !== 'string') return null
-    items.push(item)
-  }
-  return items
-}
 
 /**
- * 校验并复制字符串记录（`env` / `headers`）；形状不对返回 null。
+ * 校验并复制字符串数组；形状不对返回 null。
  *
- * 用 `Object.fromEntries` 而不是 `record[key] = item`：键来自**不受信**的 `.mcp.json`，
- * 字面写 `"__proto__": "X"` 时，朴素赋值会命中原型 setter 而被静默丢弃（字符串值
- * 不满足 setter 的对象要求 → no-op），服务器拿到缺一个变量的环境，认证失败却没有任何
- * 诊断；而指纹把该键算在内，用户批准的内容与实际生效的内容不一致。`trust.ts` 的
- * `canonicalValue` 出于同一原因用 `fromEntries`（见该处注释与 `trust.test.mts` 的
- * `__proto__` 用例），本模块此前漏了同一处加固。
+ * 实现见 `values.ts` 的 `asStringArray`。
  */
-function asStringRecord(value: unknown): Record<string, string> | null {
-  if (!isPlainObject(value)) return null
-  const pairs: [string, string][] = []
-  for (const [key, item] of Object.entries(value)) {
-    if (typeof item !== 'string') return null
-    pairs.push([key, item])
-  }
-  return Object.fromEntries(pairs)
-}
-
-/**
- * 展开字符串记录（`env` / `headers`）的键与值；任一变量缺失即返回其名字。
- *
- * 展开后的**键**同样可能撞上 `__proto__`（`"${K}"` 在 `K='__proto__'` 时展开出该名字），
- * 因此落盘同样走 `Object.fromEntries`，理由与 `asStringRecord` 相同。
- */
-function expandRecord(
-  record: Record<string, string>,
-  env: Record<string, string | undefined>,
-): { value: Record<string, string> } | { missing: string } {
-  const pairs: [string, string][] = []
-  for (const [key, raw] of Object.entries(record)) {
-    const expandedKey = expandVariables(key, env)
-    if ('missing' in expandedKey) return expandedKey
-    const expandedValue = expandVariables(raw, env)
-    if ('missing' in expandedValue) return expandedValue
-    pairs.push([expandedKey.value, expandedValue.value])
-  }
-  return { value: Object.fromEntries(pairs) }
-}
-
-/** 展开字符串列表（`args`）；任一变量缺失即返回其名字。 */
-function expandList(
-  items: string[],
-  env: Record<string, string | undefined>,
-): { value: string[] } | { missing: string } {
-  const expanded: string[] = []
-  for (const item of items) {
-    const result = expandVariables(item, env)
-    if ('missing' in result) return result
-    expanded.push(result.value)
-  }
-  return { value: expanded }
-}
 
 /** 缺失变量的统一诊断：只回变量名，不回值（规格 §10）。 */
 function missingVariable(variable: string): TranslateResult {
@@ -162,7 +78,7 @@ function missingVariable(variable: string): TranslateResult {
 function translateStdio(
   entry: Record<string, unknown>,
   name: string,
-  options: { cwd: string; env: Record<string, string | undefined> },
+  options: { cwd: string; env: Record<string, string | undefined>; diagnostics: string[] },
 ): TranslateResult {
   const command = entry.command
   if (typeof command !== 'string' || command === '') {
@@ -213,11 +129,59 @@ function translateStdio(
   }
 }
 
-/** 翻译 http 分支：`url` 必填，`headers` 可选。 */
+/**
+ * 解析可选的 `serve` 字段（按需拉起服务的配置）。
+ *
+ * ## 为什么 `serve` 畸形**不**跳过整个条目
+ *
+ * 与 `headers` / `args` 的处理刻意不同：那两者形状不对会让**连接本身**与用户的预期
+ * 不符（少一个认证头、少一个参数），继续挂载只会带来更难诊断的故障。`serve` 是纯粹的
+ * **锦上添花**——它的全部作用是"服务没在跑时帮忙拉一把"。畸形时正确行为是丢掉它、
+ * 记一条诊断、照常挂载：用户若已手动启好服务，一切照常工作；若没启，症状就是
+ * "服务不可达"，而这条诊断正好解释了原因。反过来让整条 HTTP 条目消失，会把"辅助功能
+ * 的配置写错了"升级成"这个服务器完全用不了"（规格 §7 的用例要求"跳过 serve + 仍挂载"）。
+ *
+ * 诊断只回**字段名**（`command` / `args` / `env` / `health` / `readyTimeoutMs`）与变量名，
+ * 绝不回值——`serve.env` 同样可能含凭据（红线 3）。
+ */
+function translateServe(
+  entry: Record<string, unknown>,
+  url: string,
+  env: Record<string, string | undefined>,
+  diagnostics: string[],
+): ServeMetadata | undefined {
+  if (entry.serve === undefined) return undefined
+
+  const plan = planServeStart({ serve: entry.serve, url, env })
+  if ('skip' in plan) {
+    // 只记字段名与变量名（`plan.reason` 已保证），不记值。
+    diagnostics.push(`serve 配置已被忽略：${plan.reason}`)
+    return undefined
+  }
+  // `notes` 是非致命诊断（如 `readyTimeoutMs` 非法已退回默认）：计划仍然可用，但用户
+  // 必须能看到自己的配置没被采纳。
+  for (const note of plan.notes) diagnostics.push(`serve 配置已被修正：${note}`)
+  return {
+    command: plan.command,
+    args: plan.args,
+    env: plan.env,
+    ...(plan.health === undefined ? {} : { health: plan.health }),
+    readyTimeoutMs: plan.readyTimeoutMs,
+  }
+}
+
+/**
+ * 翻译 http 分支：`url` 必填，`headers` 与 `serve` 可选。
+ *
+ * `serve` 只作为 `config.serve` 的元数据保留：它**不是** `mcp-client` 的 Config 字段
+ * （`packages/mcp/mcp-client/src/index.ts:119-142` 的 union 里没有它），必须由装配层在
+ * `ctx.plugin()` 之前剥离（见 `serve.ts` 的 `splitServe`）。放在这里是因为翻译层才是
+ * `.mcp.json` 形状的唯一真相来源，装配层只消费已翻译的结果。
+ */
 function translateHttp(
   entry: Record<string, unknown>,
   name: string,
-  options: { cwd: string; env: Record<string, string | undefined> },
+  options: { cwd: string; env: Record<string, string | undefined>; diagnostics: string[] },
 ): TranslateResult {
   const url = entry.url
   if (typeof url !== 'string' || url === '') {
@@ -241,6 +205,8 @@ function translateHttp(
   const expandedHeaders = expandRecord(rawHeaders, options.env)
   if ('missing' in expandedHeaders) return missingVariable(expandedHeaders.missing)
 
+  const serve = translateServe(entry, expandedUrl.value, options.env, options.diagnostics)
+
   const serverName = normalizeServerName(name)
   return {
     kind: 'ok',
@@ -251,6 +217,7 @@ function translateHttp(
       url: expandedUrl.value,
       headers: expandedHeaders.value,
       failOnStartupError: false,
+      ...(serve === undefined ? {} : { serve }),
     },
   }
 }
@@ -265,12 +232,18 @@ function translateHttp(
  *
  * `failOnStartupError` 恒为 `false`：坏服务器只记日志，不影响会话创建
  * （规格 §5.1，与 ACP 相反）。
+ *
+ * `diagnostics` 是**可选的出参**：`serve` 字段畸形时条目仍然成功（见 `translateServe`），
+ * 因此它的诊断无处安放——`skip` 变体专门承载"整个条目被跳过"的原因，而这不是那种情形。
+ * 由调用方（装配层）决定这些文本去哪里：会话创建路径上必须**只记日志**，否则一条配置
+ * 写错就会出现在用户的会话提示里（红线 4 的降级方向）。不传则不收集，条目照常产出。
  */
 export function translateServer(
   name: string,
   entry: unknown,
-  options: { cwd: string; env: Record<string, string | undefined> },
+  options: { cwd: string; env: Record<string, string | undefined>; diagnostics?: string[] },
 ): TranslateResult {
+  const diagnostics = options.diagnostics ?? []
   if (!isPlainObject(entry)) return { kind: 'skip', reason: '条目必须是 JSON 对象' }
 
   const rawType = entry.type
@@ -283,10 +256,12 @@ export function translateServer(
     if (entry.url !== undefined) {
       return { kind: 'skip', reason: '条目含 url 但没有 type：无法判断传输类型' }
     }
-    return translateStdio(entry, name, options)
+    return translateStdio(entry, name, { ...options, diagnostics })
   }
-  if (type === 'stdio') return translateStdio(entry, name, options)
-  if (type === 'http' || type === 'streamable-http') return translateHttp(entry, name, options)
+  if (type === 'stdio') return translateStdio(entry, name, { ...options, diagnostics })
+  if (type === 'http' || type === 'streamable-http') {
+    return translateHttp(entry, name, { ...options, diagnostics })
+  }
 
   return {
     kind: 'skip',

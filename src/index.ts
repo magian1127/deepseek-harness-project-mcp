@@ -34,8 +34,11 @@ import { dirname } from 'node:path'
 import { errorName, validateMountConfig } from './config-guard.js'
 import { McpFileTooLargeError, readProjectMcpFile, findProjectRoot } from './discovery.js'
 import { collectGlobalServerNames } from './global-rows.js'
+import { POLL_INTERVAL_MS, PROBE_TIMEOUT_MS } from './health.js'
 import { renderNotice } from './notice.js'
 import { loadAtomicWrite, loadMcpClient } from './profile-modules.js'
+import { ensureServeReady, spawnDetached, splitServe } from './serve.js'
+import type { ServeIo } from './serve.js'
 import { planSessionMount } from './session.js'
 import type { SessionMountInput, SessionMountPlan } from './session.js'
 import { withSessionTag } from './session-tag.js'
@@ -291,14 +294,33 @@ function disposeServers(ctx: HostContext, servers: Map<string, PluginFiberShape>
  * 不 await 返回的 fiber：只挂一个拒绝处理器，避免启动失败变成未处理拒绝
  * （`failOnStartupError: false` 时 `mcp-client` 本身不会抛，但 `apply` 内仍可能抛，
  * 例如 serverName 在 agent scope 内已被别的实例占用）。
+ *
+ * ## 为什么是 async：HTTP 条目的"确保服务就绪"发生在挂载**之前**
+ *
+ * HTTP 模式下 DSH 不 spawn 子进程，服务由外部启动；服务没在跑时 DSH 连不上、工具不可用。
+ * `serve` 字段让插件在健康检查失败时把服务拉起来（`serve.ts`），**等服务就绪再挂**。
+ *
+ * 等待发生在 `agent/created` 的监听器里，这是**有意**的：`agent/created` 是 serial 且被
+ * await（`packages/core/agent/src/index.ts:550`），契约明确 "AgentLoop holds queued input
+ * until all listeners finish"（`packages/core/agent/src/runtime-types.ts:257`）——因此用户
+ * 的第一条消息会等到服务就绪，工具在首次请求前就注册好。
+ *
+ * 这**不违反**红线 5：那条红线禁止的是 await `mcp-client` 的**握手**（它可能永远不成功，
+ * 等它等于让会话创建卡在一个不受控的握手上）。这里等的是**健康检查**——有明确上限
+ * （`readyTimeoutMs`，默认 120 秒）、失败不抛、且服务是我们自己启动的。`ctx.plugin()`
+ * 返回的 fiber **仍然不 await**（见上）。
+ *
+ * 关键：等待只影响**该条目自己**。同一个 agent 里其余的服务器（尤其是 stdio 条目）
+ * 照旧立即挂上，不会因为一个 HTTP 条目的服务在慢慢启动而推迟。
  */
-function mountInto(
+async function mountInto(
   ctx: HostContext,
   agents: Map<AgentKey, AgentRegistrations>,
   McpClient: unknown,
   agent: AgentShape,
   configs: McpClientConfig[],
-): void {
+  serve: { inflight: Map<string, Promise<void>>; io: ServeIo },
+): Promise<void> {
   if (configs.length === 0) return
   if (McpClient === null || McpClient === undefined) {
     ctx.logger?.warn?.('project-mcp：未能从 profile 解析到 mcp-client，跳过项目级 MCP 挂载')
@@ -325,15 +347,48 @@ function mountInto(
   for (const config of configs) {
     if (servers.has(config.serverName)) continue
 
+    // `serve` 是本插件自己的元数据，**不在** `mcp-client` 的 Config schema 里，必须在
+    // 任何消费点之前剥离（见 `splitServe`：它还兼着"防止展开后的 env 值经 schema 校验
+    // 错误消息漏进日志"的安全职责）。剥离后的 `config` 才是进守卫、进标记、进
+    // `ctx.plugin()` 的那一份。
+    const { config: bare, serve: serveMeta } = splitServe(config)
+
     // 自校验：不通过就跳过并记安全诊断，绝不交给 ctx.plugin()。诊断只含服务器名与
     // 字段路径/错误类型，不含任何配置值（红线 3）。
-    const guarded = validateMountConfig(McpClient, config)
+    //
+    // 刻意放在"确保服务就绪"**之前**：下面那一步可能等满 `readyTimeoutMs`（默认 120 秒），
+    // 而为一个注定不会挂载的配置去拉起一个服务、再等它两分钟，是纯粹的浪费——何况
+    // 拉起来的服务会一直活着（生命周期归它自己）。
+    const guarded = validateMountConfig(McpClient, bare)
     if (!guarded.ok) {
       ctx.logger?.error?.(
-        `project-mcp：项目级 MCP 服务器「${config.serverName}」的配置未通过 schema 校验，已跳过挂载（${guarded.reason}）`,
+        `project-mcp：项目级 MCP 服务器「${bare.serverName}」的配置未通过 schema 校验，已跳过挂载（${guarded.reason}）`,
       )
       continue
     }
+
+    // 确保服务就绪（仅 HTTP 条目；stdio 条目零额外动作）。失败一律降级为日志，
+    // **绝不**抛出——调用点在会话创建路径上（红线 4）。
+    try {
+      await ensureServeReady({
+        serverName: bare.serverName,
+        ...(bare.transport === 'streamable-http' ? { url: bare.url } : {}),
+        ...(serveMeta === undefined ? {} : { serve: serveMeta }),
+        inflight: serve.inflight,
+        io: serve.io,
+        logger: ctx.logger ?? {},
+      })
+    } catch (error) {
+      ctx.logger?.warn?.(
+        `project-mcp：确保项目级 MCP 服务器「${bare.serverName}」的服务就绪时出错` +
+          `（错误类型：${errorName(error)}），仍继续挂载`,
+      )
+    }
+
+    // 等待期间该条目可能已被别的路径挂上（同一 agent 的并发挂载，或 `/mcp-project trust`
+    // 与本函数交叉）。重名守卫只按 scope 对象隔离，挡不住同一 scope 的第二次注册——
+    // 会多出一个实例与一次子进程 spawn。因此这里**复查**一次。
+    if (servers.has(bare.serverName)) continue
 
     try {
       // 标记在守卫**之后**追加：守卫只作准入闸，标记是挂载期的修饰，且必须在交给
@@ -341,7 +396,7 @@ function mountInto(
       const fiber = agentCtx.plugin(McpClient, withSessionTag(guarded.config, key))
       // fiber 登记在插件侧：插件卸载时由 apply 的 effect 统一 dispose（见
       // AgentRegistrations）。agent 销毁时 agent.ctx 也会回收它，两条路径都成立。
-      servers.set(config.serverName, fiber)
+      servers.set(bare.serverName, fiber)
       // 只观察启动结果，不阻塞：`then` 走 `fiber.await()`，不触发 dispose。
       //
       // 刻意**不**透传 `message(error)`：fiber 拒绝的一种来源是 Config 校验失败，而
@@ -352,7 +407,7 @@ function mountInto(
       // 防线，所以口径保持"只记固定文本与 `error.name`"。
       fiber.then(undefined, (error: unknown) => {
         ctx.logger?.warn?.(
-          `project-mcp：项目级 MCP 服务器「${config.serverName}」启动失败（错误类型：${errorName(error)}），已从挂载记账移除`,
+          `project-mcp：项目级 MCP 服务器「${bare.serverName}」启动失败（错误类型：${errorName(error)}），已从挂载记账移除`,
         )
         // 启动失败的 fiber 停在 FAILED 状态（`vendor/cordis/src/fiber.ts:576` 的
         // `_getState` 把 `_error` 映射成 `FiberState.FAILED`），实例并没有活着。留在
@@ -361,13 +416,13 @@ function mountInto(
         //
         // 按身份摘除：条目可能已被**后来者**替换（同名重挂，或本名被重新批准后挂上新的
         // fiber），那种情况下旧 fiber 的拒绝不得误删新条目。比较引用即可，不需要额外代际号。
-        if (servers.get(config.serverName) === fiber) servers.delete(config.serverName)
+        if (servers.get(bare.serverName) === fiber) servers.delete(bare.serverName)
       })
     } catch (error) {
       // 同步抛出同样可能是 Config 校验（`ctx.plugin()` 内部 resolveConfig 是同步的），
       // 因此这里的诊断口径与上面一致。
       ctx.logger?.error?.(
-        `project-mcp：挂载项目级 MCP 服务器「${config.serverName}」失败（错误类型：${errorName(error)}）`,
+        `project-mcp：挂载项目级 MCP 服务器「${bare.serverName}」失败（错误类型：${errorName(error)}）`,
       )
     }
   }
@@ -472,6 +527,14 @@ function inspectAgent(
   }
 
   const plan: SessionMountPlan = planSessionMount(input)
+
+  // `serve` 字段畸形时条目**仍然挂载**，因此那条诊断不在 `skipped` 里，也没有别的展示面。
+  // 会话创建路径上只记日志，**绝不**进会话提示：一条写错的辅助配置不该出现在模型上下文
+  // 里（红线 4 的降级方向）。`/mcp-project` 也不展示它——那份输出的每一条都对应"用户需要
+  // 做点什么"，而"serve 写错了"只影响自动拉起，服务已在跑时毫无影响。
+  if (plan.kind === 'mount') {
+    for (const note of plan.diagnostics) ctx.logger?.warn?.(`project-mcp：${note}`)
+  }
 
   // `invalid` / `skip` 变体不携带项目根，但提示文本需要它；用同一函数重算一次。
   const fallbackRoot = header.cwd !== undefined ? findProjectRoot(header.cwd, existsSync) : undefined
@@ -627,11 +690,41 @@ export function apply(ctx: HostContext, config: unknown): void {
   /** 插件侧的 agent 登记表；键是 `agent.id`（见 `AgentKey`，刻意用可迭代的 Map）。 */
   const agents = new Map<AgentKey, AgentRegistrations>()
 
+  /**
+   * **进行中**的服务启动表，键是条目的 `url`（见 `EnsureServeInput.inflight`）。
+   *
+   * 必须由 `apply` 持有并跨会话共享：两个会话同时挂载同一个 url 时会同时发现服务不可达，
+   * 各自 spawn 一个服务，第二个会因端口占用失败。共享这张表让后到的那个**等**前一个的
+   * 启动结果，而不是再拉一个。
+   *
+   * 键用 `url` 而不是 `serverName`：同一个服务可能被两个项目用不同的服务器名指向，而
+   * 冲突的根源是**端口**（也就是 url 的 origin），不是名字。
+   *
+   * 生命周期与插件一致，不需要随 agent 清理：条目在启动完成后即删除（见 `startShared`），
+   * 因此它描述的是"正在启动"，不会无限增长。
+   */
+  const serveInflight = new Map<string, Promise<void>>()
+
+  /**
+   * 真实 I/O 端口：健康检查 + 脱离进程启动。
+   *
+   * `fetch` / `setTimeout` / `Date.now` / `AbortSignal.timeout` 在这里绑定，`serve.ts`
+   * 本身不 import 它们——那让 `waitReady` 的每条失败路径都能被确定性单测（见 `health.ts`）。
+   */
+  const serveIo: ServeIo = {
+    fetch: (url, init) => fetch(url, init),
+    sleep: ms => new Promise<void>(resolve => { setTimeout(resolve, ms) }),
+    now: () => Date.now(),
+    timeoutSignal: ms => AbortSignal.timeout(ms),
+    spawnDetached,
+  }
+
   const deps: CommandDeps = {
     readStore: () => readTrustStore(readFileUtf8),
     writeStore: writeStoreAtomic,
     inspect: agent => inspectAgent(ctx, agents, agent),
-    mountInto: (agent, configs) => mountInto(ctx, agents, McpClient, agent, configs),
+    mountInto: (agent, configs) =>
+      mountInto(ctx, agents, McpClient, agent, configs, { inflight: serveInflight, io: serveIo }),
     unmountFrom: agent => unmountFrom(ctx, agents, agent),
     mountedServers: agent => mountedServers(agents, agent),
     refreshNotice: agent => refreshNotice(ctx, agents, agent),
@@ -650,13 +743,25 @@ export function apply(ctx: HostContext, config: unknown): void {
 
           const view = inspectAgent(ctx, agents, agent)
           if (view.plan.kind === 'mount') {
-            mountInto(ctx, agents, McpClient, agent, view.plan.configs)
+            // `mountInto` 现在是 async（HTTP 条目要先确保服务就绪），而 Cordis 的 serial
+            // 派发**会 await 监听器返回的 promise**（`vendor/cordis/src/events.ts` 的
+            // `serial`：`await cb(...args)`）——因此这里返回它即可让"用户的第一条消息等到
+            // 服务就绪"成立（`packages/core/agent/src/index.ts:550`）。
+            //
+            // 返回 promise 也意味着**失败路径必须自己吞掉**：本函数里 `mountInto` 内部
+            // 每个条目各有 try/catch，不会向外抛（红线 4）。
+            return mountInto(ctx, agents, McpClient, agent, view.plan.configs, {
+              inflight: serveInflight,
+              io: serveIo,
+            })
           }
 
           const notice = renderNotice(view.plan, view.projectRoot ?? '')
           if (notice !== '') injectNotice(ctx, agents, agent, notice)
+          return undefined
         } catch (error) {
           ctx.logger?.error?.(`project-mcp：会话挂载失败：${message(error)}`)
+          return undefined
         }
       }),
     'project-mcp:agent-created',

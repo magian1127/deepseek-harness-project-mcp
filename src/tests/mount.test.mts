@@ -279,20 +279,34 @@ function createHarness(options: { loader?: unknown; withCommands?: boolean } = {
      * `disposed` 过滤才能回答"模型现在看到什么"——这正是缺陷 1 的观测面。
      */
     liveSections: () => sections.filter(section => section.disposed === 0),
-    fire: (name: string, payload: unknown) => {
-      for (const callback of listeners.get(name) ?? []) callback(payload)
+    /**
+     * 派发事件，并**按 Cordis 的 serial 语义 await 每个监听器**。
+     *
+     * 为什么必须 await（而不是像以前那样同步遍历）：`agent/created` 的监听器在
+     * `mountInto` 里会先为 HTTP 条目"确保服务就绪"（`serve.ts`），因此它返回 promise。
+     * 真实 Cordis 的 `serial` 派发是 `await cb(...args)`
+     * （`vendor/cordis/src/events.ts` 的 `serial`），而 `agent/created` 的派发点同样 await
+     * 整个 serial 结果（`packages/core/agent/src/index.ts:550`）——契约是 "AgentLoop holds
+     * queued input until all listeners finish"（`runtime-types.ts:257`）。
+     *
+     * 同步的 `fire` 会让所有断言在监听器完成**之前**执行：挂载还没发生，"未挂载"的断言
+     * 会假性通过，"已挂载"的断言则必然失败——两种都是错误的观测。await 之后，本文件里
+     * 每条 `await harness.fire(...)` 都精确对应"会话创建完成"这一时刻。
+     */
+    fire: async (name: string, payload: unknown) => {
+      for (const callback of listeners.get(name) ?? []) await callback(payload)
     },
     /** 卸载插件：按注册逆序跑 effect disposer，模拟 fiber 拆除。 */
     unload: () => { for (const dispose of [...effects].reverse()) dispose() },
   }
 }
 
-test('未批准时 agent/created 不调用 plugin（规格 §13.4 安全断言）', () => {
+test('未批准时 agent/created 不调用 plugin（规格 §13.4 安全断言）', async () => {
   const project = makeProject({ alpha: { command: 'node' } })
   const harness = createHarness()
   apply(harness.host as never, {})
 
-  harness.fire('agent/created', { agent: harness.makeAgent(project) })
+  await harness.fire('agent/created', { agent: harness.makeAgent(project) })
 
   assert.equal(harness.pluginCalls.length, 0, '未批准的项目服务器不得被挂载')
   // 提示必须注入：这是用户能看到"待批准"的唯一会话内渠道。
@@ -304,13 +318,13 @@ test('未批准时 agent/created 不调用 plugin（规格 §13.4 安全断言�
   assert.match(text, /alpha/)
 })
 
-test('已批准时挂载进 agent scope，配置带 failOnStartupError: false', () => {
+test('已批准时挂载进 agent scope，配置带 failOnStartupError: false', async () => {
   const project = makeProject({ alpha: { command: 'node', args: ['-v'] } })
   approveAll(project, ['alpha'])
   const harness = createHarness()
   apply(harness.host as never, {})
 
-  harness.fire('agent/created', { agent: harness.makeAgent(project) })
+  await harness.fire('agent/created', { agent: harness.makeAgent(project) })
 
   assert.equal(harness.pluginCalls.length, 1, '已批准的项目服务器应挂载一次')
   assert.equal(harness.pluginCalls[0]!.config.serverName, 'alpha')
@@ -326,7 +340,7 @@ test('已批准时挂载进 agent scope，配置带 failOnStartupError: false', 
   assert.equal(harness.sections.length, 0)
 })
 
-test('ctx.get(loader) 传的是 Loader 本体：全局撞名项被跳过', () => {
+test('ctx.get(loader) 传的是 Loader 本体：全局撞名项被跳过', async () => {
   const project = makeProject({ taken: { command: 'node' }, free: { command: 'node' } })
   approveAll(project, ['taken', 'free'])
   // 只有 Loader **本体**有 entries()；root 是 EntryGroup，没有 entries。
@@ -339,7 +353,7 @@ test('ctx.get(loader) 传的是 Loader 本体：全局撞名项被跳过', () =>
   const harness = createHarness({ loader })
   apply(harness.host as never, {})
 
-  harness.fire('agent/created', { agent: harness.makeAgent(project) })
+  await harness.fire('agent/created', { agent: harness.makeAgent(project) })
 
   assert.deepEqual(
     harness.pluginCalls.map(call => call.config.serverName),
@@ -354,7 +368,7 @@ test('重复 trust 只挂载一次（幂等），命令层每次都按计划调�
   apply(harness.host as never, {})
 
   const agent = harness.makeAgent(project)
-  harness.fire('agent/created', { agent })
+  await harness.fire('agent/created', { agent })
   assert.equal(harness.pluginCalls.length, 0)
 
   const definition = harness.commands.get('mcp-project')!
@@ -369,7 +383,7 @@ test('重复 trust 只挂载一次（幂等），命令层每次都按计划调�
   assert.equal(harness.pluginCalls.length, 1, '重复批准不得重复挂载同一 serverName')
 })
 
-test('插件卸载回收 agent 维度注册：挂载 fiber 与提示段都被拆除', () => {
+test('插件卸载回收 agent 维度注册：挂载 fiber 与提示段都被拆除', async () => {
   const mounted = makeProject({ alpha: { command: 'node' } })
   approveAll(mounted, ['alpha'])
   const pending = makeProject({ beta: { command: 'node' } })
@@ -377,8 +391,8 @@ test('插件卸载回收 agent 维度注册：挂载 fiber 与提示段都被拆
   apply(harness.host as never, {})
 
   // 两个**不同**会话（默认 id 各自唯一）：一个已批准、一个待批准，两条注册都必须能回收。
-  harness.fire('agent/created', { agent: harness.makeAgent(mounted) })
-  harness.fire('agent/created', { agent: harness.makeAgent(pending) })
+  await harness.fire('agent/created', { agent: harness.makeAgent(mounted) })
+  await harness.fire('agent/created', { agent: harness.makeAgent(pending) })
 
   assert.equal(harness.pluginCalls.length, 1)
   assert.equal(harness.sections.length, 1)
@@ -391,17 +405,17 @@ test('插件卸载回收 agent 维度注册：挂载 fiber 与提示段都被拆
   assert.equal(harness.sections[0]!.disposed, 1, '插件卸载后提示段仍存活')
 })
 
-test('agent 销毁清理插件侧登记项，且与插件卸载可任意顺序重复拆除', () => {
+test('agent 销毁清理插件侧登记项，且与插件卸载可任意顺序重复拆除', async () => {
   const project = makeProject({ alpha: { command: 'node' } })
   approveAll(project, ['alpha'])
   const harness = createHarness()
   apply(harness.host as never, {})
 
   const agent = harness.makeAgent(project)
-  harness.fire('agent/created', { agent })
+  await harness.fire('agent/created', { agent })
   assert.equal(harness.fibers[0]!.disposed, 0)
 
-  harness.fire('agent/disposed', { agent })
+  await harness.fire('agent/disposed', { agent })
   assert.equal(harness.fibers[0]!.disposed, 1, 'agent 销毁应回收插件侧登记项')
 
   // 插件随后卸载不得二次 dispose（登记项已清空）——重复拆除是幂等的。
@@ -409,12 +423,12 @@ test('agent 销毁清理插件侧登记项，且与插件卸载可任意顺序�
   assert.equal(harness.fibers[0]!.disposed, 1, '重复拆除不得再次 dispose')
 })
 
-test('loader 缺失时留下可查诊断（撞名守卫退化必须可见）', () => {
+test('loader 缺失时留下可查诊断（撞名守卫退化必须可见）', async () => {
   const project = makeProject({ alpha: { command: 'node' } })
   const harness = createHarness()
   apply(harness.host as never, {})
 
-  harness.fire('agent/created', { agent: harness.makeAgent(project) })
+  await harness.fire('agent/created', { agent: harness.makeAgent(project) })
 
   assert.ok(
     harness.logs.some(entry => entry.message.includes('loader')),
@@ -422,7 +436,7 @@ test('loader 缺失时留下可查诊断（撞名守卫退化必须可见）', (
   )
 })
 
-test('commands 服务缺失时留下可查诊断，而不是命令面无声消失', () => {
+test('commands 服务缺失时留下可查诊断，而不是命令面无声消失', async () => {
   const harness = createHarness({ withCommands: false })
   apply(harness.host as never, {})
 
@@ -432,7 +446,7 @@ test('commands 服务缺失时留下可查诊断，而不是命令面无声消�
   )
 })
 
-test('声明 inject：apply 同步依赖的宿主服务必须显式列出', () => {
+test('声明 inject：apply 同步依赖的宿主服务必须显式列出', async () => {
   // `apply` 同步调用 `ctx.get('commands')` 与 `ctx.get('loader')`，`injectNotice` 还
   // 要 `systemPrompt`。不声明的话，缺少这些服务的 profile 上插件会以半个装配状态
   // 运行，而 `practices.md`「Stability」要求放进 `inject` 让插件保持未激活并等待。
@@ -452,7 +466,7 @@ test('批准后提示段被撤下：模型不再看到"未启用任何项目级 
   apply(harness.host as never, {})
   const agent = harness.makeAgent(project)
 
-  harness.fire('agent/created', { agent })
+  await harness.fire('agent/created', { agent })
   assert.equal(harness.liveSections().length, 1, '未批准时应注入待批准提示段')
   const before = (harness.liveSections()[0]!.text as () => string)()
   assert.match(before, /尚未批准/, `创建时提示应说明未批准：${before}`)
@@ -484,7 +498,7 @@ test('撤销后提示段被刷新到当前状态（不留下已批准时期的�
   const agent = harness.makeAgent(project)
 
   // 已批准：挂载、无提示段。
-  harness.fire('agent/created', { agent })
+  await harness.fire('agent/created', { agent })
   assert.equal(harness.pluginCalls.length, 1)
   assert.equal(harness.liveSections().length, 0, 'mount 计划不注入提示')
 
@@ -513,7 +527,7 @@ test('撤销后若文件已不可用，提示段被撤下而不是留着旧文�
   apply(harness.host as never, {})
   const agent = harness.makeAgent(project)
 
-  harness.fire('agent/created', { agent })
+  await harness.fire('agent/created', { agent })
   assert.equal(harness.liveSections().length, 0)
 
   const definition = harness.commands.get('mcp-project')!
@@ -548,8 +562,8 @@ test('/mcp-project 的"已挂载"取自真实记账：会话 B 不谎报计划�
   const agentA = harness.makeAgent(project)
   const agentB = harness.makeAgent(project)
   assert.notEqual(agentA.id, agentB.id, '这条用例的前提是两个**不同**会话')
-  harness.fire('agent/created', { agent: agentA })
-  harness.fire('agent/created', { agent: agentB })
+  await harness.fire('agent/created', { agent: agentA })
+  await harness.fire('agent/created', { agent: agentB })
   assert.equal(harness.pluginCalls.length, 0, '未批准时两个会话都不挂载')
 
   const definition = harness.commands.get('mcp-project')!
@@ -582,7 +596,7 @@ test('trust 回报的是实际挂载结果，不是请求挂载的 configs', asy
   const harness = createHarness()
   apply(harness.host as never, {})
   const agent = harness.makeAgent(project)
-  harness.fire('agent/created', { agent })
+  await harness.fire('agent/created', { agent })
 
   // 让 agent scope 拒绝挂载：`ctx.plugin` 抛错 → 记账里没有该项。
   agent.ctx.plugin = () => { throw new Error('mcp-client 不可用') }
@@ -633,7 +647,7 @@ test('挂载失败的日志只记错误类型，不回显展开后的 env 值', 
     return fiber
   }
 
-  harness.fire('agent/created', { agent })
+  await harness.fire('agent/created', { agent })
   await new Promise(resolve => setTimeout(resolve, 0))
 
   const joined = harness.logs.map(entry => entry.message).join('\n')
@@ -673,7 +687,7 @@ test('fiber 启动失败后该名不再出现在"已挂载"里，并留下"已�
     })
   }
 
-  harness.fire('agent/created', { agent })
+  await harness.fire('agent/created', { agent })
   await new Promise(resolve => setTimeout(resolve, 0))
 
   assert.equal(harness.pluginCalls.length, 1, '已批准的项目服务器应尝试挂载一次')
@@ -728,7 +742,7 @@ test('迟到的 fiber 拒绝不得摘掉同名的新条目（按身份摘除）'
     })
   }
 
-  harness.fire('agent/created', { agent })
+  await harness.fire('agent/created', { agent })
   assert.equal(calls, 1, '首次挂载应走被扣住拒绝的第一条 fiber')
 
   const definition = harness.commands.get('mcp-project')!
@@ -767,7 +781,7 @@ test('过大的 .mcp.json 被拒读：报"过大"而不是"没有 .mcp.json"，�
   const harness = createHarness()
   apply(harness.host as never, {})
   const agent = harness.makeAgent({ root, raw })
-  harness.fire('agent/created', { agent })
+  await harness.fire('agent/created', { agent })
 
   assert.equal(harness.pluginCalls.length, 0, '超限文件不得进入挂载路径')
 
@@ -814,7 +828,7 @@ test('过大的 .mcp.json 被拒读：报"过大"而不是"没有 .mcp.json"，�
 // 那一层同样会丢掉该键——**本插件无法阻止**。因此"该键到不了服务器"是下游局限，
 // 见 `docs/development.md` §8 的未验证项；本用例守护的是"本插件自己不再额外丢一次"。
 
-test('端到端：.mcp.json 的 env 含 __proto__ 键，交给 ctx.plugin 的 config 仍有该键', () => {
+test('端到端：.mcp.json 的 env 含 __proto__ 键，交给 ctx.plugin 的 config 仍有该键', async () => {
   // 用 JSON.parse 而不是字面量：对象字面量里的 `__proto__` 是**设置原型**的特殊语法，
   // 根本不会成为自有键，测不到任何东西。`.mcp.json` 是外部输入，走 JSON.parse。
   const entry = JSON.parse('{"command":"node","env":{"__proto__":"X","OK":"v"}}')
@@ -823,7 +837,7 @@ test('端到端：.mcp.json 的 env 含 __proto__ 键，交给 ctx.plugin 的 co
   const harness = createHarness()
   apply(harness.host as never, {})
 
-  harness.fire('agent/created', { agent: harness.makeAgent(project) })
+  await harness.fire('agent/created', { agent: harness.makeAgent(project) })
 
   assert.equal(harness.pluginCalls.length, 1, '已批准的项目服务器应挂载一次')
   const env = (harness.pluginCalls[0]!.config as { env?: Record<string, string> }).env
@@ -837,14 +851,14 @@ test('端到端：.mcp.json 的 env 含 __proto__ 键，交给 ctx.plugin 的 co
   assert.equal(env['OK'], 'v', '同一条目的其他键不得受影响')
 })
 
-test('端到端：.mcp.json 的 headers 含 __proto__ 键，交给 ctx.plugin 的 config 仍有该键', () => {
+test('端到端：.mcp.json 的 headers 含 __proto__ 键，交给 ctx.plugin 的 config 仍有该键', async () => {
   const entry = JSON.parse('{"type":"http","url":"https://example.invalid","headers":{"__proto__":"Y","H":"v"}}')
   const project = makeProject({ alpha: entry })
   approveAll(project, ['alpha'])
   const harness = createHarness()
   apply(harness.host as never, {})
 
-  harness.fire('agent/created', { agent: harness.makeAgent(project) })
+  await harness.fire('agent/created', { agent: harness.makeAgent(project) })
 
   assert.equal(harness.pluginCalls.length, 1, '已批准的项目服务器应挂载一次')
   const headers = (harness.pluginCalls[0]!.config as { headers?: Record<string, string> }).headers
@@ -887,17 +901,17 @@ function duplicateAgents(harness: ReturnType<typeof createHarness>, project: Pro
   return { first, second }
 }
 
-test('同一 sessionId 的第二个 agent 对象不再重复挂载（缺陷 1 端到端守护）', () => {
+test('同一 sessionId 的第二个 agent 对象不再重复挂载（缺陷 1 端到端守护）', async () => {
   const project = makeProject({ alpha: { command: 'node' } })
   approveAll(project, ['alpha'])
   const harness = createHarness()
   apply(harness.host as never, {})
 
   const { first, second } = duplicateAgents(harness, project, 'session-dup')
-  harness.fire('agent/created', { agent: first })
+  await harness.fire('agent/created', { agent: first })
   assert.equal(harness.pluginCalls.length, 1, '首次创建应挂载一次')
 
-  harness.fire('agent/created', { agent: second })
+  await harness.fire('agent/created', { agent: second })
   assert.equal(
     harness.pluginCalls.length,
     1,
@@ -914,7 +928,7 @@ test('同一 sessionId 的第二个 agent 对象复用同一份记账：untrust 
   apply(harness.host as never, {})
 
   const { first, second } = duplicateAgents(harness, project, 'session-dup')
-  harness.fire('agent/created', { agent: first })
+  await harness.fire('agent/created', { agent: first })
   assert.equal(harness.fibers[0]!.disposed, 0)
 
   // 用**第二个**对象发 untrust：登记项必须落在同一个键上。按对象引用记账时这里什么都
@@ -932,7 +946,7 @@ test('同一 sessionId 的第二个 agent 对象复用同一份记账：untrust 
   )
 })
 
-test('同一 sessionId 的第二个 agent 对象销毁时清理插件侧登记项（agent/disposed 用同一个键）', () => {
+test('同一 sessionId 的第二个 agent 对象销毁时清理插件侧登记项（agent/disposed 用同一个键）', async () => {
   // `agent/disposed` 同样按对象引用取登记项时，清理会落空 → fiber 与提示段一直挂在插件侧
   // （泄漏），直到插件自己被卸载。键必须与挂载时逐字相同。
   const project = makeProject({ alpha: { command: 'node' } })
@@ -941,10 +955,10 @@ test('同一 sessionId 的第二个 agent 对象销毁时清理插件侧登记�
   apply(harness.host as never, {})
 
   const { first, second } = duplicateAgents(harness, project, 'session-dup')
-  harness.fire('agent/created', { agent: first })
+  await harness.fire('agent/created', { agent: first })
   assert.equal(harness.fibers[0]!.disposed, 0)
 
-  harness.fire('agent/disposed', { agent: second })
+  await harness.fire('agent/disposed', { agent: second })
   assert.equal(harness.fibers[0]!.disposed, 1, '销毁第二个对象必须回收第一个对象挂的 fiber')
 
   // 登记项已删：插件随后卸载不得二次 dispose（重复拆除是幂等的）。
@@ -952,7 +966,7 @@ test('同一 sessionId 的第二个 agent 对象销毁时清理插件侧登记�
   assert.equal(harness.fibers[0]!.disposed, 1, '重复拆除不得再次 dispose')
 })
 
-test('同一 sessionId 的第二个 agent 对象命中提示段幂等，不重复注入', () => {
+test('同一 sessionId 的第二个 agent 对象命中提示段幂等，不重复注入', async () => {
   // 未批准 → 会话创建时注入待批准提示段。两个 agent 对象的 ctx 各自独立，因此"幂等"只能
   // 靠插件侧记账判定：按对象引用记账时第二个对象看不到 `record.notice`，会再注册一条。
   const project = makeProject({ alpha: { command: 'node' } })
@@ -960,10 +974,10 @@ test('同一 sessionId 的第二个 agent 对象命中提示段幂等，不重�
   apply(harness.host as never, {})
 
   const { first, second } = duplicateAgents(harness, project, 'session-dup')
-  harness.fire('agent/created', { agent: first })
+  await harness.fire('agent/created', { agent: first })
   assert.equal(harness.liveSections().length, 1, '未批准时应注入待批准提示段')
 
-  harness.fire('agent/created', { agent: second })
+  await harness.fire('agent/created', { agent: second })
   assert.equal(
     harness.liveSections().length,
     1,
@@ -973,7 +987,7 @@ test('同一 sessionId 的第二个 agent 对象命中提示段幂等，不重�
   )
 })
 
-test('不同 sessionId 各自挂载，不误拦', () => {
+test('不同 sessionId 各自挂载，不误拦', async () => {
   // 修复的方向是"按会话身份记账"，不是"全局只挂一次"：N 个会话就是 N 份连接与子进程
   // （规格 §10）。把键改成任何全局唯一值都会让第二个会话静默拿不到工具。
   const project = makeProject({ alpha: { command: 'node' } })
@@ -983,14 +997,14 @@ test('不同 sessionId 各自挂载，不误拦', () => {
 
   const a = harness.makeAgent(project, { id: 'session-a' })
   const b = harness.makeAgent(project, { id: 'session-b' })
-  harness.fire('agent/created', { agent: a })
-  harness.fire('agent/created', { agent: b })
+  await harness.fire('agent/created', { agent: a })
+  await harness.fire('agent/created', { agent: b })
 
   assert.equal(harness.pluginCalls.length, 2, '两个不同会话各挂一次')
   assert.equal(harness.fibers.length, 2, '每个会话有自己的 fiber')
 })
 
-test('agent.id 缺失或非字符串时不挂载，并留下可查诊断', () => {
+test('agent.id 缺失或非字符串时不挂载，并留下可查诊断', async () => {
   // 键不可用时**宁可少挂一次**：退回对象引用正是缺陷 1 的成因，重复挂载会多 spawn 一个
   // 子进程而用户没有任何可见线索；少挂一次在 `/mcp-project` 里看得见（未挂载），重开
   // 会话即恢复。因此这条路径必须是"跳过 + 记日志"，不是"尽力而为地挂上"。
@@ -1001,7 +1015,7 @@ test('agent.id 缺失或非字符串时不挂载，并留下可查诊断', () =>
   for (const badId of badIds) {
     const harness = createHarness()
     apply(harness.host as never, {})
-    harness.fire('agent/created', { agent: harness.makeAgent(project, { id: badId }) })
+    await harness.fire('agent/created', { agent: harness.makeAgent(project, { id: badId }) })
 
     const shown = JSON.stringify(badId)
     assert.equal(harness.pluginCalls.length, 0, `id=${shown} 时不得挂载`)
@@ -1020,7 +1034,7 @@ test('id 不可用时命令层的"已挂载"如实为空（不得谎报）', asy
   apply(harness.host as never, {})
 
   const agent = harness.makeAgent(project, { id: undefined })
-  harness.fire('agent/created', { agent })
+  await harness.fire('agent/created', { agent })
 
   const definition = harness.commands.get('mcp-project')!
   const out = (await Promise.resolve(definition.handler({ agent, rawInput: '' }))) as {
@@ -1042,13 +1056,13 @@ test('id 不可用时命令层的"已挂载"如实为空（不得谎报）', asy
 // 任何配置内容）。纯函数层面的守护（不修改入参、args 缺失、http 直通）在
 // `session-tag.test.mts`；这里是穿过 `apply` 的端到端面。
 
-test('stdio 挂载的命令行带 --project-mcp-session <sessionId>，追加在原有 args 之后', () => {
+test('stdio 挂载的命令行带 --project-mcp-session <sessionId>，追加在原有 args 之后', async () => {
   const project = makeProject({ alpha: { command: 'node', args: ['--stdio', '--version', '9.10.0'] } })
   approveAll(project, ['alpha'])
   const harness = createHarness()
   apply(harness.host as never, {})
 
-  harness.fire('agent/created', { agent: harness.makeAgent(project, { id: 'session-1f4830f2' }) })
+  await harness.fire('agent/created', { agent: harness.makeAgent(project, { id: 'session-1f4830f2' }) })
 
   assert.deepEqual(
     harness.pluginCalls[0]!.config.args,
@@ -1057,7 +1071,7 @@ test('stdio 挂载的命令行带 --project-mcp-session <sessionId>，追加在�
   )
 })
 
-test('两个会话的标记不同：多进程可据此分辨归属', () => {
+test('两个会话的标记不同：多进程可据此分辨归属', async () => {
   // 这是本功能的全部理由：同一份 `.mcp.json` 产出的命令行**逐字相同**，唯一能区分
   // "哪个进程属于哪个会话"的就是这一段。
   const project = makeProject({ alpha: { command: 'node', args: ['--stdio'] } })
@@ -1065,8 +1079,8 @@ test('两个会话的标记不同：多进程可据此分辨归属', () => {
   const harness = createHarness()
   apply(harness.host as never, {})
 
-  harness.fire('agent/created', { agent: harness.makeAgent(project, { id: 'session-a' }) })
-  harness.fire('agent/created', { agent: harness.makeAgent(project, { id: 'session-b' }) })
+  await harness.fire('agent/created', { agent: harness.makeAgent(project, { id: 'session-a' }) })
+  await harness.fire('agent/created', { agent: harness.makeAgent(project, { id: 'session-b' }) })
 
   const tail = (index: number) => harness.pluginCalls[index]!.config.args!.slice(-2)
   assert.deepEqual(tail(0), ['--project-mcp-session', 'session-a'])
@@ -1074,13 +1088,13 @@ test('两个会话的标记不同：多进程可据此分辨归属', () => {
   assert.notDeepEqual(tail(0), tail(1), '两个会话的命令行必须可区分')
 })
 
-test('streamable-http 挂载不追加标记（没有子进程命令行可标记）', () => {
+test('streamable-http 挂载不追加标记（没有子进程命令行可标记）', async () => {
   const project = makeProject({ alpha: { type: 'http', url: 'https://example.invalid/mcp' } })
   approveAll(project, ['alpha'])
   const harness = createHarness()
   apply(harness.host as never, {})
 
-  harness.fire('agent/created', { agent: harness.makeAgent(project, { id: 'session-1' }) })
+  await harness.fire('agent/created', { agent: harness.makeAgent(project, { id: 'session-1' }) })
 
   const config = harness.pluginCalls[0]!.config as { transport?: string; args?: unknown; url?: string }
   assert.equal(config.transport, 'streamable-http')
@@ -1088,7 +1102,7 @@ test('streamable-http 挂载不追加标记（没有子进程命令行可标记�
   assert.equal(config.url, 'https://example.invalid/mcp', 'url 必须原样保留')
 })
 
-test('标记只含 SessionId：不得把展开后的 env 值带进命令行', () => {
+test('标记只含 SessionId：不得把展开后的 env 值带进命令行', async () => {
   // 红线 3 的新通道：命令行对本机所有用户可见（任务管理器、`wmic process get
   // commandline`、`/proc/<pid>/cmdline`）。标记是插件唯一新增的命令行内容，必须证明它
   // 只有 SessionId。
@@ -1099,7 +1113,7 @@ test('标记只含 SessionId：不得把展开后的 env 值带进命令行', ()
   const harness = createHarness()
   apply(harness.host as never, {})
 
-  harness.fire('agent/created', { agent: harness.makeAgent(project, { id: 'session-1' }) })
+  await harness.fire('agent/created', { agent: harness.makeAgent(project, { id: 'session-1' }) })
 
   const args = JSON.stringify(harness.pluginCalls[0]!.config.args)
   assert.equal(args.includes(secret), false, `命令行不得携带展开后的环境变量值：${args}`)

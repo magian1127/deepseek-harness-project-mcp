@@ -193,8 +193,8 @@ function createHarness() {
     host, logs, pluginCalls, fibers, makeAgent,
     /** 全部日志文本（含 warn 与 error），用于"不含敏感值"断言。 */
     joined: () => logs.map(entry => entry.message).join('\n'),
-    fire: (name: string, payload: unknown) => {
-      for (const callback of listeners.get(name) ?? []) callback(payload)
+    fire: async (name: string, payload: unknown) => {
+      for (const callback of listeners.get(name) ?? []) await callback(payload)
     },
   }
 }
@@ -210,7 +210,7 @@ test('schema 不通过时非法 config 被拦在 ctx.plugin 之前，日志不�
   const harness = createHarness()
   apply(harness.host as never, {})
 
-  harness.fire('agent/created', { agent: harness.makeAgent(project) })
+  await harness.fire('agent/created', { agent: harness.makeAgent(project) })
   // 等一个宏任务：fiber 的拒绝处理器是微任务链，日志若由它产生此时已落定。
   await new Promise(resolve => setTimeout(resolve, 0))
 
@@ -238,7 +238,7 @@ test('多条非法配置全部被拦下，每条各留一条安全诊断', async
   const harness = createHarness()
   apply(harness.host as never, {})
 
-  harness.fire('agent/created', { agent: harness.makeAgent(project) })
+  await harness.fire('agent/created', { agent: harness.makeAgent(project) })
   await new Promise(resolve => setTimeout(resolve, 0))
 
   assert.equal(harness.pluginCalls.length, 0, '两条非法配置都不得到达 ctx.plugin()')
@@ -257,7 +257,7 @@ test('挂载记账不含被拦下的服务器：/mcp-project 不得谎报已挂�
   apply(harness.host as never, {})
 
   const agent = harness.makeAgent(project)
-  harness.fire('agent/created', { agent })
+  await harness.fire('agent/created', { agent })
   await new Promise(resolve => setTimeout(resolve, 0))
 
   assert.equal(harness.fibers.length, 0, '被拦下的配置不得留下 fiber')
@@ -282,7 +282,7 @@ test('命令层 trust 路径同样被拦下（两条挂载入口共用同一守�
   apply(harness.host as never, {})
 
   const agent = harness.makeAgent(project)
-  harness.fire('agent/created', { agent })
+  await harness.fire('agent/created', { agent })
   await new Promise(resolve => setTimeout(resolve, 0))
 
   const out = (await Promise.resolve(

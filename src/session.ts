@@ -33,7 +33,24 @@ export type SessionMountPlan =
   | { kind: 'skip'; reason: string; silent?: boolean; skipped?: Array<{ name: string; reason: string }> }
   | { kind: 'invalid'; reason: string }
   | { kind: 'untrusted'; projectRoot: string; fingerprint: string; pending: string[] }
-  | { kind: 'mount'; projectRoot: string; fingerprint: string; configs: McpClientConfig[]; skipped: Array<{ name: string; reason: string }> }
+  | {
+      kind: 'mount'
+      projectRoot: string
+      fingerprint: string
+      configs: McpClientConfig[]
+      skipped: Array<{ name: string; reason: string }>
+      /**
+       * **非致命**诊断：条目本身可用，但其中某个可选字段被丢弃了。
+       *
+       * 目前唯一的来源是 `serve` 字段畸形（`translateServe`）——那种情形下条目照常挂载
+       * （用户可能已手动启好服务），因此它既不能进 `skipped`（那意味着"整条被跳过"），
+       * 也不能无声丢弃（用户会永远不知道"为什么服务没被拉起"）。
+       *
+       * 由**装配层**决定这些文本去哪里：会话创建路径上必须只记日志，绝不进会话提示
+       * ——一条写错的辅助配置不该出现在模型上下文里（红线 4 的降级方向）。
+       */
+      diagnostics: string[]
+    }
 
 /** 翻译成功、进入后续过滤的条目：保留原名用于诊断（规格 §6.2 要求显示原名与规范名）。 */
 interface Candidate {
@@ -88,8 +105,9 @@ export function planSessionMount(input: SessionMountInput): SessionMountPlan {
   //    实际所在目录为工作目录。
   const candidates: Candidate[] = []
   const skipped: SkipNote[] = []
+  const diagnostics: string[] = []
   for (const [name, entry] of Object.entries(parsed.servers)) {
-    const result = translateServer(name, entry, { cwd, env: input.env })
+    const result = translateServer(name, entry, { cwd, env: input.env, diagnostics })
     if (result.kind === 'ok') {
       candidates.push({ originalName: name, serverName: result.serverName, config: result.config })
     } else {
@@ -165,11 +183,15 @@ export function planSessionMount(input: SessionMountInput): SessionMountPlan {
 
   // 12. 挂载（真正挂载由任务 7 执行，本函数只产出配置）。`configs` 为空且
   //     `mountable` 为空时，代表这份文件没有任何可挂载项，原因见 `skipped`。
+  //
+  //     `diagnostics` 原样带出：`serve` 字段畸形时条目仍然可用，那条诊断既不属于
+  //     `skipped`（整条没被跳过），也不该无声丢弃——去哪里由装配层决定。
   return {
     kind: 'mount',
     projectRoot,
     fingerprint: fp,
     configs: approved.map(candidate => candidate.config),
     skipped,
+    diagnostics,
   }
 }

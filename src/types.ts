@@ -105,6 +105,29 @@ export interface AgentShape {
   session: { header: { cwd?: string; parentSession?: unknown; origin?: string } }
 }
 
+/**
+ * 一条 HTTP 条目的**按需拉起服务**元数据（`.mcp.json` 的 `serve` 字段）。
+ *
+ * 这是**本插件自己的**字段，不是 `mcp-client` 的：真实 `Config` 的 union
+ * （`packages/mcp/mcp-client/src/index.ts:119-142`）里没有 `serve`，因此它必须在
+ * `ctx.plugin()` 之前被剥离（`serve.ts` 的 `splitServe`）。
+ *
+ * 全部字段都已在翻译层展开/校验完毕：这里的 `env` 是**展开后的值**，只允许交给
+ * `spawn`，绝不允许进入日志、错误或会话记录（红线 3）。
+ */
+export interface ServeMetadata {
+  /** 可执行文件（已展开 `${VAR}`）。 */
+  command: string
+  /** 参数数组（已展开）。 */
+  args: string[]
+  /** 追加到宿主环境之上的环境变量（已展开，值敏感）。 */
+  env: Record<string, string>
+  /** 就绪检查 URL；`undefined` 表示无从等待（`url` 的 origin 推导失败）。 */
+  health?: string
+  /** 等待就绪的上限（毫秒）。 */
+  readyTimeoutMs: number
+}
+
 /** `@deepseek-ai/dsh-mcp-client` 的 Config 形状（挂载时逐字传给 ctx.plugin）。 */
 export type McpClientConfig =
   | {
@@ -122,4 +145,13 @@ export type McpClientConfig =
       url: string
       headers: Record<string, string>
       failOnStartupError: boolean
+      /**
+       * 按需拉起服务的元数据；**不得**随 config 一起交给 `ctx.plugin()`。
+       *
+       * 为什么挂在 config 上而不是单独一条旁路：`planSessionMount` 只产出
+       * `McpClientConfig[]`，`serve` 属于"这个条目怎么挂"的一部分，与它同源同行最不容易
+       * 走散（分开存放会让两者在去重/撞名过滤后对不上号）。代价是每个消费点都必须
+       * 记得剥离——因此剥离集中在 `splitServe`，且 `mountInto` 是唯一的调用点。
+       */
+      serve?: ServeMetadata
     }
