@@ -41,10 +41,7 @@ export type ConfigGuardResult =
 /** 诊断里回显的字段路径段数上限：路径只用于定位，不是内容通道。 */
 const PATH_SEGMENT_LIMIT = 4
 
-/** 单个路径段的长度上限。 */
-const PATH_SEGMENT_LENGTH_LIMIT = 32
-
-/** 单段路径允许的字符集；不匹配则整条路径退化为"未提供字段路径"。 */
+/** 单段路径允许的字符集与长度；不匹配则整条路径退化为"未提供字段路径"。 */
 const PATH_SEGMENT_PATTERN = /^[A-Za-z0-9_-]{1,32}$/
 
 /**
