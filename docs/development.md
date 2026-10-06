@@ -31,6 +31,7 @@
 | `trust.ts` | 信任存储读写、规范化指纹、批准/撤销、存储路径 | 纯函数 + 注入 I/O |
 | `global-rows.ts` | 从 Loader 树收集全局 `mcp-client` 行的 `serverName` | 纯函数（只读遍历） |
 | `session.ts` | `planSessionMount`：会话 → 挂载决策（纯函数，零 I/O） | 纯函数 |
+| `session-tag.ts` | `withSessionTag`：给 stdio config 追加 `--project-mcp-session <SessionId>` 标记（返回新对象） | 纯函数 |
 | `commands.ts` | `/mcp-project` 命令族（列表 / trust / untrust） | 无（依赖经 `CommandDeps` 注入） |
 | `notice.ts` | `renderNotice`：会话提示文本 | 纯函数 |
 
@@ -41,12 +42,13 @@ index.ts ──> session.ts ──> discovery.ts, translate.ts, trust.ts, global
    │                              │
    ├──> commands.ts, notice.ts    └──> types.ts
    ├──> config-guard.ts ──> types.ts
+   ├──> session-tag.ts ──> types.ts
    └──> profile-modules.ts
 ```
 
 **职责边界**：`session.ts` / `translate.ts` / `discovery.ts` / `trust.ts` / `global-rows.ts`
-各自只承担一件事、互不依赖，且全部通过注入 I/O 保持可彻底单测。`index.ts` 是唯一的装配层，
-因此它的测试是"假 ctx + 真实 fs"的集成冒烟，而非穷尽单测。
+/ `session-tag.ts` 各自只承担一件事、互不依赖，且全部通过注入 I/O（或干脆无 I/O）保持可彻底
+单测。`index.ts` 是唯一的装配层，因此它的测试是"假 ctx + 真实 fs"的集成冒烟，而非穷尽单测。
 
 **"唯一做 I/O"的准确范围**：`index.ts` 是唯一做**会话数据** I/O（`.mcp.json` 与信任存储
 的读写）与 Cordis 交互的模块。上表把 `profile-modules.ts` 的 I/O 记为"模块解析 + 文件读"
@@ -194,13 +196,13 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 
 | 层 | 覆盖 | 命令 |
 | --- | --- | --- |
-| 纯函数单测 | `discovery` / `translate` / `trust` / `global-rows` / `session` / `notice` / `config-guard` | `npm test` |
+| 纯函数单测 | `discovery` / `translate` / `trust` / `global-rows` / `session` / `notice` / `config-guard` / `session-tag` | `npm test` |
 | 装配集成 | `plugin-smoke`（假 ctx，验证注册与清理可逆）、`commands`（注入 `CommandDeps`，验证命令输出）、`mount`（真实 fs + 假 agent ctx，验证挂载路径）、`mount-guard`（真实 fs + 假 mcp-client，验证非法 config 被拦在 `ctx.plugin()` 之前） | `npm test` |
 | 模块解析 | `profile-modules`（`--profile` 解析、`DSH_HOME` 落点）、`profile-config-contract`（对**已安装的 profile 模块**断言 `Config['~standard']` 契约） | `npm test` |
 | 类型 | `tsc --noEmit` | `npm run typecheck` |
 | 打包 | tarball 内容 | `npm pack --dry-run` |
 
-### 7.2 测试文件与用例数（当前 169）
+### 7.2 测试文件与用例数（当前 190）
 
 | 文件 | 用例 | 覆盖 |
 | --- | --- | --- |
@@ -215,7 +217,8 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 | `session.test.mts` | 16 | 无 cwd、子代理判据（`origin` 单条）、**分叉会话（有 `parentSession`、无 `origin`）应当挂载 / 未批准时进入 untrusted**、**两者同时存在时仍跳过**、无文件静默跳过、未信任、已信任、指纹失配、撞名跳过、损坏文件、结构错误、全候选被跳过时不要求批准、规范化去重、未知传输、变量缺失诊断 |
 | `plugin-smoke.test.mts` | 6 | `apply` 注册与注销、`agent/created` 监听可逆、`renderNotice` 四态 |
 | `commands.test.mts` | 17 | 未批准仍显示诊断、部分批准同时可见、空 `configs` 说明、**"已挂载"取自真实记账（计划要挂但没挂上时不谎报）**、**挂载后文件改动仍按记账呈现**、trust 用计划键、幂等（含回报去重）、未知名字报错、untrust 卸载、**untrust 刷新提示段**、**trust 刷新顺序（落盘→挂载→刷新）**、**写盘失败不刷新**、**无项目根不刷新**、未知子命令、无 agent、**命令声明 `input.hint`（缺它则带参数的行被当成对话发给模型）**、**命令名与描述齐备且符合宿主正则**、**未批准时输出可照抄的下一步命令** |
-| `mount.test.mts` | 20 | 未批准不挂载（安全断言）、挂载带 `failOnStartupError: false`、loader 传本体、重复 trust 幂等、插件卸载回收、agent 销毁清理、loader 缺失诊断、commands 缺失诊断、`inject` 声明、**批准后提示段被撤下**、**撤销后提示段刷新为待批准**、**文件消失后提示段撤下**、**会话 B 不谎报已挂载**、**trust 回报实际挂载结果**、**挂载失败日志只记错误类型、不回显展开后的 env 值**、**fiber 启动失败后该名不再出现在"已挂载"里（并留下"已从挂载记账移除"诊断）**、**迟到的 fiber 拒绝不摘掉同名新条目（按身份摘除）**、**过大的 `.mcp.json` 报"过大"而非"没有 `.mcp.json"`，且不进入挂载路径**、**端到端：`env` 的 `__proto__` 键穿过守卫到达 `ctx.plugin()`**、**端到端：`headers` 的 `__proto__` 键穿过守卫到达 `ctx.plugin()`** |
+| `mount.test.mts` | 31 | 未批准不挂载（安全断言）、挂载带 `failOnStartupError: false`、loader 传本体、重复 trust 幂等、插件卸载回收、agent 销毁清理、loader 缺失诊断、commands 缺失诊断、`inject` 声明、**批准后提示段被撤下**、**撤销后提示段刷新为待批准**、**文件消失后提示段撤下**、**会话 B 不谎报已挂载**、**trust 回报实际挂载结果**、**挂载失败日志只记错误类型、不回显展开后的 env 值**、**fiber 启动失败后该名不再出现在"已挂载"里（并留下"已从挂载记账移除"诊断）**、**迟到的 fiber 拒绝不摘掉同名新条目（按身份摘除）**、**过大的 `.mcp.json` 报"过大"而非"没有 `.mcp.json"`，且不进入挂载路径**、**端到端：`env` 的 `__proto__` 键穿过守卫到达 `ctx.plugin()`**、**端到端：`headers` 的 `__proto__` 键穿过守卫到达 `ctx.plugin()`**、**同一 sessionId 的第二个 agent 对象不重复挂载**、**第二个对象发起的 untrust 能卸载第一个对象挂的 fiber**、**第二个对象销毁时回收第一个对象的 fiber**、**第二个对象不重复注入提示段**、**不同 sessionId 各自挂载**、**`agent.id` 缺失或非字符串时不挂载且有诊断（六种非法值）**、**id 不可用时"已挂载"如实为空**、**stdio 命令行带 `--project-mcp-session <sessionId>` 且追加在原有 args 之后**、**两个会话的标记不同**、**http 不追加标记**、**标记只含 SessionId，不带展开后的 env 值** |
+| `session-tag.test.mts` | 10 | 标记追加在原有 args 之后、参数名带 `project-mcp` 前缀、不修改入参（含冻结对象）、连续标记两次结果相同（不累积）、`args` 缺失时标记成为唯一参数、`args` 非数组时按缺失处理、`args` 里的非字符串项被剔除、`streamable-http` 原样返回且不凭空多出 `args`、标记只含 SessionId 不带 env 值、保留 config 的其他字段 |
 
 ### 7.3 Review Focus 的守护位置
 
@@ -259,7 +262,7 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 
 ## 8 验证分层与未验证项
 
-**已由测试与命令覆盖**：上表 169 个用例、`npm run typecheck`、`npm pack --dry-run` 的
+**已由测试与命令覆盖**：上表 190 个用例、`npm run typecheck`、`npm pack --dry-run` 的
 tarball 内容。
 
 **未在真实 DSH 运行时验证**（需要真实 profile 与会话，无法在纯单元测试中覆盖）：
@@ -304,6 +307,40 @@ Select-String -Path src\commands.ts -Pattern 'plan\.configs'
 
 第一条应命中 `commands.ts`（接口 + 两处调用）与 `index.ts`（定义 + 注入）；第二条应**无**
 命中。守护用例见 §7.2 的 `commands.test.mts` 与 `mount.test.mts` 行。
+
+### 8.2 诊断：分辨一个 MCP 子进程属于哪个会话
+
+每个 stdio 服务器在命令行末尾带 `--project-mcp-session <SessionId>`（见
+[`behavior.md` §10](behavior.md#10-挂载语义) 与 `session-tag.ts`）。同一份 `.mcp.json` 在
+多个会话下的 `command` / `args` / `cwd` **逐字相同**，因此这段标记是唯一可区分归属的字段。
+
+```powershell
+# 按标记筛选出本插件启动的全部子进程，并列出各自的会话 id
+Get-CimInstance Win32_Process -Filter "Name = 'node.exe' OR Name = 'dotnet.exe'" |
+  Where-Object { $_.CommandLine -match '--project-mcp-session' } |
+  Select-Object ProcessId, ParentProcessId, CommandLine
+
+# 只看标记本身（会话 id 列表）
+Get-CimInstance Win32_Process |
+  Where-Object { $_.CommandLine -match '--project-mcp-session\s+(\S+)' } |
+  ForEach-Object { [regex]::Match($_.CommandLine, '--project-mcp-session\s+(\S+)').Groups[1].Value }
+```
+
+判定规则：
+
+| 观察 | 含义 |
+| --- | --- |
+| 同一 `SessionId` 出现**两个**进程，且 `ParentProcessId` 相同、启动时间相近 | 重复挂载（会话被 `agent/created` 报告两次却记了两笔账）——记账键必须按 `agent.id` |
+| 进程数 == 不同 `SessionId` 数 | 正常：每会话一份连接与子进程 |
+| 有进程但**没有** `--project-mcp-session` | 该进程不是本插件启动的（全局 MCP 行、用户自己起的服务器），或进程起于标记功能之前 |
+| 进程的 `cwd` 与会话工作区不符 | 与本插件无关；本插件把 `cwd` 设为会话工作区（`translate.ts` 的 `options.cwd`） |
+
+进程命令行对本机所有用户可见，因此标记**只含 SessionId**：不得把 `.mcp.json` 的内容或
+展开后的环境变量值（红线 3）放进任何命令行参数。`mount.test.mts` 的"标记只含 SessionId"
+用例守护这一条。
+
+Host 半边没有热通道：标记要进入长跑进程，需要使用者重启一次 DSH。**在重启之前**看到的
+命令行没有标记是正常的，不代表功能没实现。
 
 ## 9. 已知局限（实现层面）
 

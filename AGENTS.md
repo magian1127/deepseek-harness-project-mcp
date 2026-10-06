@@ -31,8 +31,10 @@
    **变量名**与服务器名，绝不回显 `.mcp.json` 内容。
 4. 会话创建路径上的任何函数**都不抛异常**（抛异常会中断会话创建）；失败一律降级并记日志。
 5. 挂载必须**不 await 连接**且设 `failOnStartupError: false`：会话秒开优先于工具必定就位。
-6. 挂载与提示段的 disposer 必须**双份登记**：注册落在 `agent.ctx`，disposer 同时按 agent
-   键控地留在插件自己的 `ctx.effect` 里（`agent.ctx` 上的注册有两个 owner）。
+6. 挂载与提示段的 disposer 必须**双份登记**：注册落在 `agent.ctx`，disposer 同时按
+   **`agent.id`（会话 id）**键控地留在插件自己的 `ctx.effect` 里（`agent.ctx` 上的注册有
+   两个 owner）。**不得**按 agent 对象引用记账：同一 sessionId 可能被 `agent/created`
+   报告两次且传的是不同对象，按引用记账会让幂等失效、重复挂载并多 spawn 一个子进程。
 7. `ctx.get('loader')` 必须传 **Loader 本体**而非 `loader.root`；传 root 会让全局名单静默
    变成空集、撞名守卫完全失效。
 8. 信任键（`projectRoot` + `fingerprint`）必须与 `isApproved` 的查询键逐字一致；批准时复用
@@ -53,6 +55,7 @@
 | `src/trust.ts` | 信任存储、规范化指纹、批准/撤销 |
 | `src/global-rows.ts` | 从 Loader 树收集全局 `mcp-client` 行的 `serverName` |
 | `src/session.ts` | `planSessionMount`：会话 → 挂载决策（纯函数，零 I/O） |
+| `src/session-tag.ts` | `withSessionTag`：给 stdio config 追加 `--project-mcp-session <SessionId>` 会话标记（纯函数，返回新对象） |
 | `src/commands.ts` | `/mcp-project` 命令族（依赖经 `CommandDeps` 注入） |
 | `src/notice.ts` | `renderNotice`：会话提示文本（只在需用户行动时非空） |
 
@@ -63,11 +66,13 @@ index.ts ──> session.ts ──> discovery.ts, translate.ts, trust.ts, global
    │                              │
    ├──> commands.ts, notice.ts    └──> types.ts
    ├──> config-guard.ts ──> types.ts
+   ├──> session-tag.ts ──> types.ts
    └──> profile-modules.ts
 ```
 
 `session.ts` / `translate.ts` / `discovery.ts` / `trust.ts` / `global-rows.ts` /
-`config-guard.ts` 各自只承担一件事、互不依赖，全部通过注入 I/O 保持可彻底单测。
+`config-guard.ts` / `session-tag.ts` 各自只承担一件事、互不依赖，全部通过注入 I/O
+（或干脆无 I/O）保持可彻底单测。
 
 **"唯一做 I/O"的准确范围**：`index.ts` 是唯一做**会话数据** I/O（`.mcp.json` 与信任
 存储的读写）与 Cordis 交互的模块。`profile-modules.ts` 是**显式例外**——它做真实 I/O
@@ -80,7 +85,7 @@ index.ts ──> session.ts ──> discovery.ts, translate.ts, trust.ts, global
 ```powershell
 npm install
 npm run typecheck                        # tsc -p tsconfig.json --noEmit
-npm test                                 # 169 个用例，12 个测试文件
+npm test                                 # 190 个用例，13 个测试文件
 npm pack --dry-run                       # 核对 tarball 内容（files 字段）
 (Get-Content AGENTS.md).Count            # 必须 ≤ 200
 ```
