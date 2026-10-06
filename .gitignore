@@ -2,3 +2,6 @@ node_modules/
 lib/
 .tsbuild/
 temp/
+# MudMCP 之类的外部 MCP 服务器会在**会话 cwd** 里建索引（实测约 27 MB）。
+# 本仓库自己不开会话，但若在仓库目录下调试 MCP 就会生成它——忽略以免脏工作树。
+/data/
