@@ -247,7 +247,20 @@ function renderList(view: ProjectInspection, store: TrustStore): CommandOutcome 
     lines.push('（.mcp.json 里没有声明任何服务器。）')
   }
 
-  lines.push(USAGE)
+  // 末尾给出**可照抄的下一步**，而不是只列用法：用户不必记住子命令拼写。
+  // 只在确实需要用户行动时提示；已经挂好时不啰嗦（避免每条命令都刷一遍用法）。
+  if (unapproved.length > 0) {
+    lines.push(
+      `下一步：运行 /mcp-project trust 批准这份文件的全部服务器，` +
+        `或 /mcp-project trust ${unapproved.join(' ')} 只批准以上列出的项。`,
+    )
+  } else if (plannedNotMounted.length > 0) {
+    lines.push(
+      '下一步：这些服务器已在信任列表中，但本会话未挂载——重开一个会话即可挂载，' +
+        '或运行 /mcp-project trust 在本会话立即挂载。',
+    )
+  }
+
   return { kind: 'success', text: lines.join('\n') }
 }
 
@@ -382,6 +395,13 @@ export function registerCommands(ctx: HostContext, deps: CommandDeps): Disposer 
   return commands.register({
     name: COMMAND_NAME,
     description: DESCRIPTION,
+    // **必须声明 `input`**：客户端只把带参数的行路由给声明了 `input` 的命令
+    // （`packages/client/ui-commands/src/client/service.ts:340-344`：`desc.input !== undefined`
+    // 才 `leadingClaim`，否则 `if (!bare) return undefined` → 该行作为普通消息发给模型）。
+    // 漏了它，`/mcp-project trust mudblazor` 会被当成对话，而裸 `/mcp-project` 仍正常
+    // ——症状极具误导性。`hint` 必须是非空字符串，否则注册时抛 TypeError
+    // （`packages/interaction/commands/src/index.ts:193-206`）。
+    input: { hint: '[trust [<名称>…] | untrust]' },
     handler: (invocation) => {
       const agent = invocation.agent
       // 命令由某个会话的 UI 派发；没有 agent 就无法定位项目、也无处挂载。

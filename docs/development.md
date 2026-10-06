@@ -200,7 +200,7 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 | 类型 | `tsc --noEmit` | `npm run typecheck` |
 | 打包 | tarball 内容 | `npm pack --dry-run` |
 
-### 7.2 测试文件与用例数（当前 166）
+### 7.2 测试文件与用例数（当前 169）
 
 | 文件 | 用例 | 覆盖 |
 | --- | --- | --- |
@@ -214,7 +214,7 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 | `global-rows.test.mts` | 9 | 收集 `mcp-client` 行、忽略非 mcp-client / 缺 `serverName` / 非字符串、`loader` 缺失或形状不符或 `entries()` 抛错时降级空集、嵌套子树 |
 | `session.test.mts` | 16 | 无 cwd、子代理判据（`origin` 单条）、**分叉会话（有 `parentSession`、无 `origin`）应当挂载 / 未批准时进入 untrusted**、**两者同时存在时仍跳过**、无文件静默跳过、未信任、已信任、指纹失配、撞名跳过、损坏文件、结构错误、全候选被跳过时不要求批准、规范化去重、未知传输、变量缺失诊断 |
 | `plugin-smoke.test.mts` | 6 | `apply` 注册与注销、`agent/created` 监听可逆、`renderNotice` 四态 |
-| `commands.test.mts` | 14 | 未批准仍显示诊断、部分批准同时可见、空 `configs` 说明、**"已挂载"取自真实记账（计划要挂但没挂上时不谎报）**、**挂载后文件改动仍按记账呈现**、trust 用计划键、幂等（含回报去重）、未知名字报错、untrust 卸载、**untrust 刷新提示段**、**trust 刷新顺序（落盘→挂载→刷新）**、**写盘失败不刷新**、**无项目根不刷新**、未知子命令、无 agent |
+| `commands.test.mts` | 17 | 未批准仍显示诊断、部分批准同时可见、空 `configs` 说明、**"已挂载"取自真实记账（计划要挂但没挂上时不谎报）**、**挂载后文件改动仍按记账呈现**、trust 用计划键、幂等（含回报去重）、未知名字报错、untrust 卸载、**untrust 刷新提示段**、**trust 刷新顺序（落盘→挂载→刷新）**、**写盘失败不刷新**、**无项目根不刷新**、未知子命令、无 agent、**命令声明 `input.hint`（缺它则带参数的行被当成对话发给模型）**、**命令名与描述齐备且符合宿主正则**、**未批准时输出可照抄的下一步命令** |
 | `mount.test.mts` | 20 | 未批准不挂载（安全断言）、挂载带 `failOnStartupError: false`、loader 传本体、重复 trust 幂等、插件卸载回收、agent 销毁清理、loader 缺失诊断、commands 缺失诊断、`inject` 声明、**批准后提示段被撤下**、**撤销后提示段刷新为待批准**、**文件消失后提示段撤下**、**会话 B 不谎报已挂载**、**trust 回报实际挂载结果**、**挂载失败日志只记错误类型、不回显展开后的 env 值**、**fiber 启动失败后该名不再出现在"已挂载"里（并留下"已从挂载记账移除"诊断）**、**迟到的 fiber 拒绝不摘掉同名新条目（按身份摘除）**、**过大的 `.mcp.json` 报"过大"而非"没有 `.mcp.json"`，且不进入挂载路径**、**端到端：`env` 的 `__proto__` 键穿过守卫到达 `ctx.plugin()`**、**端到端：`headers` 的 `__proto__` 键穿过守卫到达 `ctx.plugin()`** |
 
 ### 7.3 Review Focus 的守护位置
@@ -259,7 +259,7 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 
 ## 8 验证分层与未验证项
 
-**已由测试与命令覆盖**：上表 166 个用例、`npm run typecheck`、`npm pack --dry-run` 的
+**已由测试与命令覆盖**：上表 169 个用例、`npm run typecheck`、`npm pack --dry-run` 的
 tarball 内容。
 
 **未在真实 DSH 运行时验证**（需要真实 profile 与会话，无法在纯单元测试中覆盖）：

@@ -223,6 +223,16 @@ DSH 源码，超出"只加插件"的范围。实际影响很小：SSE 已被 MCP
 
 行为细节：
 
+- **命令必须声明 `input`**：客户端只把**带参数**的行路由给声明了 `input` 的命令
+  （`packages/client/ui-commands/src/client/service.ts:340-344`：`desc.input !== undefined`
+  才走 `leadingClaim`，否则 `if (!bare) return undefined` → 该行作为普通消息发给模型）。
+  漏声明时裸 `/mcp-project` 仍可用、带参数却变成对话——注册时声明
+  `input: { hint: '[trust [<名称>…] | untrust]' }`，`hint` 非空否则注册抛 `TypeError`。
+- **批准是持久的、不是每会话一次**：记录写在 `${DSH_HOME:-~/.dsh}/project-mcp-trust.json`，
+  同一项目批准一次后，之后所有会话直接挂载、不再询问。只有首次使用、以及 `.mcp.json`
+  内容变更（如 `git pull`）才需再次批准。
+- **列表末尾给出可照抄的下一步**：`/mcp-project` 在存在未批准项或"已批准但本会话未挂载"
+  时，输出末尾直接给出对应命令行，用户不必记子命令拼写；已挂好时不重复刷用法。
 - **必须带名称时才校验名称**：带参数批准时，名称必须是当前**可挂载**的规范名（照
   `/mcp-project` 或会话提示里列出的抄）。写错会报错且**不写**信任存储——写进去的条目
   永远不会命中查询，批准会静默失效。

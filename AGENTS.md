@@ -80,7 +80,7 @@ index.ts ──> session.ts ──> discovery.ts, translate.ts, trust.ts, global
 ```powershell
 npm install
 npm run typecheck                        # tsc -p tsconfig.json --noEmit
-npm test                                 # 164 个用例，12 个测试文件
+npm test                                 # 169 个用例，12 个测试文件
 npm pack --dry-run                       # 核对 tarball 内容（files 字段）
 (Get-Content AGENTS.md).Count            # 必须 ≤ 200
 ```

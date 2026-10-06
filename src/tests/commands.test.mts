@@ -19,6 +19,47 @@ import type { TrustStore } from '../trust.js'
 
 const AGENT = { id: 'a1', session: { header: { cwd: '/repo' } } } as unknown as AgentShape
 
+/**
+ * 守护 `input` 声明本身——这是一个**曾真实发生的用户可见缺陷**。
+ *
+ * 客户端的命令判定规则（`packages/client/ui-commands/src/client/service.ts:340-344`）是：
+ * 声明了 `input` 的命令，带参数的行才被 `leadingClaim` 路由给它；未声明时走
+ * `if (!bare) return undefined`，于是 `/mcp-project trust mudblazor` 被当成**普通对话
+ * 发给模型**，而裸 `/mcp-project` 仍正常——症状极具误导性（命令"半可用"）。
+ *
+ * 因此这条断言不是形式检查：删掉 `input` 会让带参数的子命令整体失效。
+ * 同时守护 `hint` 非空——空串会在注册时抛 TypeError（`commands/src/index.ts:199-200`）。
+ */
+test('命令声明了 input.hint，带参数的子命令才会被客户端路由', () => {
+  const h = harness(deps({ view: listView() }))
+  const def = h.definition()
+  assert.ok(def.input, '缺少 input 声明：带参数的行会被当成对话发给模型')
+  assert.equal(typeof def.input.hint, 'string')
+  assert.ok(def.input.hint.trim().length > 0, 'input.hint 不能为空（注册时会抛 TypeError）')
+  // 提示里应让用户看到可用的子动作，否则等于没提示。
+  assert.match(def.input.hint, /trust/)
+})
+
+test('命令名与描述齐备且名字符合宿主正则', () => {
+  const h = harness(deps({ view: listView() }))
+  const def = h.definition()
+  assert.equal(def.name, 'mcp-project')
+  assert.match(def.name, /^[a-z][a-z0-9_-]*$/)
+  assert.ok(def.description.trim().length > 0)
+})
+
+/** 一个最小的、可列出内容的检视结果，供只关心注册元数据的用例使用。 */
+function listView(): ProjectInspection {
+  return {
+    projectRoot: '/repo',
+    plan: { kind: 'untrusted', projectRoot: '/repo', fingerprint: 'sha256:x', pending: ['ok'] },
+    mountable: ['ok'],
+    renamed: [],
+    skipped: [],
+    mounted: [],
+  }
+}
+
 function config(serverName: string): McpClientConfig {
   return {
     transport: 'stdio',
@@ -33,7 +74,14 @@ function config(serverName: string): McpClientConfig {
 
 /** 捕获注册的命令定义。 */
 function harness(deps: CommandDeps) {
-  let definition: { handler: (i: { agent?: AgentShape; rawInput?: string }) => unknown } | undefined
+  let definition:
+    | {
+        name: string
+        description: string
+        input?: { hint: string }
+        handler: (i: { agent?: AgentShape; rawInput?: string }) => unknown
+      }
+    | undefined
   const ctx = {
     get: (name: string) =>
       name === 'commands'
@@ -45,11 +93,12 @@ function harness(deps: CommandDeps) {
 
   registerCommands(ctx, deps)
   assert.ok(definition, 'mcp-project 命令未注册')
-  return (rawInput: string) =>
+  const run = (rawInput: string) =>
     Promise.resolve(definition!.handler({ agent: AGENT, rawInput })) as Promise<{
       kind: string
       text: string
     }>
+  return Object.assign(run, { definition: () => definition! })
 }
 
 function deps(overrides: Partial<CommandDeps> & { view: ProjectInspection }): CommandDeps {
@@ -65,6 +114,25 @@ function deps(overrides: Partial<CommandDeps> & { view: ProjectInspection }): Co
     ...rest,
   }
 }
+
+test('未批准时给出可照抄的下一步，而不是只列用法', async () => {
+  // 用户不必记子命令拼写：未批准时必须直接给出能复制的命令行。
+  const run = harness(deps({
+    view: {
+      projectRoot: '/repo',
+      plan: { kind: 'untrusted', projectRoot: '/repo', fingerprint: 'sha256:x', pending: ['alpha', 'beta'] },
+      mountable: ['alpha', 'beta'],
+      renamed: [],
+      skipped: [],
+      mounted: [],
+    },
+  }))
+
+  const out = await run('')
+  assert.equal(out.kind, 'success')
+  assert.match(out.text, /下一步/)
+  assert.match(out.text, /\/mcp-project trust/)
+})
 
 test('未批准状态下仍显示跳过原因与重命名（诊断不被信任状态吞掉）', async () => {
   // `untrusted` 计划**不携带** `skipped`；跳过诊断只存在于检视层补齐的名单里。

@@ -109,10 +109,20 @@ Approving needs no session restart. Any change to `.mcp.json` (including added e
 the fingerprint and forces re-approval — that is exactly the protection when a `git pull` brings in
 a new server.
 
+**Approval is persistent, not per-session.** The record lives in
+`${DSH_HOME:-~/.dsh}/project-mcp-trust.json`, so once a project is approved every later session mounts
+directly without asking. Only two situations require approving again:
+
+- the project's **first** use;
+- the contents of `.mcp.json` changed (for example a `git pull` brought in a new server).
+
 Diagnostics (why each server was skipped, which name was normalized, "this file has no usable
 server") live in `/mcp-project` output rather than session notices. Session notices appear only when
 **you need to act**: the file cannot be used (unparsable, or over 1 MiB), or entries are pending
 approval.
+
+`/mcp-project` ends its output with the **exact next command to copy**, so you never have to remember
+subcommand spellings.
 
 ## Data boundaries
 

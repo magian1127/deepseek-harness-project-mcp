@@ -52,6 +52,18 @@ export interface CommandsService {
 export interface CommandDefinitionShape {
   name: string
   description: string
+  /**
+   * 命令接受自由输入的声明（`CommandInputDescriptor`）。
+   *
+   * **不是可选的形式装饰**：客户端只把带参数的行路由给声明了 `input` 的命令
+   * （`packages/client/ui-commands/src/client/service.ts:340-344`：`desc.input !== undefined`
+   * 才 `leadingClaim`，否则 `if (!bare) return undefined` → 该行作为普通消息发给模型）。
+   * 漏声明时裸命令仍可用、带参数却变成对话，症状极具误导性。
+   *
+   * `hint` 必须是非空字符串，否则注册时抛 `TypeError`
+   * （`packages/interaction/commands/src/index.ts:193-206`）。
+   */
+  input?: { hint: string; attachments?: boolean }
   handler: (invocation: { agent?: AgentShape; rawInput?: string }) => unknown
 }
 
