@@ -22,7 +22,7 @@
 
 | 模块 | 职责 | I/O |
 | --- | --- | --- |
-| `index.ts` | 插件入口 `apply`：装配命令、订阅 `agent/created` 与 `agent/disposed`、挂载与卸载、写信任存储 | **唯一做真实 I/O 与 Cordis 交互的模块** |
+| `index.ts` | 插件入口 `apply`：装配命令、订阅 `agent/created` 与 `agent/disposed`、挂载与卸载、写信任存储 | **唯一做会话数据 I/O 与 Cordis 交互的模块**（`profile-modules.ts` 是显式例外，见下） |
 | `config-guard.ts` | 挂载前的 Config 自校验（`validateMountConfig`）与只记类型名的 `errorName` | 纯函数 |
 | `types.ts` | 宿主服务的最小鸭子类型（`HostContext` / `AgentContext` / `CommandsService` / `SystemPromptService` / `LoaderService` / `AgentShape` / `McpClientConfig`） | 无 |
 | `profile-modules.ts` | 从当前 profile 的模块解析上下文解析并预载 DSH 运行时模块 | 模块解析 + 文件读 |
@@ -47,6 +47,13 @@ index.ts ──> session.ts ──> discovery.ts, translate.ts, trust.ts, global
 **职责边界**：`session.ts` / `translate.ts` / `discovery.ts` / `trust.ts` / `global-rows.ts`
 各自只承担一件事、互不依赖，且全部通过注入 I/O 保持可彻底单测。`index.ts` 是唯一的装配层，
 因此它的测试是"假 ctx + 真实 fs"的集成冒烟，而非穷尽单测。
+
+**"唯一做 I/O"的准确范围**：`index.ts` 是唯一做**会话数据** I/O（`.mcp.json` 与信任存储
+的读写）与 Cordis 交互的模块。上表把 `profile-modules.ts` 的 I/O 记为"模块解析 + 文件读"
+——它**确实**做真实 I/O（`readFileSync` 读 `package.json`、`createRequire`、动态 `import`），
+是这条不变量的**显式例外**：那是 profile 模块解析，与会话数据无关，且刻意独立成模块以便
+隔离"从 profile 载入 DSH 运行时模块"这一副作用（模块顶层就会执行，见 §7.4 的 `DSH_HOME`
+时序要求）。因此不要把会话数据 I/O 搬出 `index.ts`，也不要把 profile 解析搬进来。
 
 ## 3. 依赖策略：不把 `@deepseek-ai/*` 写进依赖
 
@@ -193,7 +200,7 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 | 类型 | `tsc --noEmit` | `npm run typecheck` |
 | 打包 | tarball 内容 | `npm pack --dry-run` |
 
-### 7.2 测试文件与用例数（当前 159）
+### 7.2 测试文件与用例数（当前 164）
 
 | 文件 | 用例 | 覆盖 |
 | --- | --- | --- |
@@ -201,14 +208,14 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 | `config-guard.test.mts` | 20 | 合法放行与规范化值回传、`value` 缺失时退回原配置、非法 `serverName` / 缺失 `command` 的诊断只含字段路径、无 `path` 时的通用摘要、`env` 键名可入诊断、不可信 path 段整条作废（含 `=`、超长、换行、非原始值、symbol）、数组下标合法、段数上限截断、**根级 union 无 `path` 时下钻 union 成员取字段**、成员抛错/返回 thenable 不影响主判定、非 union 不下钻、空 `issues` 视为失败、异步校验拦下、校验抛错只记类型名、非对象结果拦下、schema 缺失放行、`validate` 以 `~standard` 为接收者调用、`errorName` 只回类型名 |
 | `mount-guard.test.mts` | 4 | **schema 不通过时非法 config 被拦在 `ctx.plugin()` 之前且日志不含敏感值**、**多条非法配置全部拦下**、**被拦下的项不进挂载记账**、**命令层 trust 路径共用同一守卫** |
 | `profile-config-contract.test.mts` | 6 | 对**已安装的 profile 模块**断言：`Config` 是带 `~standard` 的 schemastery union、`validate` 同步、合法返回补齐默认值的 `value`、**非法时 `issue.message` 回显整个 config（泄密源）**、`validateMountConfig` 在真实 schema 上放行合法/拦下非法且不泄漏 |
-| `discovery.test.mts` | 10 | 向上找最近的 `.git`、无 `.git` 回退 cwd、`absent` / 非法 JSON / 顶层非对象 / `mcpServers` 非对象、缺 `mcpServers` 按空、原文透传用于指纹 |
+| `discovery.test.mts` | 12 | 向上找最近的 `.git`、无 `.git` 回退 cwd、`absent` / 非法 JSON / 顶层非对象 / `mcpServers` 非对象、缺 `mcpServers` 按空、原文透传用于指纹、**尺寸超限归一为 `invalid`（带尺寸与上限）而不是 `absent`**、**非哨兵异常仍返回 `absent`** |
 | `translate.test.mts` | 29 | `normalizeServerName` 六态、`expandVariables` 六态（含原型链）、`translateServer` 的 stdio / http / 别名 / sse / ws / 无 type 有 url / 非对象 / 缺 command / 变量缺失 / env 展开 / 规范名、**`env` 与 `headers` 的 `__proto__` 键保留三态（含展开后落在该键上）**、**`command` / `url` 展开为空串时跳过** |
 | `trust.test.mts` | 25 | 指纹稳定性与敏感性（空白、键序、新增条目、`__proto__`、超深嵌套）、读写往返、失败关闭四态、`isApproved` 四态、`approve` / `revoke` 不改入参 |
 | `global-rows.test.mts` | 9 | 收集 `mcp-client` 行、忽略非 mcp-client / 缺 `serverName` / 非字符串、`loader` 缺失或形状不符或 `entries()` 抛错时降级空集、嵌套子树 |
 | `session.test.mts` | 16 | 无 cwd、子代理判据（`origin` 单条）、**分叉会话（有 `parentSession`、无 `origin`）应当挂载 / 未批准时进入 untrusted**、**两者同时存在时仍跳过**、无文件静默跳过、未信任、已信任、指纹失配、撞名跳过、损坏文件、结构错误、全候选被跳过时不要求批准、规范化去重、未知传输、变量缺失诊断 |
 | `plugin-smoke.test.mts` | 6 | `apply` 注册与注销、`agent/created` 监听可逆、`renderNotice` 四态 |
 | `commands.test.mts` | 14 | 未批准仍显示诊断、部分批准同时可见、空 `configs` 说明、**"已挂载"取自真实记账（计划要挂但没挂上时不谎报）**、**挂载后文件改动仍按记账呈现**、trust 用计划键、幂等（含回报去重）、未知名字报错、untrust 卸载、**untrust 刷新提示段**、**trust 刷新顺序（落盘→挂载→刷新）**、**写盘失败不刷新**、**无项目根不刷新**、未知子命令、无 agent |
-| `mount.test.mts` | 15 | 未批准不挂载（安全断言）、挂载带 `failOnStartupError: false`、loader 传本体、重复 trust 幂等、插件卸载回收、agent 销毁清理、loader 缺失诊断、commands 缺失诊断、`inject` 声明、**批准后提示段被撤下**、**撤销后提示段刷新为待批准**、**文件消失后提示段撤下**、**会话 B 不谎报已挂载**、**trust 回报实际挂载结果**、**挂载失败日志只记错误类型、不回显展开后的 env 值** |
+| `mount.test.mts` | 18 | 未批准不挂载（安全断言）、挂载带 `failOnStartupError: false`、loader 传本体、重复 trust 幂等、插件卸载回收、agent 销毁清理、loader 缺失诊断、commands 缺失诊断、`inject` 声明、**批准后提示段被撤下**、**撤销后提示段刷新为待批准**、**文件消失后提示段撤下**、**会话 B 不谎报已挂载**、**trust 回报实际挂载结果**、**挂载失败日志只记错误类型、不回显展开后的 env 值**、**fiber 启动失败后该名不再出现在"已挂载"里（并留下"已从挂载记账移除"诊断）**、**迟到的 fiber 拒绝不摘掉同名新条目（按身份摘除）**、**过大的 `.mcp.json` 报"过大"而非"没有 `.mcp.json"`，且不进入挂载路径** |
 
 ### 7.3 Review Focus 的守护位置
 
@@ -252,7 +259,7 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 
 ## 8 验证分层与未验证项
 
-**已由测试与命令覆盖**：上表 159 个用例、`npm run typecheck`、`npm pack --dry-run` 的
+**已由测试与命令覆盖**：上表 164 个用例、`npm run typecheck`、`npm pack --dry-run` 的
 tarball 内容。
 
 **未在真实 DSH 运行时验证**（需要真实 profile 与会话，无法在纯单元测试中覆盖）：

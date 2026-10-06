@@ -536,3 +536,155 @@ test('挂载失败的日志只记错误类型，不回显展开后的 env 值', 
     `日志不得回显展开后的环境变量值：${joined}`,
   )
 })
+
+// —— 回归守卫：挂载记账必须回答"现在什么是活的"，而不是"曾经挂过谁" ——
+//
+// 修复前 `mountInto` 的拒绝处理器只记日志、**不把条目摘掉**，于是启动失败的服务器会
+// 永久留在 `AgentRegistrations.servers` 里，`/mcp-project` 把它列进"已挂载（模型可见的
+// 工具名为 mcp__<名称>__*）"——而那条命令的唯一职责就是回答"现在什么是活的"。
+
+test('fiber 启动失败后该名不再出现在"已挂载"里，并留下"已从挂载记账移除"的诊断', async () => {
+  const project = makeProject({ alpha: { command: 'node' } })
+  approveAll(project, ['alpha'])
+  const harness = createHarness()
+  apply(harness.host as never, {})
+  const agent = harness.makeAgent(project)
+
+  // 真实形状：`mcp-client` 的 fiber 以启动失败拒绝（连接失败、工具同步失败、重名等）。
+  // `failOnStartupError: false` 只保证它不打断会话，不保证实例活着——失败的 fiber 停在
+  // FAILED 状态（`vendor/cordis/src/fiber.ts:576` 的 `_getState` 把 `_error` 映射成 FAILED）。
+  agent.ctx.plugin = (module: unknown, config: unknown) => {
+    harness.pluginCalls.push({ module, config: config as { serverName: string } })
+    const fiber: FiberShape = { disposed: 0, dispose: async () => { fiber.disposed += 1 } }
+    const error = new Error('startup failed')
+    error.name = 'StartupError'
+    return Object.assign(fiber, {
+      then: (_ok?: unknown, onErr?: (e: unknown) => unknown) =>
+        Promise.resolve().then(() => { throw error }).catch(onErr as never),
+    })
+  }
+
+  harness.fire('agent/created', { agent })
+  await new Promise(resolve => setTimeout(resolve, 0))
+
+  assert.equal(harness.pluginCalls.length, 1, '已批准的项目服务器应尝试挂载一次')
+  assert.ok(
+    harness.logs.some(
+      entry => entry.message.includes('启动失败') && entry.message.includes('已从挂载记账移除'),
+    ),
+    `启动失败应留下"已从挂载记账移除"的可查诊断：${JSON.stringify(harness.logs)}`,
+  )
+
+  const definition = harness.commands.get('mcp-project')!
+  const out = (await Promise.resolve(definition.handler({ agent, rawInput: '' }))) as {
+    kind: string
+    text: string
+  }
+  assert.doesNotMatch(
+    out.text,
+    /已挂载（模型可见的工具名为/,
+    `启动失败的服务器不得被报成"已挂载"：${out.text}`,
+  )
+  assert.match(
+    out.text,
+    /已批准但本会话未挂载/,
+    `应如实列在"已批准但本会话未挂载"下：${out.text}`,
+  )
+})
+
+test('迟到的 fiber 拒绝不得摘掉同名的新条目（按身份摘除）', async () => {
+  // 摘除必须按**身份**而不是按名字：条目可能已被后来者替换（用户 untrust 再 trust），
+  // 此时旧 fiber 的拒绝若照名删除，会把活着的新实例从记账里抹掉——那是与缺陷 1 相反的
+  // 同一个错误（记账再次说错"现在什么是活的"）。
+  const project = makeProject({ alpha: { command: 'node' } })
+  approveAll(project, ['alpha'])
+  const harness = createHarness()
+  apply(harness.host as never, {})
+  const agent = harness.makeAgent(project)
+
+  // 第一条 fiber 的拒绝被扣住，等同名的新条目挂上之后再放行。
+  let rejectFirst: ((error: unknown) => void) | undefined
+  const original = agent.ctx.plugin.bind(agent.ctx)
+  let calls = 0
+  agent.ctx.plugin = (module: unknown, config: unknown) => {
+    calls += 1
+    if (calls > 1) return original(module, config)
+    harness.pluginCalls.push({ module, config: config as { serverName: string } })
+    const fiber: FiberShape = { disposed: 0, dispose: async () => { fiber.disposed += 1 } }
+    return Object.assign(fiber, {
+      then: (_ok?: unknown, onErr?: (e: unknown) => unknown) => {
+        rejectFirst = onErr as (error: unknown) => void
+        return Promise.resolve()
+      },
+    })
+  }
+
+  harness.fire('agent/created', { agent })
+  assert.equal(calls, 1, '首次挂载应走被扣住拒绝的第一条 fiber')
+
+  const definition = harness.commands.get('mcp-project')!
+  const run = (rawInput: string) =>
+    Promise.resolve(definition.handler({ agent, rawInput })) as Promise<{ kind: string; text: string }>
+
+  // untrust 清空记账（旧 fiber 被 dispose）→ trust 挂上同名的**新**条目。
+  assert.equal((await run('untrust')).kind, 'success')
+  assert.equal((await run('trust')).kind, 'success')
+  assert.equal(calls, 2, 'untrust 之后应能重新挂载同名服务器')
+
+  // 旧 fiber 的拒绝现在才到：它不属于记账里的当前条目。
+  rejectFirst?.(new Error('stale failure'))
+
+  const out = await run('')
+  assert.match(out.text, /已挂载（模型可见的工具名为/, `新条目仍在，必须报"已挂载"：${out.text}`)
+  assert.match(out.text, /- alpha/, `新条目仍在，必须列出 alpha：${out.text}`)
+})
+
+test('过大的 .mcp.json 被拒读：报"过大"而不是"没有 .mcp.json"，且不进入挂载路径', async () => {
+  // 威胁模型是"克隆陌生仓库并打开它"，而读盘发生在 `agent/created` 的**同步路径**上。
+  // 修复前 `readFileSync` 无条件把整份文件读进内存（只有 >2GiB 才由 Node 抛
+  // `ERR_FS_FILE_TOO_LARGE`，且会被 catch 成"文件不存在"——诊断反而更差）。
+  //
+  // 刻意写**合法 JSON**：这样"读到了并解析成功"与"被尺寸闸门拒读"会走出完全不同的
+  // 计划形状（前者是 untrusted/mount，后者是 invalid + 过大）。把尺寸检查回退掉，
+  // 本用例立刻变红。
+  const root = mkdtempSync(join(tmpdir(), 'project-mcp-big-'))
+  mkdirSync(join(root, '.git'), { recursive: true })
+  const raw = JSON.stringify({
+    mcpServers: { alpha: { command: 'node' } },
+    padding: 'x'.repeat(1024 * 1024 + 4096),
+  })
+  writeFileSync(join(root, '.mcp.json'), raw)
+
+  const harness = createHarness()
+  apply(harness.host as never, {})
+  const agent = harness.makeAgent({ root, raw })
+  harness.fire('agent/created', { agent })
+
+  assert.equal(harness.pluginCalls.length, 0, '超限文件不得进入挂载路径')
+
+  const definition = harness.commands.get('mcp-project')!
+  const out = (await Promise.resolve(definition.handler({ agent, rawInput: '' }))) as {
+    kind: string
+    text: string
+  }
+  assert.match(out.text, /过大/, `应报"过大"而不是别的失败：${out.text}`)
+  assert.doesNotMatch(
+    out.text,
+    /没有 \.mcp\.json/,
+    `文件明明在，不得谎报"没有 .mcp.json"：${out.text}`,
+  )
+  // 诊断必须给出可行动的尺寸信息，且只含路径/尺寸，不含文件内容（红线 3）。
+  assert.match(out.text, new RegExp(String(1024 * 1024)), `应报出上限：${out.text}`)
+  assert.equal(
+    out.text.includes('padding'),
+    false,
+    `诊断不得回显文件内容：${out.text}`,
+  )
+
+  // `invalid` 计划会注入会话提示：用户必须在会话里就能看到"文件太大"。
+  const live = harness.liveSections()
+  assert.equal(live.length, 1, `超限应注入会话提示，实际 ${live.length} 条`)
+  const text = (live[0]!.text as () => string)()
+  assert.match(text, /过大/, `会话提示应说明过大：${text}`)
+  assert.equal(text.includes('padding'), false, `会话提示不得回显文件内容：${text}`)
+})

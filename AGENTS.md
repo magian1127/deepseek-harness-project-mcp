@@ -44,7 +44,7 @@
 
 | 模块 | 职责 |
 | --- | --- |
-| `src/index.ts` | 插件入口 `apply`：装配命令、订阅 `agent/created` / `agent/disposed`、挂载与卸载、写信任存储。**唯一做真实 I/O 与 Cordis 交互的模块** |
+| `src/index.ts` | 插件入口 `apply`：装配命令、订阅 `agent/created` / `agent/disposed`、挂载与卸载、写信任存储。**唯一做会话数据 I/O 与 Cordis 交互的模块** |
 | `src/config-guard.ts` | 挂载前的 Config 自校验（非法配置拦在 `ctx.plugin()` 之前）与只记类型名的 `errorName` |
 | `src/types.ts` | 宿主服务的最小鸭子类型（不 import `@deepseek-ai/*`） |
 | `src/profile-modules.ts` | 从当前 profile 解析并预载 DSH 运行时模块 |
@@ -69,12 +69,18 @@ index.ts ──> session.ts ──> discovery.ts, translate.ts, trust.ts, global
 `session.ts` / `translate.ts` / `discovery.ts` / `trust.ts` / `global-rows.ts` /
 `config-guard.ts` 各自只承担一件事、互不依赖，全部通过注入 I/O 保持可彻底单测。
 
+**"唯一做 I/O"的准确范围**：`index.ts` 是唯一做**会话数据** I/O（`.mcp.json` 与信任
+存储的读写）与 Cordis 交互的模块。`profile-modules.ts` 是**显式例外**——它做真实 I/O
+（`readFileSync` 读 `package.json`、`createRequire`、动态 `import`），但那是 profile
+模块解析，与会话数据无关，且刻意独立成模块以便隔离"从 profile 载入 DSH 运行时模块"
+这一副作用。不要把会话数据 I/O 搬出 `index.ts`，也不要把 profile 解析搬进来。
+
 ## 本地验证命令
 
 ```powershell
 npm install
 npm run typecheck                        # tsc -p tsconfig.json --noEmit
-npm test                                 # 159 个用例，12 个测试文件
+npm test                                 # 164 个用例，12 个测试文件
 npm pack --dry-run                       # 核对 tarball 内容（files 字段）
 (Get-Content AGENTS.md).Count            # 必须 ≤ 200
 ```

@@ -13,6 +13,33 @@ export type ParseResult =
   | { kind: 'ok'; raw: string; servers: Record<string, unknown> }
 
 /**
+ * 注入的读取实现发现文件超过尺寸上限时抛出的哨兵。
+ *
+ * 为什么需要这个类型：`readFile` 是**注入**的（真实实现在 `index.ts`），而本模块的
+ * 契约是"任何失败都归一为 `absent` / `invalid` 而不抛异常"。若没有哨兵，尺寸超限会
+ * 与"文件不存在"一起塌进 `absent`：`/mcp-project` 于是报"`<root>` 下没有 `.mcp.json`"
+ * ——那是对用户的**假陈述**（文件明明在），而且用户无从知道该把它改小。会话提示也不
+ * 会注入，问题彻底隐身。
+ *
+ * 本模块不 import `node:fs`：这里只有错误类型，真实尺寸检查在注入实现里（保持本模块
+ * 的零 I/O 可测性）。
+ */
+export class McpFileTooLargeError extends Error {
+  constructor(
+    /** 被拒读的文件路径。 */
+    readonly path: string,
+    /** 实测大小（字节）。 */
+    readonly size: number,
+    /** 允许的上限（字节）。 */
+    readonly limit: number,
+  ) {
+    // 消息只含路径与尺寸——不含文件内容（红线 3）。
+    super(`${path} 大小 ${size} 字节，超过上限 ${limit} 字节`)
+    this.name = 'McpFileTooLargeError'
+  }
+}
+
+/**
  * 从 cwd 起逐级向上，返回第一个含 `.git` 的目录；走到根都没有则返回 cwd 本身
  * （与 DSH skill-filesystem 的 findProjectRoot 同语义）。
  *
@@ -48,7 +75,13 @@ export function readProjectMcpFile(projectRoot: string, readFile: (p: string) =>
   let raw: string
   try {
     raw = readFile(path)
-  } catch {
+  } catch (error) {
+    // 尺寸超限必须与"文件不存在"分开：前者是 `invalid`（文件在，只是被本插件拒读），
+    // 后者才是 `absent`。塌进 `absent` 会让 `/mcp-project` 谎报"没有 .mcp.json"，
+    // 用户也无从知道要把它改小（见 `McpFileTooLargeError`）。
+    if (error instanceof McpFileTooLargeError) {
+      return { kind: 'invalid', reason: `${path} 过大（${error.size} 字节，上限 ${error.limit} 字节），未读取` }
+    }
     return { kind: 'absent' }
   }
 

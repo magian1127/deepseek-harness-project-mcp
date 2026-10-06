@@ -1,5 +1,6 @@
 /**
- * 插件装配层（规格 §4.1 / §5）：本插件唯一做真实 I/O 与运行时交互的模块。
+ * 插件装配层（规格 §4.1 / §5）：本插件唯一做**会话数据** I/O 与运行时交互的模块。
+ * （`profile-modules.ts` 做 profile 模块解析的真实 I/O，是这条不变量的显式例外。）
  *
  * 职责边界：
  * - 决策在 `session.ts`（纯函数），信任在 `trust.ts`（纯函数 + 注入 I/O），
@@ -15,11 +16,20 @@
  *   会话创建卡在 MCP 握手上；`failOnStartupError: false` 保证启动失败不中断会话。
  * - 任何诊断只含服务器名与原因，绝不含 `.mcp.json` 内容或展开后的环境变量值（§10）。
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import {
+  closeSync,
+  existsSync,
+  fstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from 'node:fs'
 import { dirname } from 'node:path'
 
 import { errorName, validateMountConfig } from './config-guard.js'
-import { readProjectMcpFile, findProjectRoot } from './discovery.js'
+import { McpFileTooLargeError, readProjectMcpFile, findProjectRoot } from './discovery.js'
 import { collectGlobalServerNames } from './global-rows.js'
 import { renderNotice } from './notice.js'
 import { loadAtomicWrite, loadMcpClient } from './profile-modules.js'
@@ -69,9 +79,50 @@ const MCP_SERVERS_ORDER = 3100
 /** 会话提示段名；同一 scope 内重名会抛错，因此固定不变。 */
 const NOTICE_SECTION = 'project-mcp'
 
-/** 读文件为 UTF-8 文本；真实 fs 读，供 `session.ts` / `trust.ts` 注入。 */
+/**
+ * `.mcp.json` 的尺寸上限：1 MiB。
+ *
+ * 为什么必须有上限：本插件的核心威胁模型正是"克隆陌生仓库并打开它"，而
+ * `agent/created` 是**会话创建的同步路径**——`readFileSync` 会把整份文件读进内存并
+ * 阻塞该路径。一个 500 MB 的 `.mcp.json` 足以在会话创建时耗掉大量内存；Node 只在
+ * >2 GiB 时才抛 `ERR_FS_FILE_TOO_LARGE`，那已经太晚（且会被 catch 成"文件不存在"，
+ * 诊断反而更差）。
+ *
+ * 为什么是 1 MiB：真实的 `.mcp.json` 只声明服务器列表（几十条条目、含 `${VAR}` 引用
+ * 与少量 args），实测远小于 100 KiB；1 MiB 给了两个数量级的余量，不会误伤任何合法
+ * 文件，同时把"陌生仓库里的异常大文件"挡在会话创建路径之外。
+ */
+const MAX_MCP_FILE_BYTES = 1024 * 1024
+
+/**
+ * 读文件为 UTF-8 文本；真实 fs 读，供 `session.ts` / `trust.ts` 注入。
+ *
+ * 先 `open` 再 `fstat` 取大小、超限即抛 `McpFileTooLargeError`，**不读内容**：检查必须
+ * 在读之前，否则内存已经花掉了。刻意走 fd 而不是 `statSync(path)` + `readFileSync(path)`：
+ * 后者的两次系统调用之间文件可能被写大（`stat` 看到 1 KiB、`read` 读到 5 GB），尺寸闸门
+ * 就成了摆设；fd 版本断言的是**同一个 inode** 在打开时的大小，没有这个窗口。
+ *
+ * 抛哨兵而不是返回空串/截断文本——截断会让 JSON 解析失败并报成"不是合法 JSON"，把
+ * "文件太大"误诊成"文件损坏"；空串会让 `discovery` 把它当成"文件不存在"。
+ * `discovery.ts` 把哨兵归一为 `invalid`（含尺寸与上限），`trust.ts` 的 catch 把它归一为
+ * "全部未信任"（失败关闭），两者都符合各自契约。
+ *
+ * 尺寸检查刻意放在这个**注入实现**里，而不是 `discovery.ts`：后者不 import `node:fs`，
+ * 靠注入 I/O 保持零 I/O 可测性（见 `discovery.ts` 模块头）。
+ */
 function readFileUtf8(path: string): string {
-  return readFileSync(path, 'utf8')
+  // `openSync` 自身对不存在/无权限的文件抛错，与 `readFileSync` 同语义：调用方的
+  // catch（`absent` / 空存储）照常生效，因此这里不做额外处理。
+  const fd = openSync(path, 'r')
+  try {
+    const { size } = fstatSync(fd)
+    if (size > MAX_MCP_FILE_BYTES) {
+      throw new McpFileTooLargeError(path, size, MAX_MCP_FILE_BYTES)
+    }
+    return readFileSync(fd, 'utf8')
+  } finally {
+    closeSync(fd)
+  }
 }
 
 /**
@@ -242,8 +293,16 @@ function mountInto(
       // 防线，所以口径保持"只记固定文本与 `error.name`"。
       fiber.then(undefined, (error: unknown) => {
         ctx.logger?.warn?.(
-          `project-mcp：项目级 MCP 服务器「${config.serverName}」启动失败（错误类型：${errorName(error)}）`,
+          `project-mcp：项目级 MCP 服务器「${config.serverName}」启动失败（错误类型：${errorName(error)}），已从挂载记账移除`,
         )
+        // 启动失败的 fiber 停在 FAILED 状态（`vendor/cordis/src/fiber.ts:576` 的
+        // `_getState` 把 `_error` 映射成 `FiberState.FAILED`），实例并没有活着。留在
+        // 记账里会让 `/mcp-project` 把"已挂载（模型可见的工具名为 mcp__<名称>__*）"报给
+        // 一个不存在实例——而 `mounted` 的全部理由就是回答"现在什么是活的"。
+        //
+        // 按身份摘除：条目可能已被**后来者**替换（同名重挂，或本名被重新批准后挂上新的
+        // fiber），那种情况下旧 fiber 的拒绝不得误删新条目。比较引用即可，不需要额外代际号。
+        if (servers.get(config.serverName) === fiber) servers.delete(config.serverName)
       })
     } catch (error) {
       // 同步抛出同样可能是 Config 校验（`ctx.plugin()` 内部 resolveConfig 是同步的），

@@ -136,6 +136,7 @@ agent/created（串行事件，在排队输入运行前完成）
   │
   ├─ <projectRoot>/.mcp.json
   │    不存在 → 静默跳过（不打扰）
+  │    > 1 MiB → 拒读 + 提示（尺寸闸门，见 §12）
   │    解析失败 → 记日志 + 提示，不挂载
   │
   ├─ fingerprint = sha256(规范化 JSON)
@@ -325,6 +326,14 @@ without the origin and is an independent conversation"（`archive-admission.ts:4
 | `/mcp-project trust <name>…` | 只批准指定服务器 |
 | `/mcp-project untrust` | 撤销并卸载当前会话已挂载的 |
 
+### 11.1 "已挂载"一列的口径：真实记账，且只记**活着**的
+
+`/mcp-project` 的"已挂载"取自插件侧按 agent 键控的挂载记账（`AgentRegistrations.servers`），而不是计划：计划回答"按当前信任状态**应当**挂什么"，这条命令回答"**现在什么是活的**"。两者可以合法地不一致（别的会话批准后本会话计划变成 `mount` 却什么都没挂；或挂载后文件被改，计划退回 `untrusted` 而旧挂载仍在），因此分别呈现、互不代言。
+
+**记账必须反映"活着"而不是"曾经挂过"**：fiber 以启动失败拒绝时（连接失败、工具同步失败、重名等），实例停在 FAILED 状态（`vendor/cordis/src/fiber.ts:576` 的 `_getState` 把 `_error` 映射成 `FiberState.FAILED`），并没有活着。若拒绝处理器只记日志、不摘条目，该 `serverName` 会**永久留在记账里**，命令把它列进"已挂载（模型可见的工具名为 `mcp__<名称>__*`）"——恰好答错它唯一要回答的问题。因此拒绝处理器把条目摘掉。
+
+**摘除按身份（引用比较）而不是按名字**：条目可能已被后来者替换（`untrust` 之后重新 `trust` 会挂上同名的**新** fiber），此时旧 fiber 迟到的拒绝若照名删除，就会把活着的新实例从记账里抹掉——那是与上面相反的同一个错误。`if (servers.get(name) === fiber) servers.delete(name)` 两个方向都成立。
+
 ### 11.1 为什么批准必须走命令
 
 `ctx.approval` 只在 turn 内可用（`packages/interaction/user-approval/src/index.ts:219` 会抛 `approval.request() outside an open turn`），而会话创建时没有 open turn。所以**无法**在会话创建时弹窗确认；只能"不挂载 + 告知"，批准动作发生在 turn 内。
@@ -338,22 +347,41 @@ without the origin and is an independent conversation"（`archive-admission.ts:4
 | 情形 | 行为 |
 | --- | --- |
 | 无 `.mcp.json` | 静默跳过 |
+| `.mcp.json` 大于 1 MiB | 不读取 + 提示（`invalid`，含实测大小与上限）；**不与"文件不存在"混同** |
 | `.mcp.json` 解析失败 | 记日志 + 提示，不挂载 |
 | `mcpServers` 缺失或非对象 | 视为空；在 `/mcp-project` 中说明该文件没有声明任何服务器（**不**注入会话提示，见下） |
 | 单条服务器配置非法 | 跳过该条 + 警告，其余照常 |
 | 信任文件损坏 | 全部未信任 + 警告 |
-| MCP 连接失败 | 记日志（`failOnStartupError: false`），不影响会话 |
-| profile 仍有 MCP 行 | 启动警告：这些不受本插件管辖，会在进程启动时连接 |
+| MCP 连接失败 | 记日志（`failOnStartupError: false`），不影响会话；并**从挂载记账移除**该服务器 |
+| profile 仍有 MCP 行 | 不受本插件管辖，在进程启动时即连接；本插件**能检测到**（名单只用于撞名过滤），但**不警告**——见下 |
 
 **警告落在哪里**：分两个面，不要混淆。
 
-- **会话提示**（`ctx.systemPrompt.section()`）只用于**用户需要采取行动**的情形：`.mcp.json` 解析失败（`invalid`）、有可挂载项但尚未批准（`untrusted`）。理由：提示会占用模型上下文，只在用户需要做决定时才值得。
+- **会话提示**（`ctx.systemPrompt.section()`）只用于**用户需要采取行动**的情形：`.mcp.json` 解析失败或超过 1 MiB（`invalid`）、有可挂载项但尚未批准（`untrusted`）。理由：提示会占用模型上下文，只在用户需要做决定时才值得。
 - **`/mcp-project` 命令输出**承载**诊断信息**：每条服务器的跳过原因、规范化重命名、`mcpServers` 缺失、"文件里没有可用服务器"等。用户主动查询时看到，不打扰会话。
 - **挂载失败的日志只记错误类型**，不透传 `message(error)`：fiber 拒绝的一种来源是 Config 校验失败，而 schemastery 的 union 错误消息是 `` `expected ${toString()} but got ${JSON.stringify(data)}` ``（`vendor/schemastery/src/index.ts:834`），会把**整个 config**——含展开后的 `env` / `headers` 凭据——回显进日志，违反红线 3。逐字段核对表明插件当前产出的 config 全部通过 `mcp-client` 的 schema，因此该路径目前**不可达**；但只要上游给 Config 加一个必填字段它立刻可达。因此这条日志固定为"服务器名 + `error.name`"，既保留可查诊断，又不带出配置内容。其余 `message(error)` 调用点（dispose / 提示段拆除 / agent 清理）的异常来自 Cordis 内部而非 Config 校验，不涉配置内容，保持原样。
 
 因此"跳过 + 警告"里的"警告"一律指 `/mcp-project` 的可见条目（外加必要时的一条 `ctx.logger.warn`），**不是**会话提示。这条区分是任务 6 评审发现的缺口：`mcpServers` 缺失时计划形状是 `mount` + 空 `configs` + 空 `skipped`，两个面都没有落点，用户无从知晓自己的 `.mcp.json` 是空的。
 
-最后一条是**能力边界**：插件能检测到全局行并警告，但**无法阻止它们连接**——它们挂载得比赛会创建早得多。
+### 12.1 `.mcp.json` 的尺寸闸门（1 MiB）
+
+**威胁模型**：本插件的使用场景就是"克隆一个陌生仓库并在其中开会话"。`.mcp.json` 来自该仓库，因此完全不受信。
+
+**为什么必须设上限**：读盘发生在 `agent/created` 的**同步路径**上。无上限的 `readFileSync` 会把整份文件读进内存并阻塞会话创建——一个 500 MB 的 `.mcp.json` 足以拖住会话。Node 只在 >2 GiB 时才抛 `ERR_FS_FILE_TOO_LARGE`，那已经太晚，而且该错误会被 `discovery.ts` 的 catch 归一成 `absent`（"没有 `.mcp.json`"）——诊断反而更差。
+
+**为什么是 1 MiB**：真实的 `.mcp.json` 只声明服务器列表，远小于 100 KiB；1 MiB 留了两个数量级余量，不会误伤任何合法文件。
+
+**闸门放在注入实现里**（`index.ts` 的 `readFileUtf8`），不是 `discovery.ts`：后者不 import `node:fs`，靠注入 I/O 保持零 I/O 可测性。检查走 `open` + `fstat` + 从同一 fd 读，而不是 `statSync(path)` + `readFileSync(path)`——后者两次系统调用之间文件可能被写大，闸门会失效。
+
+**超限的归一**：抛 `McpFileTooLargeError` 哨兵，`discovery.ts` 把它转成 `invalid`（带实测大小与上限）。**刻意不与 `absent` 混同**：报"没有 `.mcp.json`"是假陈述（文件明明在），用户也无从知道要把它改小；而 `invalid` 会注入会话提示，用户立刻看到该做什么。对信任存储的读取（同一实现）则沿用 `trust.ts` 的失败关闭语义——超限等同"读不到"，全部未信任。
+
+最后一条是**能力边界**，需要精确表述——早期文档在这里写过"检测并警告"，那是**不成立**的：
+
+- **能检测**：`collectGlobalServerNames` 会遍历 Loader 树，收集全局 `mcp-client` 行的 `serverName`。
+- **但不警告**：这份名单**只**用作撞名过滤（规格 §8.2），从不产生用户可见的警告。唯一的调用点在 `inspectAgent`（`src/index.ts`，每次检视时按需遍历），`apply` 里**没有**启动期遍历，`Set` 的产物也没有任何日志或提示出口。
+- **也无法阻止**：全局行由 profile 补丁声明，挂载得比任何会话创建都早得多。
+
+**为什么不加启动期警告**（这是刻意的取舍，不是遗漏）：要在 `apply` 里遍历 Loader 树，需要 `ctx.get('loader')` 已就绪；而按需调用是本插件的有意设计（规格 §8.1，理由见 §8 与 `global-rows.ts` 模块头）。更关键的是**警告没有行动落点**——插件无法阻止那些行连接，用户能做的只有改 profile 补丁，而那与"本插件管辖的项目级 MCP"是两件事。启动时打扰一条用户无能为力的信息，收益为负。因此如实描述为"能检测（用于撞名过滤）、不提示"。
 
 ## 13. 测试
 
