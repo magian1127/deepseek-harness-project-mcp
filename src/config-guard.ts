@@ -22,7 +22,8 @@
  * { version: 1, vendor: 'schemastery', validate(value): { value } | { issues } }
  * ```
  * - `validate` **同步**返回（`Schema.resolve` 是同步的），但为防御仍判 thenable；
- * - 合法：`{ value: <规范化后的配置> }`（`value` 已补齐默认值，可直接交给 `plugin()`）；
+ * - 合法：`{ value: <规范化后的配置> }`（`value` 已补齐默认值）——但本模块**不使用**
+ *   `value`，见 `validateMountConfig` 的说明；
  * - 非法：`{ issues: [{ message, path? }] }`，其中 `message` 就是上面那条**含全量
  *   config 的**文本，`path` 是字段路径（根级 union 错误没有 `path`）。
  * Cordis 的用法见 `vendor/cordis/src/fiber.ts:50-62`：无 `Config` 时原样返回，
@@ -163,7 +164,23 @@ function describeIssues(schema: unknown, config: unknown, issues: unknown): stri
  * - 返回 thenable：Cordis 抛 `TypeError`，本层**跳过挂载**（同步挂载路径无法 await，
  *   放行等于把校验责任推回给 Cordis 的记录点）。
  * - `issues` 存在：跳过挂载，诊断只用字段路径。
- * - 否则取 `value`（已补齐默认值的规范化配置，与 Cordis 传给 `apply` 的是同一个值）。
+ * - 否则**返回原 config**（不是 `result.value`）——本层只作准入闸，不做规范化。
+ *
+ * ## 为什么成功时返回原 config 而不是 `result.value`
+ *
+ * 守卫的职责是**判断合法性**，不是**规范化配置**。规范化交给 Cordis 自己做：`ctx.plugin()`
+ * 内部的 `_resolveConfig`（`vendor/cordis/src/fiber.ts:641-644`）会对同一份 schema 再跑一次
+ * `resolveConfig`，`this.config = this._resolveConfig(this._config)`（同文件 `:655`）之后才
+ * 把值交给 `apply`。因此"补默认值"这件事**不依赖**本层——返回原 config 与返回 `value`
+ * 对 `apply` 收到的配置是等价的（已用真实 Cordis Context + 真实 mcp-client 实测：只传
+ * `transport`/`serverName`/`command`/`env` 时，`apply` 仍收到补齐后的 `args: []`、
+ * `cwd: ''`、`toolCallTimeoutMs: 60000`）。
+ *
+ * 反过来，**让守卫回传 `value` 是有害的**：`result.value` 是 schemastery 重新构造出来的
+ * 对象，而 dict resolver 用朴素赋值落盘（`vendor/schemastery/src/index.ts:790-792` 的
+ * `result[rKey] = ...`），键名 `__proto__` 会命中原型 setter 被静默丢弃。守卫本不该是
+ * 配置的第二个真相来源，`translate.ts` 用 `Object.fromEntries` 刻意保住的键不该在下一层
+ * 被本插件自己抹掉。
  *
  * 本函数不抛异常：调用方在会话创建路径上（红线 4）。
  */
@@ -193,8 +210,9 @@ export function validateMountConfig(McpClient: unknown, config: McpClientConfig)
     return { ok: false, reason: describeIssues(schema, config, (result as { issues?: unknown }).issues) }
   }
 
-  const value = (result as { value?: unknown }).value
-  // `value ?? config`：schema 未产出规范化值（或产出 `undefined`）时退回原配置，
-  // 保证不会把 `undefined` 挂进 `ctx.plugin()`。
-  return { ok: true, config: (value ?? config) as McpClientConfig }
+  // 成功时返回**原 config**：本层只作准入闸，规范化（补默认值）由 Cordis 的
+  // `_resolveConfig` 在 `ctx.plugin()` 内部完成——见上面的长注释。刻意不读
+  // `result.value`：那是 schemastery 重建的对象，其 dict resolver 的朴素赋值会丢掉
+  // `__proto__` 键，等于把 `translate.ts` 刚保住的键又抹掉一次。
+  return { ok: true, config }
 }

@@ -313,6 +313,12 @@ without the origin and is an independent conversation"（`archive-admission.ts:4
   `__proto__` 这类键名必须是自有数据属性而不是改写结果对象的原型。否则朴素赋值会静默丢弃
   该键——服务器拿到缺一个变量的环境、认证失败却无诊断，而指纹把该键算在内（`trust.ts` 的
   `canonicalValue` 出于同一原因用 `fromEntries`，`translate.ts` 此处是同一处加固）。
+- **该键仍到不了服务器**：`mcp-client` 的 Config schema 在 Cordis 的 `_resolveConfig` 里
+  规范化时会重建字典，而 schemastery 的 dict resolver 用朴素赋值
+  （`vendor/schemastery/src/index.ts:790-792` 的 `result[rKey] = ...`）——`__proto__` 命中
+  原型 setter 被静默丢弃。**本插件无法阻止这一层**：Cordis 必然对传入 config 再跑一次
+  schema 解析（`vendor/cordis/src/fiber.ts:655`）。因此"保留该键"目前只能做到"不额外丢一次"，
+  端到端仍会缺键；这是下游局限，不是本插件能修的（见 `development.md` §8 未验证项）。
 - 展开在内存中进行，不落盘。
 
 ## 11. 命令
@@ -334,11 +340,11 @@ without the origin and is an independent conversation"（`archive-admission.ts:4
 
 **摘除按身份（引用比较）而不是按名字**：条目可能已被后来者替换（`untrust` 之后重新 `trust` 会挂上同名的**新** fiber），此时旧 fiber 迟到的拒绝若照名删除，就会把活着的新实例从记账里抹掉——那是与上面相反的同一个错误。`if (servers.get(name) === fiber) servers.delete(name)` 两个方向都成立。
 
-### 11.1 为什么批准必须走命令
+### 11.2 为什么批准必须走命令
 
 `ctx.approval` 只在 turn 内可用（`packages/interaction/user-approval/src/index.ts:219` 会抛 `approval.request() outside an open turn`），而会话创建时没有 open turn。所以**无法**在会话创建时弹窗确认；只能"不挂载 + 告知"，批准动作发生在 turn 内。
 
-### 11.2 批准后立即生效
+### 11.3 批准后立即生效
 
 `trust` 批准后，把 MCP 挂进当前 agent scope，无需重开会话。技术上与 preset 切换同类（`ctx.plugin()` 进 agent scope）。
 

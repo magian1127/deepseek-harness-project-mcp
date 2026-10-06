@@ -62,19 +62,23 @@ const CONFIG = {
   failOnStartupError: false,
 }
 
-test('合法配置放行，并返回 schema 规范化后的值', () => {
+test('合法配置放行，且返回的是**原 config**（守卫只作准入闸，不做规范化）', () => {
+  // 刻意断言"不是 `value`"：`value` 是 schemastery 重建的对象，其 dict resolver 用朴素
+  // 赋值落盘（`vendor/schemastery/src/index.ts:790-792`），`__proto__` 键会被静默丢弃。
+  // 规范化交给 Cordis 自己的 `_resolveConfig`（`vendor/cordis/src/fiber.ts:641-644`）。
   const normalized = { ...CONFIG, args: ['--normalized'] }
   const McpClient = { Config: stubSchema(() => ({ ok: true, value: normalized })) }
   const result = validateMountConfig(McpClient, CONFIG)
   assert.equal(result.ok, true)
-  assert.deepEqual(result.ok === true && result.config, normalized)
+  assert.equal(result.ok === true && result.config, CONFIG, '必须返回原 config 的同一引用')
+  assert.notDeepEqual(result.ok === true && result.config, normalized, '不得回传 schema 规范化后的值')
 })
 
-test('schema 未产出 value 时退回原配置，不会把 undefined 挂进去', () => {
+test('schema 未产出 value 时同样返回原配置（新契约下与上一条同一条路径）', () => {
   const McpClient = { Config: stubSchema(() => ({ ok: true })) }
   const result = validateMountConfig(McpClient, CONFIG)
   assert.equal(result.ok, true)
-  assert.deepEqual(result.ok === true && result.config, CONFIG)
+  assert.equal(result.ok === true && result.config, CONFIG, '不会把 undefined 挂进去')
 })
 
 test('非法 serverName 被拦下，诊断只含字段路径', () => {
@@ -255,7 +259,11 @@ test('schema 缺失时原样放行（对齐 Cordis 的 !runtime.Config 分支）
   assert.deepEqual(validateMountConfig({ Config: { '~standard': {} } }, CONFIG), { ok: true, config: CONFIG })
 })
 
-test('validate 被以 schema 为接收者调用（~standard 是 getter，依赖 this）', () => {
+test('validate 以 ~standard 对象为接收者被调用', () => {
+  // 标题刻意不写"依赖 this"：本用例用的是**数据属性桩**，只能证明接收者是 `~standard`
+  // 对象本身。真实 schemastery 的 `validate` 是闭包捕获 `this` 的箭头函数
+  // （`vendor/schemastery/src/index.ts:295` 的 `validate: (value) => { ... Schema.resolve(value, this, {}) }`），
+  // 并不需要绑定——因此这里证明的只是"接收者是谁"，不是"绑定是必需的"。
   let seenThis: unknown
   const schema = {
     '~standard': {

@@ -37,7 +37,89 @@ writeFileSync(
     exports: { '.': './index.mjs' },
   }),
 )
-writeFileSync(join(fakeClientDir, 'index.mjs'), 'export default class FakeMcpClient {}\n')
+/**
+ * 假 mcp-client **带 Config schema**。
+ *
+ * 为什么必须有 schema：没有 `Config` 时 `validateMountConfig` 走"无从校验、原样放行"
+ * 的分支（`config-guard.ts`），守卫整段被绕过——本文件要守护的"`env` 的 `__proto__`
+ * 键一路保留到 `ctx.plugin()`"就无从验证。给夹具一份 schema，挂载路径才会真正穿过守卫。
+ *
+ * schema 刻意复刻 schemastery 的**规范化落盘方式**：dict resolver 用朴素赋值
+ * `result[rKey] = property(...)`（`vendor/schemastery/src/index.ts:790-792`）。键名
+ * `__proto__` 会命中原型 setter，字符串值不满足其对象要求 → 静默 no-op，键被丢弃。
+ * 这正是"守卫若回传 `result.value` 就会把 `translate.ts` 刚保住的键又抹掉"的机制；
+ * 把守卫改回 `value ?? config`，下面那条端到端用例立刻变红。
+ */
+writeFileSync(join(fakeClientDir, 'index.mjs'), `
+const SERVER_NAME = /^[A-Za-z0-9_-]{1,32}$/
+
+// 复刻 schemastery 的 dict resolver：朴素赋值会丢掉 __proto__ 键。
+function dict(data) {
+  const result = {}
+  for (const key in data) result[key] = String(data[key])
+  return result
+}
+
+function normalize(value) {
+  if (value === null || typeof value !== 'object') return undefined
+  if (typeof value.serverName !== 'string' || !SERVER_NAME.test(value.serverName)) return undefined
+  if (value.transport === 'stdio') {
+    if (typeof value.command !== 'string' || value.command === '') return undefined
+    return {
+      transport: 'stdio',
+      serverName: value.serverName,
+      command: value.command,
+      args: Array.isArray(value.args) ? [...value.args] : [],
+      env: dict(value.env ?? {}),
+      cwd: typeof value.cwd === 'string' ? value.cwd : '',
+      toolCallTimeoutMs: 60000,
+      failOnStartupError: value.failOnStartupError === true,
+    }
+  }
+  if (value.transport === 'streamable-http') {
+    if (typeof value.url !== 'string' || value.url === '') return undefined
+    return {
+      transport: 'streamable-http',
+      serverName: value.serverName,
+      url: value.url,
+      headers: dict(value.headers ?? {}),
+      toolCallTimeoutMs: 60000,
+      failOnStartupError: value.failOnStartupError === true,
+    }
+  }
+  return undefined
+}
+
+function validate(value) {
+  const normalized = normalize(value)
+  if (normalized === undefined) {
+    return { issues: [{ message: 'expected Config but got ' + JSON.stringify(value) }] }
+  }
+  return { value: normalized }
+}
+
+const member = (transport) => ({
+  '~standard': {
+    version: 1,
+    vendor: 'schemastery',
+    validate: (value) => {
+      const normalized = normalize(value)
+      if (normalized === undefined || normalized.transport !== transport) {
+        return { issues: [{ message: 'expected ' + transport + ' but got ' + JSON.stringify(value) }] }
+      }
+      return { value: normalized }
+    },
+  },
+})
+
+export default class FakeMcpClient {
+  static Config = {
+    type: 'union',
+    list: [member('stdio'), member('streamable-http')],
+    '~standard': { version: 1, vendor: 'schemastery', validate },
+  }
+}
+`)
 
 const { apply, inject } = await import('../index.js')
 const { approve, fingerprint, trustStorePath } = await import('../trust.js')
@@ -687,4 +769,64 @@ test('过大的 .mcp.json 被拒读：报"过大"而不是"没有 .mcp.json"，�
   const text = (live[0]!.text as () => string)()
   assert.match(text, /过大/, `会话提示应说明过大：${text}`)
   assert.equal(text.includes('padding'), false, `会话提示不得回显文件内容：${text}`)
+})
+
+// —— 端到端守护：`env` / `headers` 的 `__proto__` 键必须穿过守卫到达 ctx.plugin() ——
+//
+// `translate.test.mts` 的 `__proto__` 用例只断言**翻译层**的输出，从不穿过守卫。于是
+// "守卫在下一层把键又抹掉"这类缺陷完全没有守护：`validateMountConfig` 曾用
+// `value ?? config` 返回 schema 规范化后的值，而 schemastery 的 dict resolver 用朴素赋值
+// `result[rKey] = property(...)`（`vendor/schemastery/src/index.ts:790-792`）——`__proto__`
+// 命中原型 setter，字符串值不满足其对象要求 → 静默 no-op。
+//
+// 下面的用例断言**最终交给 `ctx.plugin()` 的 config**（`pluginCalls[0].config`）仍带该键
+// ——把守卫改回 `value ?? config` 立刻变红。
+//
+// **本用例证明的边界**：只到 `ctx.plugin()` 的入参为止。真实 Cordis 随后会在
+// `_resolveConfig` 里对同一份 schema 再跑一次规范化（`vendor/cordis/src/fiber.ts:655`），
+// 那一层同样会丢掉该键——**本插件无法阻止**。因此"该键到不了服务器"是下游局限，
+// 见 `docs/development.md` §8 的未验证项；本用例守护的是"本插件自己不再额外丢一次"。
+
+test('端到端：.mcp.json 的 env 含 __proto__ 键，交给 ctx.plugin 的 config 仍有该键', () => {
+  // 用 JSON.parse 而不是字面量：对象字面量里的 `__proto__` 是**设置原型**的特殊语法，
+  // 根本不会成为自有键，测不到任何东西。`.mcp.json` 是外部输入，走 JSON.parse。
+  const entry = JSON.parse('{"command":"node","env":{"__proto__":"X","OK":"v"}}')
+  const project = makeProject({ alpha: entry })
+  approveAll(project, ['alpha'])
+  const harness = createHarness()
+  apply(harness.host as never, {})
+
+  harness.fire('agent/created', { agent: harness.makeAgent(project) })
+
+  assert.equal(harness.pluginCalls.length, 1, '已批准的项目服务器应挂载一次')
+  const env = (harness.pluginCalls[0]!.config as { env?: Record<string, string> }).env
+  assert.ok(env !== undefined, 'config 必须带 env')
+  assert.equal(
+    Object.hasOwn(env, '__proto__'),
+    true,
+    `守卫不得在下一层抹掉 translate 保住的键；实际 keys=${JSON.stringify(Object.keys(env))}`,
+  )
+  assert.equal(env['__proto__'], 'X', '该键的值必须原样保留')
+  assert.equal(env['OK'], 'v', '同一条目的其他键不得受影响')
+})
+
+test('端到端：.mcp.json 的 headers 含 __proto__ 键，交给 ctx.plugin 的 config 仍有该键', () => {
+  const entry = JSON.parse('{"type":"http","url":"https://example.invalid","headers":{"__proto__":"Y","H":"v"}}')
+  const project = makeProject({ alpha: entry })
+  approveAll(project, ['alpha'])
+  const harness = createHarness()
+  apply(harness.host as never, {})
+
+  harness.fire('agent/created', { agent: harness.makeAgent(project) })
+
+  assert.equal(harness.pluginCalls.length, 1, '已批准的项目服务器应挂载一次')
+  const headers = (harness.pluginCalls[0]!.config as { headers?: Record<string, string> }).headers
+  assert.ok(headers !== undefined, 'config 必须带 headers')
+  assert.equal(
+    Object.hasOwn(headers, '__proto__'),
+    true,
+    `守卫不得在下一层抹掉 translate 保住的键；实际 keys=${JSON.stringify(Object.keys(headers))}`,
+  )
+  assert.equal(headers['__proto__'], 'Y', '该键的值必须原样保留')
+  assert.equal(headers['H'], 'v', '同一条目的其他键不得受影响')
 })

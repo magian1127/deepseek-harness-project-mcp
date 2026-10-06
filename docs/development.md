@@ -200,12 +200,12 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 | 类型 | `tsc --noEmit` | `npm run typecheck` |
 | 打包 | tarball 内容 | `npm pack --dry-run` |
 
-### 7.2 测试文件与用例数（当前 164）
+### 7.2 测试文件与用例数（当前 166）
 
 | 文件 | 用例 | 覆盖 |
 | --- | --- | --- |
 | `profile-modules.test.mts` | 5 | `--profile` 标志、Electron 默认 `desktop`、非 Electron 默认 `web`、伪值忽略、`DSH_HOME/profiles/<name>` 落点 |
-| `config-guard.test.mts` | 20 | 合法放行与规范化值回传、`value` 缺失时退回原配置、非法 `serverName` / 缺失 `command` 的诊断只含字段路径、无 `path` 时的通用摘要、`env` 键名可入诊断、不可信 path 段整条作废（含 `=`、超长、换行、非原始值、symbol）、数组下标合法、段数上限截断、**根级 union 无 `path` 时下钻 union 成员取字段**、成员抛错/返回 thenable 不影响主判定、非 union 不下钻、空 `issues` 视为失败、异步校验拦下、校验抛错只记类型名、非对象结果拦下、schema 缺失放行、`validate` 以 `~standard` 为接收者调用、`errorName` 只回类型名 |
+| `config-guard.test.mts` | 20 | 合法放行且**返回原 config（不是 schema 规范化后的 `value`）**、`value` 缺失时同样返回原配置、非法 `serverName` / 缺失 `command` 的诊断只含字段路径、无 `path` 时的通用摘要、`env` 键名可入诊断、不可信 path 段整条作废（含 `=`、超长、换行、非原始值、symbol）、数组下标合法、段数上限截断、**根级 union 无 `path` 时下钻 union 成员取字段**、成员抛错/返回 thenable 不影响主判定、非 union 不下钻、空 `issues` 视为失败、异步校验拦下、校验抛错只记类型名、非对象结果拦下、schema 缺失放行、`validate` 以 `~standard` 对象为接收者调用、`errorName` 只回类型名 |
 | `mount-guard.test.mts` | 4 | **schema 不通过时非法 config 被拦在 `ctx.plugin()` 之前且日志不含敏感值**、**多条非法配置全部拦下**、**被拦下的项不进挂载记账**、**命令层 trust 路径共用同一守卫** |
 | `profile-config-contract.test.mts` | 6 | 对**已安装的 profile 模块**断言：`Config` 是带 `~standard` 的 schemastery union、`validate` 同步、合法返回补齐默认值的 `value`、**非法时 `issue.message` 回显整个 config（泄密源）**、`validateMountConfig` 在真实 schema 上放行合法/拦下非法且不泄漏 |
 | `discovery.test.mts` | 12 | 向上找最近的 `.git`、无 `.git` 回退 cwd、`absent` / 非法 JSON / 顶层非对象 / `mcpServers` 非对象、缺 `mcpServers` 按空、原文透传用于指纹、**尺寸超限归一为 `invalid`（带尺寸与上限）而不是 `absent`**、**非哨兵异常仍返回 `absent`** |
@@ -215,7 +215,7 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 | `session.test.mts` | 16 | 无 cwd、子代理判据（`origin` 单条）、**分叉会话（有 `parentSession`、无 `origin`）应当挂载 / 未批准时进入 untrusted**、**两者同时存在时仍跳过**、无文件静默跳过、未信任、已信任、指纹失配、撞名跳过、损坏文件、结构错误、全候选被跳过时不要求批准、规范化去重、未知传输、变量缺失诊断 |
 | `plugin-smoke.test.mts` | 6 | `apply` 注册与注销、`agent/created` 监听可逆、`renderNotice` 四态 |
 | `commands.test.mts` | 14 | 未批准仍显示诊断、部分批准同时可见、空 `configs` 说明、**"已挂载"取自真实记账（计划要挂但没挂上时不谎报）**、**挂载后文件改动仍按记账呈现**、trust 用计划键、幂等（含回报去重）、未知名字报错、untrust 卸载、**untrust 刷新提示段**、**trust 刷新顺序（落盘→挂载→刷新）**、**写盘失败不刷新**、**无项目根不刷新**、未知子命令、无 agent |
-| `mount.test.mts` | 18 | 未批准不挂载（安全断言）、挂载带 `failOnStartupError: false`、loader 传本体、重复 trust 幂等、插件卸载回收、agent 销毁清理、loader 缺失诊断、commands 缺失诊断、`inject` 声明、**批准后提示段被撤下**、**撤销后提示段刷新为待批准**、**文件消失后提示段撤下**、**会话 B 不谎报已挂载**、**trust 回报实际挂载结果**、**挂载失败日志只记错误类型、不回显展开后的 env 值**、**fiber 启动失败后该名不再出现在"已挂载"里（并留下"已从挂载记账移除"诊断）**、**迟到的 fiber 拒绝不摘掉同名新条目（按身份摘除）**、**过大的 `.mcp.json` 报"过大"而非"没有 `.mcp.json"`，且不进入挂载路径** |
+| `mount.test.mts` | 20 | 未批准不挂载（安全断言）、挂载带 `failOnStartupError: false`、loader 传本体、重复 trust 幂等、插件卸载回收、agent 销毁清理、loader 缺失诊断、commands 缺失诊断、`inject` 声明、**批准后提示段被撤下**、**撤销后提示段刷新为待批准**、**文件消失后提示段撤下**、**会话 B 不谎报已挂载**、**trust 回报实际挂载结果**、**挂载失败日志只记错误类型、不回显展开后的 env 值**、**fiber 启动失败后该名不再出现在"已挂载"里（并留下"已从挂载记账移除"诊断）**、**迟到的 fiber 拒绝不摘掉同名新条目（按身份摘除）**、**过大的 `.mcp.json` 报"过大"而非"没有 `.mcp.json"`，且不进入挂载路径**、**端到端：`env` 的 `__proto__` 键穿过守卫到达 `ctx.plugin()`**、**端到端：`headers` 的 `__proto__` 键穿过守卫到达 `ctx.plugin()`** |
 
 ### 7.3 Review Focus 的守护位置
 
@@ -259,7 +259,7 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 
 ## 8 验证分层与未验证项
 
-**已由测试与命令覆盖**：上表 164 个用例、`npm run typecheck`、`npm pack --dry-run` 的
+**已由测试与命令覆盖**：上表 166 个用例、`npm run typecheck`、`npm pack --dry-run` 的
 tarball 内容。
 
 **未在真实 DSH 运行时验证**（需要真实 profile 与会话，无法在纯单元测试中覆盖）：
@@ -268,7 +268,14 @@ tarball 内容。
 - 非阻塞挂载下 `ctx.plugin()` 返回的 fiber 在 agent dispose 时是否被正确清理；
 - 从 `agent.ctx` 遍历 Loader 树能否拿到完整条目集（scope 继承是否覆盖 root）；
 - 首条消息是否真的赶不上工具注册；
-- `/mcp-project` 与提示段在真实 GUI 会话中的实际渲染。
+- `/mcp-project` 与提示段在真实 GUI 会话中的实际渲染；
+- `src/index.ts` 的挂载拒绝处理器对**真实 Cordis fiber** 是否会在
+  `failOnStartupError: false` 下以**拒绝**结算：夹具给的是 thenable 桩，`mount.test.mts`
+  自造的 fiber 由测试决定何时拒绝；真实 fiber 走 `fiber.await()`
+  （`vendor/cordis/src/registry.ts:332-334` 的 `wrapped.then = (onFulfilled, onRejected) => fiber.await().then(...)`），
+  而 `failOnStartupError: false` 时 mcp-client 自己**不抛**（`packages/mcp/mcp-client/src/index.ts`
+  的 `if (outcome.error !== undefined && config.failOnStartupError)`）——因此"启动失败但
+  fiber 并不拒绝"时记账不会被摘除，与 `mount.test.mts` 那条守护的假设不同。属未验证。
 
 Host 半边没有热通道，验证这些需要由使用者重启一次 DSH。**不要在未重启的情况下**用旧
 进程的行为推断新构建的行为。
