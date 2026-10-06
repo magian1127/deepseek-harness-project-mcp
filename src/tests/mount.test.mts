@@ -170,12 +170,21 @@ interface SectionRecord {
   disposed: number
 }
 
-function createHarness(options: { loader?: unknown; withCommands?: boolean } = {}) {
+function createHarness(options: { loader?: unknown; withCommands?: boolean; withAgents?: boolean } = {}) {
   const withCommands = options.withCommands ?? true
+  const withAgents = options.withAgents ?? true
   const listeners = new Map<string, Set<(payload: unknown) => void>>()
   const effects: Array<() => void> = []
   const commands = new Map<string, { handler: (invocation: unknown) => unknown }>()
   const logs: Array<{ level: string; message: string }> = []
+  /**
+   * 假 `agents` 服务：`agent.id` → 活着的 agent。
+   *
+   * 回收判定用它回答"这个会话的 agent 还在不在"（真实实现是
+   * `AgentRegistry.get(id)`，`packages/core/agent/src/index.ts:566-568`）。`agent/disposed`
+   * 时把它摘掉，与真实 DSH 一致——否则回收会把已销毁的会话当成候选。
+   */
+  const liveAgents = new Map<string, unknown>()
   /**
    * 传给 `ctx.plugin()` 的每一对 (模块, 配置)，按调用顺序。
    *
@@ -201,6 +210,10 @@ function createHarness(options: { loader?: unknown; withCommands?: boolean } = {
         }
       }
       if (name === 'loader') return options.loader
+      if (name === 'agents') {
+        if (!withAgents) return undefined
+        return { get: (id: string) => liveAgents.get(id) }
+      }
       return undefined
     },
     on(name: string, callback: (payload: unknown) => void) {
@@ -233,13 +246,17 @@ function createHarness(options: { loader?: unknown; withCommands?: boolean } = {
   /** 假 agent：`ctx.plugin()` 与 `ctx.effect()` 都可观测。 */
   function makeAgent(
     project: Project,
-    options: { id?: unknown; header?: Record<string, unknown> } = {},
+    options: { id?: unknown; header?: Record<string, unknown>; status?: unknown } = {},
   ) {
     nextSessionId += 1
+    const id = Object.hasOwn(options, 'id') ? options.id : `session-${nextSessionId}`
     const agent = {
       // 显式传 `id: undefined` 要真的落成 `undefined`（那是"id 缺失"用例），因此用
       // `hasOwn` 而不是 `??` 判默认值。
-      id: Object.hasOwn(options, 'id') ? options.id : `session-${nextSessionId}`,
+      id,
+      // 默认 `idle`：与真实 DSH 的"没有 driver 在跑"一致，也是可回收的前提。
+      // 需要 `running` 的用例显式传 `status`。
+      status: Object.hasOwn(options, 'status') ? options.status : 'idle',
       session: { header: { cwd: project.root, ...options.header } },
     } as any
     agent.ctx = {
@@ -280,12 +297,425 @@ function createHarness(options: { loader?: unknown; withCommands?: boolean } = {
      */
     liveSections: () => sections.filter(section => section.disposed === 0),
     fire: (name: string, payload: unknown) => {
+      // 镜像真实 `AgentRegistry` 的发布/移除：`agent/created` 之后 `ctx.agents.get(id)`
+      // 才拿得到该 agent，`agent/disposed` 之后拿不到。回收判定依赖这个契约
+      // （拿不到 live agent 的会话不占回收名额），因此夹具必须如实模拟。
+      const fired = (payload as { agent?: { id?: unknown } } | undefined)?.agent
+      const firedId = typeof fired?.id === 'string' && fired.id !== '' ? fired.id : undefined
+      if (firedId !== undefined) {
+        if (name === 'agent/created') liveAgents.set(firedId, fired)
+        else if (name === 'agent/disposed') liveAgents.delete(firedId)
+      }
       for (const callback of listeners.get(name) ?? []) callback(payload)
+    },
+    /**
+     * 以 **waterfall** 语义派发 `agent/pre-step`：把 `next` 作为最后一个参数传入，
+     * 并返回最外层监听器的返回值。
+     *
+     * 为什么不能复用 `fire`：`pre-step` 是 waterfall（`agent.ts:276`），监听器**必须**
+     * 调用 `next()` 才能让链继续。用 `fire` 派发时 `next` 是 `undefined`，监听器里
+     * 那句 `return next()` 会抛 TypeError 并被自己的 catch 吞掉——于是"监听器注册了
+     * 但什么都没做"和"监听器正常工作"在测试里无法区分。这个辅助函数让断言能覆盖
+     * "决策被交还给链上"这一条（见 `preStep` 的返回值断言）。
+     */
+    preStep: (payload: unknown) => {
+      const callbacks = [...(listeners.get('agent/pre-step') ?? [])] as Array<
+        (payload: unknown, next: () => unknown) => unknown
+      >
+      // `listeners` = 链上实际跑过的监听器数（不含终止回调）；
+      // `nextCalls` = 链被继续推进的次数，含最外层那一次与终止回调那一次。
+      let listenersRun = 0
+      let nextCalls = 0
+      const next = () => {
+        nextCalls += 1
+        const callback = callbacks.shift()
+        if (callback === undefined) return { kind: 'enter' }
+        listenersRun += 1
+        return callback(payload, next)
+      }
+      const result = next()
+      return { result, listenersRun, nextCalls }
     },
     /** 卸载插件：按注册逆序跑 effect disposer，模拟 fiber 拆除。 */
     unload: () => { for (const dispose of [...effects].reverse()) dispose() },
   }
 }
+
+// —— 功能：MCP 连接的惰性回收 + 上限（默认 8） ——
+//
+// 用户痛点：DSH 的 WebUI **没有"关闭会话"**——左侧列表点开任意会话就触发
+// `promote` → `resume` → `agent/created`，本插件随之挂上一份 MCP 连接（实测每个
+// stdio 子进程约 73 MB）。浏览几个会话就积累 5 个进程、约 300 MB，而 DSH 无空闲回收。
+//
+// 规则（用户明确指定，不得改动）：上限 8；超限时回收**最后活跃时间最早**的
+// `status === 'idle'` 会话；全部 `running` 时忽略上限（绝不打断正在工作的会话）；
+// 被回收的会话下次发消息时自动重挂。
+//
+// 纯函数层面的穷尽守护在 `reclaim.test.mts`；这里是穿过 `apply` 的端到端面。
+
+/** 造一个已批准的项目并返回它的会话，挂在 `harness` 上。 */
+function mountedSession(
+  harness: ReturnType<typeof createHarness>,
+  project: Project,
+  options: { id: string; status?: unknown },
+) {
+  const agent = harness.makeAgent(project, options)
+  harness.fire('agent/created', { agent })
+  return agent
+}
+
+test('超过上限时回收最久未活跃的 idle 会话，且新会话仍能挂上', async () => {
+  // 上限设 2 让用例短小（规则与默认 8 完全同构）。
+  const project = makeProject({ alpha: { command: 'node' } })
+  approveAll(project, ['alpha'])
+  const harness = createHarness()
+  apply(harness.host as never, { connectionLimit: 2 })
+
+  const first = mountedSession(harness, project, { id: 's1' })
+  mountedSession(harness, project, { id: 's2' })
+  assert.equal(harness.pluginCalls.length, 2, '两个会话都挂上了')
+
+  // 第三个会话到来 → 必须先回收最久未活跃的 idle（s1），再挂自己。
+  const third = mountedSession(harness, project, { id: 's3' })
+
+  assert.equal(
+    harness.fibers[0]!.disposed,
+    1,
+    '最久未活跃的空闲会话 s1 的连接必须被回收（走 fiber.dispose，不是杀进程）',
+  )
+  assert.equal(harness.fibers[1]!.disposed, 0, 's2 仍在，不得被回收')
+  assert.equal(harness.pluginCalls.length, 3, '新会话 s3 照常挂载')
+
+  const run = (agent: unknown) =>
+    Promise.resolve(
+      harness.commands.get('mcp-project')!.handler({ agent, rawInput: '' }),
+    ) as Promise<{ kind: string; text: string }>
+
+  // 回收后总数恰好回到上限：s1 无连接、s2 与 s3 各一份。
+  const [a, b, c] = await Promise.all([run(first), run(third), run(third)])
+  assert.match(a.text, /已被回收/, `s1 应报"已被回收"：${a.text}`)
+  assert.match(b.text, /已挂载（模型可见的工具名为/, `s3 应报"已挂载"：${b.text}`)
+  assert.doesNotMatch(c.text, /已被回收/, `s3 不得被回收：${c.text}`)
+})
+
+test('全部会话都在 running 时忽略上限，绝不打断正在工作的会话', () => {
+  const project = makeProject({ alpha: { command: 'node' } })
+  approveAll(project, ['alpha'])
+  const harness = createHarness()
+  apply(harness.host as never, { connectionLimit: 2 })
+
+  mountedSession(harness, project, { id: 'busy-1', status: 'running' })
+  mountedSession(harness, project, { id: 'busy-2', status: 'running' })
+  assert.equal(harness.pluginCalls.length, 2)
+
+  // 第三个会话也是 running：超出上限，但一个都不能回收（规则 3）。
+  mountedSession(harness, project, { id: 'busy-3', status: 'running' })
+
+  assert.equal(
+    harness.fibers[0]!.disposed,
+    0,
+    '全部 running 时必须忽略上限——回收正在工作的会话会打断用户',
+  )
+  assert.equal(harness.fibers[1]!.disposed, 0, '同上')
+  assert.equal(harness.pluginCalls.length, 3, '新会话照常挂载')
+})
+
+test('被回收的会话在 pre-step 时重新挂载，且 pre-step 必须 return next()', async () => {
+  const project = makeProject({ alpha: { command: 'node' } })
+  approveAll(project, ['alpha'])
+  const harness = createHarness()
+  apply(harness.host as never, { connectionLimit: 2 })
+
+  const victim = mountedSession(harness, project, { id: 'victim' })
+  mountedSession(harness, project, { id: 'other' })
+  mountedSession(harness, project, { id: 'newest' })
+  assert.equal(harness.fibers[0]!.disposed, 1, 'victim 应已被回收')
+  assert.equal(harness.pluginCalls.length, 3)
+
+  // victim 发消息：`agent/pre-step` 是唯一重挂落点（agent 活着时不会再触发
+  // `agent/created`）。waterfall 语义由夹具的 `preStep` 模拟。
+  const { result, listenersRun, nextCalls } = harness.preStep({ agent: victim })
+
+  assert.equal(
+    harness.pluginCalls.length,
+    4,
+    '被回收的会话下次发消息时必须自动重挂——这是"工具会自己回来"的唯一保证',
+  )
+  assert.equal(harness.pluginCalls[3]!.config.serverName, 'alpha')
+  assert.equal(listenersRun, 1, '本插件的 pre-step 监听器应跑过一次')
+  assert.equal(
+    nextCalls,
+    2,
+    'pre-step 是 waterfall：监听器必须 return next()，否则会否决整条链（含内置行为）',
+  )
+  assert.deepEqual(result, { kind: 'enter' }, 'pre-step 的决策必须原样交还给链上的下一个监听者')
+})
+
+test('回收只清 servers、保留登记项与时间戳（会话还活着，之后要重挂）', async () => {
+  const project = makeProject({ alpha: { command: 'node' } })
+  approveAll(project, ['alpha'])
+  const harness = createHarness()
+  apply(harness.host as never, { connectionLimit: 1 })
+
+  const victim = mountedSession(harness, project, { id: 'victim' })
+  mountedSession(harness, project, { id: 'newest' })
+  assert.equal(harness.fibers[0]!.disposed, 1, 'victim 应已被回收')
+
+  const run = (agent: unknown, rawInput: string) =>
+    Promise.resolve(
+      harness.commands.get('mcp-project')!.handler({ agent, rawInput }),
+    ) as Promise<{ kind: string; text: string }>
+
+  // 条目仍在（不是 `none`）：命令能如实报出"本会话的连接已被回收"，而不是
+  // "本会话没有记账"。这条正是"不 agents.delete(key)"的观测面。
+  const out = await run(victim, '')
+  assert.match(
+    out.text,
+    /已被回收/,
+    `被回收的会话必须如实报告状态，而不是装作没有记账：${out.text}`,
+  )
+  assert.match(out.text, /连接上限：1/, `应显示当前上限：${out.text}`)
+  assert.match(out.text, /下次发消息时自动重挂/, `应给出恢复路径：${out.text}`)
+
+  // 重挂后状态回到"已挂载"。
+  harness.preStep({ agent: victim })
+  const after = await run(victim, '')
+  assert.match(after.text, /已挂载（模型可见的工具名为/, `重挂后应报"已挂载"：${after.text}`)
+  assert.doesNotMatch(after.text, /已被回收/, `重挂后不得再说"已被回收"：${after.text}`)
+})
+
+test('回收后仍可重挂：同一会话再次 pre-step 不会重复挂载（幂等）', () => {
+  const project = makeProject({ alpha: { command: 'node' } })
+  approveAll(project, ['alpha'])
+  const harness = createHarness()
+  apply(harness.host as never, { connectionLimit: 1 })
+
+  const victim = mountedSession(harness, project, { id: 'victim' })
+  mountedSession(harness, project, { id: 'newest' })
+  assert.equal(harness.pluginCalls.length, 2)
+
+  harness.preStep({ agent: victim })
+  assert.equal(harness.pluginCalls.length, 3, '第一次 pre-step 应重挂')
+  harness.preStep({ agent: victim })
+  harness.preStep({ agent: victim })
+  assert.equal(
+    harness.pluginCalls.length,
+    3,
+    '已挂载的会话再次 pre-step 不得重复挂载（每次都会多 spawn 一个子进程）',
+  )
+})
+
+test('未被回收的会话在 pre-step 时不重挂，只推时间戳', () => {
+  const project = makeProject({ alpha: { command: 'node' } })
+  approveAll(project, ['alpha'])
+  const harness = createHarness()
+  apply(harness.host as never, { connectionLimit: 8 })
+
+  const agent = mountedSession(harness, project, { id: 'only' })
+  assert.equal(harness.pluginCalls.length, 1)
+  const logsBefore = harness.logs.length
+
+  harness.preStep({ agent })
+  assert.equal(harness.pluginCalls.length, 1, '连接还在时 pre-step 不得重挂')
+  assert.equal(harness.fibers[0]!.disposed, 0, '也不得回收（未超上限）')
+
+  // 诊断不得谎报：`mountInto` 本身是幂等的（同名已挂载则跳过），因此"没重挂"这件事
+  // 只能靠**日志**观测。若重挂判据退化为恒真，这里会在每条消息上刷一条"已重新挂载"，
+  // 而实际什么都没做——用户会据此误判连接反复重建。变异 M4' 守护这一条。
+  const added = harness.logs.slice(logsBefore).map(entry => entry.message).join('\n')
+  assert.equal(
+    added.includes('已重新挂载'),
+    false,
+    `连接还在时不得报"已重新挂载"：${added}`,
+  )
+})
+
+test('重挂日志只在确实重挂时出现一次（不随每次消息重复刷）', () => {
+  const project = makeProject({ alpha: { command: 'node' } })
+  approveAll(project, ['alpha'])
+  const harness = createHarness()
+  apply(harness.host as never, { connectionLimit: 1 })
+
+  const victim = mountedSession(harness, project, { id: 'victim' })
+  mountedSession(harness, project, { id: 'newest' })
+
+  harness.preStep({ agent: victim })
+  const first = harness.logs.filter(entry => entry.message.includes('已重新挂载')).length
+  assert.equal(first, 1, `被回收的会话重挂时应恰好报一次：${JSON.stringify(harness.logs)}`)
+
+  harness.preStep({ agent: victim })
+  harness.preStep({ agent: victim })
+  const second = harness.logs.filter(entry => entry.message.includes('已重新挂载')).length
+  assert.equal(second, 1, '后续消息不得再报"已重新挂载"（连接已经在）')
+})
+
+test('agent/disposed 后该会话不再占回收名额', () => {
+  const project = makeProject({ alpha: { command: 'node' } })
+  approveAll(project, ['alpha'])
+  const harness = createHarness()
+  apply(harness.host as never, { connectionLimit: 2 })
+
+  const gone = mountedSession(harness, project, { id: 'gone' })
+  const stay = mountedSession(harness, project, { id: 'stay' })
+  harness.fire('agent/disposed', { agent: gone })
+  assert.equal(harness.fibers[0]!.disposed, 1, '销毁会话应回收它的连接')
+
+  // `gone` 已从记账与 `agents` 服务里移除，因此新会话到来时它不占名额——
+  // 于是 `stay` 不会被误回收（回收名额只该被活着的会话占用）。
+  mountedSession(harness, project, { id: 'fresh' })
+  assert.equal(harness.fibers[1]!.disposed, 0, '`stay` 不得因为已销毁会话占名额而被回收')
+})
+
+test('回收日志只含会话 id 与数量，不含任何配置内容', () => {
+  const secret = 'placeholder-token-not-a-real-credential'
+  process.env.PROJECT_MCP_RECLAIM_TOKEN = secret
+  const project = makeProject({
+    alpha: { command: 'node', env: { TOKEN: '${PROJECT_MCP_RECLAIM_TOKEN}' } },
+  })
+  approveAll(project, ['alpha'])
+  const harness = createHarness()
+  apply(harness.host as never, { connectionLimit: 1 })
+
+  mountedSession(harness, project, { id: 'victim' })
+  mountedSession(harness, project, { id: 'newest' })
+
+  const joined = harness.logs.map(entry => entry.message).join('\n')
+  assert.match(joined, /已回收最久未活跃的空闲会话/, `应留下可查诊断：${joined}`)
+  assert.match(joined, /victim/, `诊断应指出被回收的会话：${joined}`)
+  assert.equal(joined.includes(secret), false, `日志不得回显展开后的环境变量值：${joined}`)
+})
+
+test('agents 服务缺失时不回收（判不出空闲就绝不动它），其余功能照常', () => {
+  const project = makeProject({ alpha: { command: 'node' } })
+  approveAll(project, ['alpha'])
+  // 不声明 `agents` 到 `inject`：拿不到就退化为"不回收"，而不是让插件整体不激活。
+  const harness = createHarness({ withAgents: false })
+  apply(harness.host as never, { connectionLimit: 1 })
+
+  mountedSession(harness, project, { id: 's1' })
+  mountedSession(harness, project, { id: 's2' })
+
+  assert.equal(
+    harness.fibers[0]!.disposed,
+    0,
+    '判不出会话是否空闲时绝不回收（安全侧：误回收会打断正在工作的会话）',
+  )
+  assert.equal(harness.pluginCalls.length, 2, '挂载不受影响')
+})
+
+test('回归：Config 缺失或 schemastery 不可用时默认上限 8，且不抛', () => {
+  // 本仓库的测试 profile 里**没有** schemastery（夹具只造了 mcp-client），因此
+  // `loadSchemastery()` 返回 null → `Config === undefined`。这正是要守护的降级路径：
+  // 宿主设置页对 schema 做 `'toJSON' in Config`，`null` 会抛错并带崩整页。
+  const project = makeProject({ alpha: { command: 'node' } })
+  approveAll(project, ['alpha'])
+
+  for (const config of [undefined, {}, { connectionLimit: '8' }, { connectionLimit: Number.NaN }]) {
+    const harness = createHarness()
+    assert.doesNotThrow(
+      () => apply(harness.host as never, config),
+      `配置 ${JSON.stringify(config)} 不得让 apply 抛异常`,
+    )
+    // 默认 8：7 个会话不回收，第 9 个才触发。
+    for (let index = 1; index <= 8; index += 1) {
+      mountedSession(harness, project, { id: `s${index}` })
+    }
+    assert.equal(harness.pluginCalls.length, 8, '8 个会话都在上限内')
+    assert.equal(harness.fibers.filter(fiber => fiber.disposed > 0).length, 0, '未超上限不回收')
+
+    mountedSession(harness, project, { id: 's9' })
+    assert.equal(
+      harness.fibers.filter(fiber => fiber.disposed > 0).length,
+      1,
+      '第 9 个会话到来时应回收 1 个（默认上限 8）',
+    )
+  }
+})
+
+test('回归：Config 导出的是 schema 或 undefined，绝不是 null', async () => {
+  // `null` 会让宿主设置页的 `'toJSON' in Config` 抛 TypeError 并带崩整页。
+  const mod = await import('../index.js')
+  assert.notEqual(mod.Config, null, 'Config 不得为 null（宿主 settings 会抛错）')
+  if (mod.Config === undefined) return
+  // 有 schema 时必须是带 `toJSON` 的可调用对象（宿主据此判定"可配置"）。
+  assert.equal(typeof mod.Config, 'function', 'schemastery schema 是可调用对象')
+  assert.equal('toJSON' in (mod.Config as object), true, 'schema 必须有 toJSON')
+})
+
+test('回归：connectionLimit 为 0 时回收全部空闲连接（显式语义）', () => {
+  const project = makeProject({ alpha: { command: 'node' } })
+  approveAll(project, ['alpha'])
+  const harness = createHarness()
+  apply(harness.host as never, { connectionLimit: 0 })
+
+  mountedSession(harness, project, { id: 's1' })
+  // 第 2 个会话到来：预留 1 个名额后有效上限为 -1 → 按 0 处理 → 回收全部空闲。
+  mountedSession(harness, project, { id: 's2' })
+
+  assert.equal(harness.fibers[0]!.disposed, 1, '上限 0 时 s1 必须被回收')
+  assert.equal(harness.pluginCalls.length, 2, '新会话仍能挂上')
+})
+
+test('pre-step 不抛异常：监听器注册且随插件卸载注销', () => {
+  const harness = createHarness()
+  apply(harness.host as never, {})
+
+  // 监听器确实挂上了（`plugin-smoke.test.mts` 断言的是计数，这里补一条行为面）。
+  const project = makeProject({ alpha: { command: 'node' } })
+  const agent = harness.makeAgent(project, { id: 'x' })
+  assert.doesNotThrow(() => harness.preStep({ agent }), 'pre-step 监听器不得抛异常')
+  assert.doesNotThrow(() => harness.preStep({}), 'payload 形状不符时也不得抛异常')
+
+  harness.unload()
+  assert.equal(
+    harness.preStep({ agent }).listenersRun,
+    0,
+    '插件卸载后 pre-step 监听器必须已注销（listenersRun 为 0 说明链上已无本插件的监听器）',
+  )
+})
+
+test('新会话不会挂载任何东西时不得触发回收（不能平白拆掉别的会话）', () => {
+  // 打开一个与 MCP 无关的项目会话是很常见的动作（没有 `.mcp.json`，或未批准）。
+  // 那种会话一个服务器都不会挂，却会占用"新会话"名额——若照样按 `reserve: 1` 回收，
+  // 就会平白拆掉一个正在用的空闲会话，而新会话根本不需要那个名额。
+  const withMcp = makeProject({ alpha: { command: 'node' } })
+  approveAll(withMcp, ['alpha'])
+  const bare = makeProject({ beta: { command: 'node' } }) // 存在但**未批准**
+  const harness = createHarness()
+  apply(harness.host as never, { connectionLimit: 2 })
+
+  mountedSession(harness, withMcp, { id: 'keep-1' })
+  mountedSession(harness, withMcp, { id: 'keep-2' })
+  assert.equal(harness.pluginCalls.length, 2)
+
+  // 第三个会话所在项目没有可挂载项 → 计划不是 `mount` → 不得回收。
+  mountedSession(harness, bare, { id: 'no-mcp' })
+
+  assert.equal(
+    harness.fibers[0]!.disposed,
+    0,
+    '新会话不会挂载任何东西时不得回收——否则浏览一个无关项目的会话就会拆掉别人的连接',
+  )
+  assert.equal(harness.fibers[1]!.disposed, 0, '同上')
+  assert.equal(harness.pluginCalls.length, 2, '未批准的项目不挂载')
+})
+
+test('未批准时 pre-step 不重挂（计划不是 mount 就不该有连接）', () => {
+  const project = makeProject({ alpha: { command: 'node' } })
+  const harness = createHarness()
+  apply(harness.host as never, { connectionLimit: 1 })
+
+  const agent = harness.makeAgent(project, { id: 'pending' })
+  harness.fire('agent/created', { agent })
+  assert.equal(harness.pluginCalls.length, 0, '未批准不挂载')
+
+  harness.preStep({ agent })
+  assert.equal(
+    harness.pluginCalls.length,
+    0,
+    '未批准时 pre-step 不得挂载——重挂只对"已批准但被回收"的会话生效',
+  )
+})
 
 test('未批准时 agent/created 不调用 plugin（规格 §13.4 安全断言）', () => {
   const project = makeProject({ alpha: { command: 'node' } })

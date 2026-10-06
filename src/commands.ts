@@ -66,6 +66,28 @@ export interface ProjectInspection {
    * 与这份名单是**两个独立口径**，不一致时必须并列呈现，不能相互代言。
    */
   mounted: string[]
+  /**
+   * 回收面：连接上限与本会话的连接状态。
+   *
+   * 为什么必须展示：连接可能**在用户不知情的情况下被回收**（超过上限时回收最久未活跃
+   * 的空闲会话）。若命令不说明，用户看到工具消失只会以为插件坏了——而"被回收"是一个
+   * 完全正常、且下次发消息就会自愈的状态。诊断价值全在于**说清楚它发生了**。
+   */
+  reclaim: ReclaimStatus
+}
+
+/** 本会话相对回收机制的状态。 */
+export interface ReclaimStatus {
+  /**
+   * - `mounted`：本会话有已挂载的连接；
+   * - `reclaimed`：记账在、但连接为空——被回收过（或从未挂上，由"状态"行区分）；
+   * - `none`：本插件没有本会话的记账（会话 id 不可用，或从未走过挂载路径）。
+   */
+  status: 'mounted' | 'reclaimed' | 'none'
+  /** 当前生效的连接上限（默认 8，可经插件 Config 配置）。 */
+  limit: number
+  /** 插件侧当前记账的会话总数（回收判定的候选面）。 */
+  sessions: number
 }
 
 /** 命令执行结果，对齐 DSH `CommandResult`（本插件只产出这两态）。 */
@@ -206,6 +228,17 @@ function renderList(view: ProjectInspection, store: TrustStore): CommandOutcome 
   const lines: string[] = []
   lines.push(`项目：${projectRoot ?? '（无法定位项目根）'}`)
   lines.push(`状态：${stateLine(plan)}`)
+
+  // 连接面：上限与"被回收"状态。被回收的会话必须说清楚——否则用户看到工具消失只会
+  // 以为插件坏了，而实际上下次发消息就会自动重挂。
+  const { reclaim } = view
+  lines.push(`连接上限：${reclaim.limit} 个会话（当前记账 ${reclaim.sessions} 个）`)
+  if (reclaim.status === 'reclaimed' && plan.kind === 'mount') {
+    lines.push(
+      '本会话的连接已被回收（超过上限时回收最久未活跃的空闲会话）：' +
+        '下次发消息时自动重挂，**该次请求的工具列表仍是旧的，下一轮可见**。',
+    )
+  }
 
   if (mounted.length > 0) {
     lines.push('已挂载（模型可见的工具名为 mcp__<名称>__*）：')

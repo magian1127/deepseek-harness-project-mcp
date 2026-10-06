@@ -32,6 +32,7 @@
 | `global-rows.ts` | 从 Loader 树收集全局 `mcp-client` 行的 `serverName` | 纯函数（只读遍历） |
 | `session.ts` | `planSessionMount`：会话 → 挂载决策（纯函数，零 I/O） | 纯函数 |
 | `session-tag.ts` | `withSessionTag`：给 stdio config 追加 `--project-mcp-session <SessionId>` 标记（返回新对象） | 纯函数 |
+| `reclaim.ts` | `selectReclaimTargets` / `normalizeConnectionLimit`：连接回收决策与上限归一（纯函数，零 I/O） | 纯函数 |
 | `commands.ts` | `/mcp-project` 命令族（列表 / trust / untrust） | 无（依赖经 `CommandDeps` 注入） |
 | `notice.ts` | `renderNotice`：会话提示文本 | 纯函数 |
 
@@ -43,12 +44,14 @@ index.ts ──> session.ts ──> discovery.ts, translate.ts, trust.ts, global
    ├──> commands.ts, notice.ts    └──> types.ts
    ├──> config-guard.ts ──> types.ts
    ├──> session-tag.ts ──> types.ts
+   ├──> reclaim.ts
    └──> profile-modules.ts
 ```
 
 **职责边界**：`session.ts` / `translate.ts` / `discovery.ts` / `trust.ts` / `global-rows.ts`
-/ `session-tag.ts` 各自只承担一件事、互不依赖，且全部通过注入 I/O（或干脆无 I/O）保持可彻底
-单测。`index.ts` 是唯一的装配层，因此它的测试是"假 ctx + 真实 fs"的集成冒烟，而非穷尽单测。
+/ `session-tag.ts` / `reclaim.ts` 各自只承担一件事、互不依赖，且全部通过注入 I/O（或干脆
+无 I/O）保持可彻底单测。`index.ts` 是唯一的装配层，因此它的测试是"假 ctx + 真实 fs"的
+集成冒烟，而非穷尽单测。
 
 **"唯一做 I/O"的准确范围**：`index.ts` 是唯一做**会话数据** I/O（`.mcp.json` 与信任存储
 的读写）与 Cordis 交互的模块。上表把 `profile-modules.ts` 的 I/O 记为"模块解析 + 文件读"
@@ -131,6 +134,12 @@ profile，拿不到与桌面运行时同实例的 DSH 模块。
    批准时复用计划携带的值，不自行推导（如用进程 cwd）。
 13. 文档与源码中不写本机绝对路径。
 14. 提交标题以中文开头。
+15. **回收只清 `servers`，不 `agents.delete(key)`**——被回收的会话还活着，要能重挂；
+    回收走 `fiber.dispose()` 而非杀进程（`mcp-client` 会自动重连，杀进程会被重新拉起）。
+16. **`agent/pre-step` 监听器必须 `return next()`**（waterfall，本插件不拥有该决策）；
+    监听器内任何异常都必须被吞掉并记日志，绝不打断用户的消息。
+17. **`Config` 在 profile 无 schemastery 时必须是 `undefined`，绝不能是 `null`**
+    （宿主设置页的 `'toJSON' in Config` 遇 `null` 抛错并带崩整页）。
 
 ## 5. `inject` 声明与缺服务的 profile
 
@@ -185,10 +194,20 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 ```
 
 没有 `files` 时 `npm pack` 会把 `.superpowers/`、`src/tests`、`docs/plans/` 与
-`package-lock.json` 全部打包（实测 65 个文件）。加了之后是 **61** 个（`npm pack --dry-run`
-实测），且上述内容均不在其中。注意 `tsconfig.json` 与 `tsconfig.tests.json` **在**
-`files` 里、也**确实**在 tarball 里——它们是有意发布的，不要把它们列进"不应含"清单。
+`package-lock.json` 全部打包。加了之后是 **77** 个（`npm pack --dry-run` 实测；
+每个 `src/*.ts` 模块贡献 4 个 `lib/` 产物 + 1 个 `src/` 源码），且上述内容均不在其中。
+注意 `tsconfig.json` 与 `tsconfig.tests.json` **在** `files` 里、也**确实**在 tarball 里
+——它们是有意发布的，不要把它们列进"不应含"清单。
 改动 `files` 后必须重跑 `npm pack --dry-run` 核对。
+
+核对命令（`--json` 的输出是**以包名为键的对象**，不是数组）：
+
+```powershell
+$j = (npm pack --dry-run --json 2>&1 | Out-String | ConvertFrom-Json).'deepseek-harness-project-mcp'
+$j.files.path | Where-Object { $_ -match 'superpowers|src/tests|docs/plans|package-lock|^temp/' }
+```
+
+上面第二条应**无输出**。
 
 ## 7. 测试策略
 
@@ -196,13 +215,13 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 
 | 层 | 覆盖 | 命令 |
 | --- | --- | --- |
-| 纯函数单测 | `discovery` / `translate` / `trust` / `global-rows` / `session` / `notice` / `config-guard` / `session-tag` | `npm test` |
-| 装配集成 | `plugin-smoke`（假 ctx，验证注册与清理可逆）、`commands`（注入 `CommandDeps`，验证命令输出）、`mount`（真实 fs + 假 agent ctx，验证挂载路径）、`mount-guard`（真实 fs + 假 mcp-client，验证非法 config 被拦在 `ctx.plugin()` 之前） | `npm test` |
+| 纯函数单测 | `discovery` / `translate` / `trust` / `global-rows` / `session` / `notice` / `config-guard` / `session-tag` / `reclaim` | `npm test` |
+| 装配集成 | `plugin-smoke`（假 ctx，验证注册与清理可逆）、`commands`（注入 `CommandDeps`，验证命令输出）、`mount`（真实 fs + 假 agent ctx，验证挂载路径与**回收/重挂**）、`mount-guard`（真实 fs + 假 mcp-client，验证非法 config 被拦在 `ctx.plugin()` 之前） | `npm test` |
 | 模块解析 | `profile-modules`（`--profile` 解析、`DSH_HOME` 落点）、`profile-config-contract`（对**已安装的 profile 模块**断言 `Config['~standard']` 契约） | `npm test` |
 | 类型 | `tsc --noEmit` | `npm run typecheck` |
 | 打包 | tarball 内容 | `npm pack --dry-run` |
 
-### 7.2 测试文件与用例数（当前 190）
+### 7.2 测试文件与用例数（当前 222）
 
 | 文件 | 用例 | 覆盖 |
 | --- | --- | --- |
@@ -216,8 +235,9 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 | `global-rows.test.mts` | 9 | 收集 `mcp-client` 行、忽略非 mcp-client / 缺 `serverName` / 非字符串、`loader` 缺失或形状不符或 `entries()` 抛错时降级空集、嵌套子树 |
 | `session.test.mts` | 16 | 无 cwd、子代理判据（`origin` 单条）、**分叉会话（有 `parentSession`、无 `origin`）应当挂载 / 未批准时进入 untrusted**、**两者同时存在时仍跳过**、无文件静默跳过、未信任、已信任、指纹失配、撞名跳过、损坏文件、结构错误、全候选被跳过时不要求批准、规范化去重、未知传输、变量缺失诊断 |
 | `plugin-smoke.test.mts` | 6 | `apply` 注册与注销、`agent/created` 监听可逆、`renderNotice` 四态 |
+| `reclaim.test.mts` | 16 | 未超上限不回收（含恰好等于上限）、超限回收最久未活跃的 idle（按序返回）、**全部 running 时忽略上限**、idle 不够时只回收 idle（不碰 running）、running 即使最久未活跃也不回收、**`lastActiveAt` 相同时按 `sessionId` 升序决胜（正反序结果相同）**、`limit` 为 0 / 负数、空数组、**`status` 非预期值（6 种）一律视为 running**、`lastActiveAt` 非有限数视为最新、重复 `sessionId` 只计一次（不让回收数虚高）、非法 `sessionId` 被跳过、不修改入参、返回顺序即回收顺序、`normalizeConnectionLimit` 九态、默认上限是 8 |
 | `commands.test.mts` | 17 | 未批准仍显示诊断、部分批准同时可见、空 `configs` 说明、**"已挂载"取自真实记账（计划要挂但没挂上时不谎报）**、**挂载后文件改动仍按记账呈现**、trust 用计划键、幂等（含回报去重）、未知名字报错、untrust 卸载、**untrust 刷新提示段**、**trust 刷新顺序（落盘→挂载→刷新）**、**写盘失败不刷新**、**无项目根不刷新**、未知子命令、无 agent、**命令声明 `input.hint`（缺它则带参数的行被当成对话发给模型）**、**命令名与描述齐备且符合宿主正则**、**未批准时输出可照抄的下一步命令** |
-| `mount.test.mts` | 31 | 未批准不挂载（安全断言）、挂载带 `failOnStartupError: false`、loader 传本体、重复 trust 幂等、插件卸载回收、agent 销毁清理、loader 缺失诊断、commands 缺失诊断、`inject` 声明、**批准后提示段被撤下**、**撤销后提示段刷新为待批准**、**文件消失后提示段撤下**、**会话 B 不谎报已挂载**、**trust 回报实际挂载结果**、**挂载失败日志只记错误类型、不回显展开后的 env 值**、**fiber 启动失败后该名不再出现在"已挂载"里（并留下"已从挂载记账移除"诊断）**、**迟到的 fiber 拒绝不摘掉同名新条目（按身份摘除）**、**过大的 `.mcp.json` 报"过大"而非"没有 `.mcp.json"`，且不进入挂载路径**、**端到端：`env` 的 `__proto__` 键穿过守卫到达 `ctx.plugin()`**、**端到端：`headers` 的 `__proto__` 键穿过守卫到达 `ctx.plugin()`**、**同一 sessionId 的第二个 agent 对象不重复挂载**、**第二个对象发起的 untrust 能卸载第一个对象挂的 fiber**、**第二个对象销毁时回收第一个对象的 fiber**、**第二个对象不重复注入提示段**、**不同 sessionId 各自挂载**、**`agent.id` 缺失或非字符串时不挂载且有诊断（六种非法值）**、**id 不可用时"已挂载"如实为空**、**stdio 命令行带 `--project-mcp-session <sessionId>` 且追加在原有 args 之后**、**两个会话的标记不同**、**http 不追加标记**、**标记只含 SessionId，不带展开后的 env 值** |
+| `mount.test.mts` | 47 | 未批准不挂载（安全断言）、挂载带 `failOnStartupError: false`、loader 传本体、重复 trust 幂等、插件卸载回收、agent 销毁清理、loader 缺失诊断、commands 缺失诊断、`inject` 声明、**批准后提示段被撤下**、**撤销后提示段刷新为待批准**、**文件消失后提示段撤下**、**会话 B 不谎报已挂载**、**trust 回报实际挂载结果**、**挂载失败日志只记错误类型、不回显展开后的 env 值**、**fiber 启动失败后该名不再出现在"已挂载"里（并留下"已从挂载记账移除"诊断）**、**迟到的 fiber 拒绝不摘掉同名新条目（按身份摘除）**、**过大的 `.mcp.json` 报"过大"而非"没有 `.mcp.json"`，且不进入挂载路径**、**端到端：`env` 的 `__proto__` 键穿过守卫到达 `ctx.plugin()`**、**端到端：`headers` 的 `__proto__` 键穿过守卫到达 `ctx.plugin()`**、**同一 sessionId 的第二个 agent 对象不重复挂载**、**第二个对象发起的 untrust 能卸载第一个对象挂的 fiber**、**第二个对象销毁时回收第一个对象的 fiber**、**第二个对象不重复注入提示段**、**不同 sessionId 各自挂载**、**`agent.id` 缺失或非字符串时不挂载且有诊断（六种非法值）**、**id 不可用时"已挂载"如实为空**、**stdio 命令行带 `--project-mcp-session <sessionId>` 且追加在原有 args 之后**、**两个会话的标记不同**、**http 不追加标记**、**标记只含 SessionId，不带展开后的 env 值**、**超限时回收最久未活跃的 idle 会话且新会话仍能挂上**、**全部 running 时忽略上限**、**被回收的会话在 pre-step 时重挂且必须 `return next()`**、**回收只清 servers、保留登记项与时间戳（命令如实报"已被回收"）**、**重挂幂等（重复 pre-step 不重复挂载）**、**未回收的会话 pre-step 不重挂（且日志不谎报"已重新挂载"）**、**重挂日志只在确实重挂时出现一次**、**`agent/disposed` 后不占回收名额**、**回收日志只含会话 id 与数量**、**`agents` 服务缺失时不回收（安全侧）**、**新会话不会挂载任何东西时不得触发回收**、**回归：Config 缺失/不可用时默认上限 8 且不抛**、**回归：Config 是 schema 或 `undefined`，绝不是 `null`**、**`connectionLimit` 为 0 时回收全部空闲**、**pre-step 不抛异常且随卸载注销**、**未批准时 pre-step 不重挂** |
 | `session-tag.test.mts` | 10 | 标记追加在原有 args 之后、参数名带 `project-mcp` 前缀、不修改入参（含冻结对象）、连续标记两次结果相同（不累积）、`args` 缺失时标记成为唯一参数、`args` 非数组时按缺失处理、`args` 里的非字符串项被剔除、`streamable-http` 原样返回且不凭空多出 `args`、标记只含 SessionId 不带 env 值、保留 config 的其他字段 |
 
 ### 7.3 Review Focus 的守护位置
@@ -260,9 +280,61 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 - **变异测试**：新增守护后用变异验证鉴别力（改回缺陷实现，确认恰好红掉对应用例）。
   `noEmitOnError` 会让编译失败的变异静默跑旧产物，变异后必须确认构建真的产出了新文件。
 
-## 8 验证分层与未验证项
+### 7.5 连接的惰性回收与上限（实现位置与判据）
 
-**已由测试与命令覆盖**：上表 190 个用例、`npm run typecheck`、`npm pack --dry-run` 的
+用户可见规则见 [`behavior.md` 第 10.2 节](behavior.md#102-连接的回收与上限)。这里是实现面。
+
+| 面 | 位置 | 判据 / 做法 |
+| --- | --- | --- |
+| 回收决策（谁被回收） | `reclaim.ts` 的 `selectReclaimTargets` | 纯函数。只看 `status === 'idle'` 的，按 `lastActiveAt` 升序取前 N，N = 候选数 − 上限。全部 `running` → `[]` |
+| 上限归一 | `reclaim.ts` 的 `normalizeConnectionLimit` | 非数字 / 非有限数 / 负数 / 小数 → 默认 8 / 夹到 0 / 向下取整 |
+| 会话是否活着 | `ctx.agents.get(sessionId)` | 返回 `undefined` 说明 agent 已销毁（`packages/core/agent/src/index.ts:566-568`），该会话不占回收名额 |
+| 会话是否空闲 | `agent.status` | **公开属性**（`packages/core/agent/src/runtime-types.ts:171-172`，`AgentStatus = 'idle' \| 'running'` 见 `:109`）。**不需要**监听 `agent/status` 事件 |
+| 最后活跃时间 | `AgentRegistrations.lastActiveAt` | 挂载时、`agent/pre-step` 时、`/mcp-project` 命令族时更新（`touch()`）。**不新增监听、不新增定时器** |
+| 执行回收 | `index.ts` 的 `reclaimOverLimit` | `disposeServers(ctx, record.servers)` + 清空 `servers`，**保留登记项与时间戳** |
+| 重挂 | `index.ts` 的 `agent/pre-step` 监听器 | 该会话 `servers` 为空且计划是 `mount` → `mountInto` |
+| 上限预留 | `reclaimOverLimit(..., reserve)` | `agent/created` 传 `reserve: 1`（新会话尚未进记账，不预留则上限实际是 9） |
+
+**不变量（改动时必须保持）**：
+
+1. **回收只清 `servers`，不 `agents.delete(key)`**——被回收的会话还活着，要能重挂；
+   删条目会与 `agent/disposed` 的清理路径及重挂逻辑冲突。
+2. **回收必须走 `fiber.dispose()`，不杀进程**——`mcp-client` 内置自动重连
+   （`packages/mcp/mcp-client/src/connection.ts:41-46`，默认开启、500ms、最多 10 次），
+   杀进程会被重新拉起；`fiber.dispose()` 会 `clearTimeout(reconnectTimer)`（`:388-394`）。
+3. **`agent/pre-step` 监听器必须 `return next()`**——它是 waterfall
+   （`packages/core/agent/src/runtime-types.ts:320`）。不调用 `next()` 会否决整条链
+   （含内置默认行为），会话将无法进入下一步。本插件不拥有这个决策
+   （`skills/cordis-plugin-development/references/practices.md` 第 16 行）。
+4. **拿不到 `agents` 服务时不回收**——判不出空闲就绝不动它。因此**不**把 `agents` 加进
+   `inject`：加进去会让插件在缺该服务的 profile 上保持未激活（连带命令与提示一起失效），
+   而"不回收"是完全可接受的降级。
+5. **重挂后当次请求看不到新工具**——`agent/pre-step` 在 `systemPrompt.assemble`
+   **之后**触发（`packages/core/agent-loop/src/agent.ts:272` 是 assemble、`:277` 才是
+   pre-step），而工具面是 assemble 的产物。这是固有顺序，**不要试图绕过**（见
+   `behavior.md` §10.2）。
+
+**调试方法**：
+
+```powershell
+# 回收决策的纯函数（不需要任何运行时）
+node --test ".tsbuild/tests/reclaim.test.mjs"
+# 穿过 apply 的端到端面（回收、重挂、上限、Config 降级）
+node --test ".tsbuild/tests/mount.test.mjs"
+# 运行时：看是否发生过回收（只含会话 id 与连接数量）
+Select-String -Path <DSH 日志> -Pattern '已回收最久未活跃的空闲会话'
+# 会话内：当前上限 + 本会话是否被回收
+/mcp-project
+```
+
+**上限配置**：`Config.connectionLimit`（默认 8），经 `loadSchemastery()` 从 profile 解析
+schemastery 后声明。**profile 无 schemastery 时必须导出 `undefined`**（不能是 `null`：
+宿主设置页对 schema 做 `'toJSON' in Config`，`packages/settings/settings/src/index.ts:427`，
+`null` 会让 `in` 抛错并带崩整页设置）。字段标 `volatile`（照抄
+`deepseek-harness-hashline/src/index.ts:60-68` 的 `markVolatile`），使插件页可改。
+
+## 8 验证分层与未验证项
+**已由测试与命令覆盖**：上表 222 个用例、`npm run typecheck`、`npm pack --dry-run` 的
 tarball 内容。
 
 **未在真实 DSH 运行时验证**（需要真实 profile 与会话，无法在纯单元测试中覆盖）：
@@ -272,6 +344,16 @@ tarball 内容。
 - 从 `agent.ctx` 遍历 Loader 树能否拿到完整条目集（scope 继承是否覆盖 root）；
 - 首条消息是否真的赶不上工具注册；
 - `/mcp-project` 与提示段在真实 GUI 会话中的实际渲染；
+- **`agent/pre-step` 是否对每个会话都触发**：本插件的重挂完全依赖它（监听器在宿主 ctx
+  上注册，靠 `scopeTarget` 的过滤器接收全部 agent 的事件——未打 scope 标签的 ctx 对
+  任何 scope 的事件都放行，见 `packages/core/scope/src/index.ts:170-185`）。**若该事件
+  不触发，被回收的会话将无法重挂**——这是本轮最需要真实会话验证的一条；
+- **回收是否真的释放了子进程内存**：测试只证明 `fiber.dispose()` 被调用（夹具的
+  `dispose` 是计数器）。真实释放取决于 `mcp-client` 在 dispose 时杀掉子进程并清掉
+  重连定时器（`connection.ts:388-394`）；需要用任务管理器核对进程数是否随之下降；
+- **`Config` 的插件页表单**：`loadSchemastery()` 在真实 profile 上应解析到 schemastery，
+  使 `Config` 不再是 `undefined`。测试 profile 里没有该模块，因此**只覆盖了降级路径**；
+  有 schemastery 时的 `createConfigSchema` / `markVolatile` 未经运行时验证。
 - `src/index.ts` 的挂载拒绝处理器对**真实 Cordis fiber** 是否会在
   `failOnStartupError: false` 下以**拒绝**结算：夹具给的是 thenable 桩，`mount.test.mts`
   自造的 fiber 由测试决定何时拒绝；真实 fiber 走 `fiber.await()`
@@ -349,7 +431,10 @@ Host 半边没有热通道：标记要进入长跑进程，需要使用者重启
 | `disabled: true` 的全局行仍被计入名单 | `global-rows.ts` | 见 [`behavior.md` 第 8.3 节](behavior.md#83-已知局限-被禁用的全局行仍占名) |
 | 模块名精确匹配 | `global-rows.ts` | 行名写成子路径或相对路径时漏检 |
 | `readProjectMcpFile` 把任何读错误当作 `absent` | `discovery.ts` | 无法区分 `ENOENT` 与 `EACCES`；方向是 fail-safe |
-| 每会话独立连接 | `index.ts` | N 个会话 = N 份连接与子进程 |
+| 每会话独立连接 | `index.ts` | N 个会话 = N 份连接与子进程；**超过上限（默认 8）时空闲会话的连接会被回收**，见 [`behavior.md` §10.2](behavior.md#102-连接的回收与上限) |
+| 重挂后当次请求看不到新工具 | `index.ts` | `agent/pre-step` 在 `systemPrompt.assemble` 之后触发，工具面已定型；下一轮可见。固有顺序，不绕过 |
+| 拿不到 `agents` 服务时不回收 | `index.ts` | 判不出空闲就绝不动它（安全侧）。刻意不把 `agents` 加进 `inject`，否则缺该服务的 profile 上插件会整体不激活 |
+| 最后活跃时间只在内存 | `index.ts` | 重启 DSH 后全部会话重新从"现在"开始计时 |
 | 挂载只发生在会话创建时或本会话批准时 | `index.ts` | 别的会话批准后，本会话的计划已是"已批准"但不会自动挂载；`/mcp-project` 把它列在"已批准但本会话未挂载"下，`/mcp-project trust` 即挂上。这是**如实呈现**，不再是口径错误 |
 | 首条消息可能赶不上工具 | `index.ts` | 非阻塞挂载的固有代价 |
 | `findProjectRoot` 不规范化路径 | `discovery.ts` | 同一目录的反斜杠与正斜杠写法在信任存储里是两个键 |

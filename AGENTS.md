@@ -40,7 +40,13 @@
 8. 信任键（`projectRoot` + `fingerprint`）必须与 `isApproved` 的查询键逐字一致；批准时复用
    计划携带的值，不自行推导。
 9. 相对导入一律写 `.js` 扩展名（即使源文件是 `.ts`）；`lib/` 与 `.tsbuild/` 不得手改。
-10. 不主动 `git commit` / `git push`；用户明确批准后，提交标题以中文开头。
+10. **回收只清 `servers`，不 `agents.delete(key)`**——被回收的会话还活着，下次发消息要重挂。
+    回收走 `fiber.dispose()` 而非杀进程（`mcp-client` 会自动重连，杀进程会被重新拉起）。
+11. **`agent/pre-step` 监听器必须 `return next()`**（waterfall，本插件不拥有该决策；不调用会
+    否决整条链含内置行为）。监听器内任何异常都必须吞掉并记日志，绝不打断用户的消息。
+12. **`Config` 在 profile 无 schemastery 时必须是 `undefined`，绝不能是 `null`**——宿主设置页
+    的 `'toJSON' in Config` 遇 `null` 抛错并带崩整页。连接上限默认 **8**。
+13. 不主动 `git commit` / `git push`；用户明确批准后，提交标题以中文开头。
 
 ## 源码地图摘要
 
@@ -56,6 +62,7 @@
 | `src/global-rows.ts` | 从 Loader 树收集全局 `mcp-client` 行的 `serverName` |
 | `src/session.ts` | `planSessionMount`：会话 → 挂载决策（纯函数，零 I/O） |
 | `src/session-tag.ts` | `withSessionTag`：给 stdio config 追加 `--project-mcp-session <SessionId>` 会话标记（纯函数，返回新对象） |
+| `src/reclaim.ts` | `selectReclaimTargets` / `normalizeConnectionLimit`：连接回收决策与上限归一（纯函数，零 I/O） |
 | `src/commands.ts` | `/mcp-project` 命令族（依赖经 `CommandDeps` 注入） |
 | `src/notice.ts` | `renderNotice`：会话提示文本（只在需用户行动时非空） |
 
@@ -67,12 +74,13 @@ index.ts ──> session.ts ──> discovery.ts, translate.ts, trust.ts, global
    ├──> commands.ts, notice.ts    └──> types.ts
    ├──> config-guard.ts ──> types.ts
    ├──> session-tag.ts ──> types.ts
+   ├──> reclaim.ts
    └──> profile-modules.ts
 ```
 
 `session.ts` / `translate.ts` / `discovery.ts` / `trust.ts` / `global-rows.ts` /
-`config-guard.ts` / `session-tag.ts` 各自只承担一件事、互不依赖，全部通过注入 I/O
-（或干脆无 I/O）保持可彻底单测。
+`config-guard.ts` / `session-tag.ts` / `reclaim.ts` 各自只承担一件事、互不依赖，全部通过
+注入 I/O（或干脆无 I/O）保持可彻底单测。
 
 **"唯一做 I/O"的准确范围**：`index.ts` 是唯一做**会话数据** I/O（`.mcp.json` 与信任
 存储的读写）与 Cordis 交互的模块。`profile-modules.ts` 是**显式例外**——它做真实 I/O
@@ -85,7 +93,7 @@ index.ts ──> session.ts ──> discovery.ts, translate.ts, trust.ts, global
 ```powershell
 npm install
 npm run typecheck                        # tsc -p tsconfig.json --noEmit
-npm test                                 # 190 个用例，13 个测试文件
+npm test                                 # 222 个用例，14 个测试文件
 npm pack --dry-run                       # 核对 tarball 内容（files 字段）
 (Get-Content AGENTS.md).Count            # 必须 ≤ 200
 ```
@@ -111,7 +119,13 @@ npm run build && node --test ".tsbuild/tests/session.test.mjs"
 - 非阻塞挂载下 fiber 在 agent dispose 时的清理时机；
 - 从 `agent.ctx` 遍历 Loader 树能否拿到完整条目集；
 - 首条消息是否真的赶不上工具注册；
-- `/mcp-project` 与提示段在真实 GUI 会话中的实际渲染。
+- `/mcp-project` 与提示段在真实 GUI 会话中的实际渲染；
+- **`agent/pre-step` 是否对每个会话都触发**——重挂完全依赖它（监听器注册在宿主 ctx 上，
+  靠 `scopeTarget` 对未打 scope 标签的 ctx 放行来接收全部 agent 的事件，
+  `packages/core/scope/src/index.ts:170-185`）。**该事件不触发则被回收的会话无法重挂**；
+- **回收是否真的释放子进程**：测试只证明 `fiber.dispose()` 被调用，真实释放取决于
+  `mcp-client` 在 dispose 时杀掉子进程并清掉重连定时器（`connection.ts:388-394`）；
+- **`Config` 的插件页表单**：测试 profile 无 schemastery，只覆盖降级为 `undefined` 的路径。
 
 Host 半边没有热通道：新构建进入长跑进程需要使用者重启一次 DSH，代理不得自行重启。
 详见 [`docs/development.md#8-验证分层与未验证项`](docs/development.md#8-验证分层与未验证项)。

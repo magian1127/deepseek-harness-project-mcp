@@ -15,6 +15,7 @@ interface ModuleState {
 
 const mcpClientState: ModuleState = { cache: undefined, failed: false }
 const atomicWriteState: ModuleState = { cache: undefined, failed: false }
+const schemasteryState: ModuleState = { cache: undefined, failed: false }
 
 /** 桌面版 Host（Electron RunAsNode）argv 不带 --profile，profile 固定为 desktop
  * （apps/desktop/src/paths.ts）；此时不能落回 web 默认，否则 createRequire 会
@@ -82,6 +83,7 @@ async function importFromProfile(name: string, state: ModuleState): Promise<void
 // 串行预载：失败保持 cache undefined，由 loadFromProfile 的同步兜底兜住。
 await importFromProfile('@deepseek-ai/dsh-mcp-client', mcpClientState)
 await importFromProfile('@deepseek-ai/dsh-atomic-write', atomicWriteState)
+await importFromProfile('@deepseek-ai/schemastery', schemasteryState)
 
 function loadFromProfile(name: string, state: ModuleState): unknown {
   if (state.cache !== undefined) return state.cache
@@ -104,4 +106,20 @@ export function loadMcpClient(): unknown {
 
 export function loadAtomicWrite(): unknown {
   return loadFromProfile('@deepseek-ai/dsh-atomic-write', atomicWriteState)
+}
+
+/**
+ * 解析 `@deepseek-ai/schemastery`（DSH 的 schema 库，即 profile 里 `z` 的来源）。
+ *
+ * 用途：为插件的 `Config` 提供字段声明，使上限可在插件页配置。**必须**从 profile 解析
+ * 而不是 import——本包不得把 `@deepseek-ai/*` 写进 `dependencies` / `peerDependencies`
+ * （红线 1），且必须与宿主拿到同一模块实例（`instanceof` / 类型同一性）。
+ *
+ * 解析不到时返回 `null`（与 `loadMcpClient` 同约定）：调用方据此降级为
+ * `export const Config = undefined`，绝不能让 `Config` 变成 `null`——宿主设置页对
+ * schema 做 `'toJSON' in Config` 检查（`packages/settings/settings/src/index.ts:427`），
+ * `null` 会让 `in` 抛错并带崩整页，而 `undefined` 被当作"无 Config"安全降级。
+ */
+export function loadSchemastery(): unknown {
+  return loadFromProfile('@deepseek-ai/schemastery', schemasteryState)
 }
