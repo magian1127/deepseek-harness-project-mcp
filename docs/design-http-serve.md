@@ -1,9 +1,13 @@
 # 设计：HTTP 模式的按需拉起服务（`serve` 字段）
 
-状态：**设计完成，待实现**（核心机制已实测验证）
+状态：**已实现**（用户可见语义见 [`behavior.md` §3.2](behavior.md#32-servehttp-条目的按需拉起可选)；
+实现位置与调试方法见 [`development.md`](development.md#2-源码地图)）
 日期：2026-10-06
 前置：[`design.md`](design.md)（本插件总设计）、[`behavior.md`](behavior.md)（用户可见行为）
 相关：[`design-workspace-mode.md`](design-workspace-mode.md)（另一个暂缓的设计）
+
+> 实现要点见 §9；实现与设计的两处**有意偏差**（`serve` 不可用时跳过整个 `serve` 而不只是
+> 跳过检查、`readyTimeoutMs` 的硬上限）记在 §9 末尾。
 
 ## 1 要解决的问题
 
@@ -221,10 +225,31 @@ child.unref()              // 不持有句柄，不阻塞事件循环
 **回退后的状态**：`src/reclaim.ts` 与 `src/tests/reclaim.test.mts` 已删除；`AGENTS.md` 红线 10-12
 （回收相关）随之消失，回到 190 用例版本的红线集（现为 206 用例，含会话标记等既有测试）。
 
-## 9 实现要点（恢复工作时从这里开始）
+## 9 实现要点（实现已完成，这里是落地位置）
 
-- 新模块 `src/serve.ts`（纯函数 + 注入 I/O，便于单测）：`planServeStart(entry)` → `{ command, args, env, health, readyTimeoutMs }` 或 `{ skip, reason }`
-- 新模块 `src/health.ts`：`checkHealth(url, timeoutMs)`（注入 fetch）
-- `src/translate.ts`：解析 `serve` 字段（复用 `expandVariables`，**不展开到日志**）
-- `src/index.ts`：`mountInto` 前插入"确保服务就绪"步骤（仅 HTTP 条目）
-- `src/types.ts`：`McpClientConfig` 增加 HTTP 变体的可选 `serve` 元数据（**注意**：`serve` 不能传给 `mcp-client`，它不在其 schema 里——必须在挂载前剥离）
+| 计划 | 实际落地 |
+| --- | --- |
+| 新模块 `src/serve.ts` | ✅ `planServeStart`（纯函数）、`deriveHealthUrl`、`splitServe`（剥离 `serve`）、`ensureServeReady`（编排 + 并发去重）、`spawnDetached`（真实进程 I/O） |
+| 新模块 `src/health.ts` | ✅ `checkHealth` / `waitReady` / `isHttpUrl`；`fetch`、`sleep`、`now`、`timeoutSignal` 全部注入 |
+| `src/translate.ts` 解析 `serve` | ✅ `translateServe`（畸形时**只丢弃 `serve`**，条目仍挂载；诊断经 `diagnostics` 出参交给装配层） |
+| `src/index.ts` 在 `mountInto` 前插入"确保服务就绪" | ✅ `mountInto` 转 async，逐条目先 `ensureServeReady` 再挂载；`agent/created` 的监听器返回该 promise（Cordis 的 serial 派发会 await 它） |
+| `src/types.ts` 加 `serve` 元数据 | ✅ `ServeMetadata` + HTTP 变体的可选 `serve` |
+| — | ➕ 新模块 `src/values.ts`：展开语义与形状守卫从 `translate.ts` 抽出，供 `serve.ts` 复用（否则两套展开语义迟早分叉） |
+
+### 9.1 与设计的两处有意偏差
+
+| # | 设计原文 | 实现 | 为什么 |
+| --- | --- | --- | --- |
+| 1 | §5「其他 scheme **跳过检查**并记 warn」 | **跳过整个 `serve`**（不 spawn） | 健康检查是 spawn 的**唯一**前提。没有可用的健康端点就永远判不出"服务已经在跑"，于是每次会话挂载都会盲目拉一次，重复实例只能靠端口占用失败收场——而那条失败是**静默的**（`stdio: 'ignore'` 拿不到输出）。宁可不拉 |
+| 2 | §3「`readyTimeoutMs` 默认 120000」（未提上限） | 默认 120000，另加 **30 分钟硬上限** | §5 要求"超时必须有上限，不得无限等待"。没有硬上限时，`.mcp.json` 里一个 `1e12` 就能把会话创建卡到用户以为 DSH 死了 |
+
+### 9.2 实测补充（实现期新发现，不是设计里的内容）
+
+- **`spawn` 的 `'error'` 事件必须挂监听器**：Node 对它没有默认处理器，无监听器时
+  `spawn('不存在的命令')` 会在约一个 tick 后抛未捕获异常并**带崩宿主进程**（Node 22，
+  `detached + stdio: 'ignore'` 下实测，退出码 1）。也就是说一个写错的 `serve.command`
+  足以打挂 DSH。这是实现期发现的最严重的一处，已写进 `AGENTS.md` 红线 12。
+- **测试夹具的 `fire` 必须 await**：`mountInto` 转 async 后，同步遍历监听器会让断言跑在
+  挂载之前——"未挂载"的断言假性通过、"已挂载"的断言必然失败，两种都是错误的观测。
+- **并发去重的实测**：`serve-mount.test.mts` 让子进程往同一个文件追加一行，两个会话并发
+  挂载同一 `url` 时**行的数量是 1**——这是"只 spawn 一次"的直接证据。

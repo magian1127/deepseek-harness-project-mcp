@@ -20,7 +20,8 @@ approve it per project.
 | A repository cannot approve itself | Approval records live only in `${DSH_HOME:-~/.dsh}`; the project has no writable approval channel |
 | Approve from the session | `/mcp-project trust` mounts the servers into the current session immediately, with no restart |
 | Two transports | `stdio` and `streamable-http` (`http` is an alias) |
-| Variable expansion | `command` / `args` / `env` / `url` / `headers` support `${VAR}` and `${VAR:-default}` |
+| On-demand HTTP server startup | An HTTP entry can declare `serve`: how to start the server when it is not running. If the health check fails, the plugin starts it and waits for readiness before connecting |
+| Variable expansion | `command` / `args` / `env` / `url` / `headers` / `serve.*` support `${VAR}` and `${VAR:-default}` |
 | Global name-collision guard | A project server sharing a name with a global profile MCP row is not mounted twice |
 | No double mount for subagents | A subagent session (`origin === 'subagent'`) shares its parent's workspace, so no extra connection or child process is created; a forked session is an independent conversation and is mounted normally |
 | Non-intrusive | With no `.mcp.json` the plugin stays completely silent; session notices appear only when you need to act |
@@ -84,12 +85,69 @@ if no `.git` is found all the way up, the workspace directory itself):
 | Key (`github` / `docs`) | Server name. Legal characters are `[A-Za-z0-9_-]`, length 1–32; anything else is normalized and renamed |
 | `command` + `args` + `env` | stdio server. `env` holds extra environment variables; `cwd` is the session workspace |
 | `type: "http"` or `"streamable-http"` + `url` + `headers` | HTTP server |
+| `serve` (optional on HTTP entries) | How to start the server when it is not running — see below |
 | `type: "sse"` / `"ws"` / `"sdk"` | **Unsupported** — skipped with a reason (DSH's transport factory only has stdio and streamable-http branches) |
 | `url` without `type` | **Skipped** — the transport cannot be determined |
 
 A server's tools appear as `mcp__<serverName>__<toolName>`; for a renamed server the tool names use
 the normalized name. Full semantics, skip reasons, and boundaries live in the
 [behavior contract](docs/behavior.md).
+
+### On-demand HTTP server startup (`serve`)
+
+In HTTP mode DSH **spawns no child process** — it only sends requests to `url`, so the server must
+already be running. If it is not, DSH cannot connect and the tools are unavailable. `serve` lets
+the plugin **start the server** in that case and wait for readiness before connecting:
+
+```json
+{
+  "mcpServers": {
+    "mudblazor": {
+      "type": "http",
+      "url": "http://127.0.0.1:19701/mcp",
+      "serve": {
+        "command": "dotnet",
+        "args": ["<path-to-MudBlazor.Mcp.dll>", "--version", "9.10.0"],
+        "env": { "ASPNETCORE_URLS": "http://127.0.0.1:19701" },
+        "health": "http://127.0.0.1:19701/health/ready",
+        "readyTimeoutMs": 120000
+      }
+    }
+  }
+}
+```
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `command` | ✅ | Executable (or absolute path). Same semantics as the stdio `command`, and **not** interpreted by a shell |
+| `args` | ❌ | Argument array, default `[]` |
+| `env` | ❌ | **Extra** environment variables (layered on top of the host environment) |
+| `health` | ❌ | Readiness URL (only `http://` / `https://`). When omitted, the `url`'s origin + `/health/ready` |
+| `readyTimeoutMs` | ❌ | Readiness deadline in milliseconds, default `120000` |
+
+Behavior:
+
+- **A running server is never touched**: one health check (2 s timeout) runs first; on success the
+  entry is handed straight to DSH with no extra action.
+- **The server is started only when that check fails**, then `health` is polled every 250 ms and the
+  entry is handed over once ready.
+- **Your first message waits for readiness** (at most `readyTimeoutMs`). This is the only
+  user-visible cost: the wait happens on the session-creation path, so the tools are registered
+  before the first request. The wait affects **only that entry** — other servers in the same
+  session are mounted immediately.
+- **A timeout still connects**: one log line is written and DSH retries on its own (tools register
+  but stay unavailable for a while).
+- **A started server outlives DSH**: it is launched in its own process group, inherits no pipes, and
+  the reference is dropped immediately. The plugin never kills, monitors, or restarts it — several
+  DSH instances (or a DSH restart) share one server, and the server decides when to exit. To stop
+  it, end the process yourself.
+- **Two sessions mounting the same `url` start it only once** (deduplicated by `url`).
+- **A malformed `serve` does not break anything**: only `serve` is dropped, one log line is written,
+  and the server is mounted as usual.
+
+Full semantics: [behavior contract §3.2](docs/behavior.md#32-servehttp-条目的按需拉起可选).
+Diagnosing "the server was not started" and "why is it taking so long":
+[troubleshooting](docs/troubleshooting.md).
 
 ## Trust and approval
 
@@ -136,15 +194,21 @@ subcommand spellings.
   messages, session records, or disk.
 - When a variable is undefined with no default, that server is skipped and the diagnostic names the
   **variable**, never its value.
-- The plugin makes no network requests of its own, collects no telemetry, and keeps no persistent
-  data beyond the trust file.
+- The plugin collects no telemetry and keeps no persistent data beyond the trust file.
+- **Network requests**: the plugin issues exactly one kind of request of its own — a readiness probe
+  against `serve`'s `health` (or the `/health/ready` derived from `url`), and only over
+  `http://` / `https://`. Every other connection is made by DSH's own MCP client (to the `url` you
+  approved).
+- **Process startup**: the plugin starts a process only when `serve` is declared and the health
+  check failed, and only ever starts `serve.command` — with no shell interpretation, so `&&`,
+  pipes, redirection, and globs do not apply. Without approval it neither spawns nor connects.
 
 ## Known limitations
 
 | Limitation | Detail |
 | --- | --- |
 | Per-session connections | A project server under N sessions means N connections and child processes (a global profile row has one). A stdio server gets `--project-mcp-session <session id>` appended after the `args` from `.mcp.json`, so you can tell which session owns a process — the rest of the command line is byte-identical across sessions for the same `.mcp.json`. The marker carries the session id only, never any configuration content, and servers ignore unknown arguments, so it does not affect runtime |
-| First message may miss the tools | Mounting does not wait for the MCP connection; instant sessions cost the first message's tool visibility, which returns on the next turn |
+| First message may miss the tools | Mounting does not wait for the MCP connection; instant sessions cost the first message's tool visibility, which returns on the next turn. **Exception**: an HTTP entry with `serve` waits for the health check first (bounded, never throws) — see above |
 | Unsupported transports | `sse` / `ws` / `sdk` are always skipped; SSE is deprecated in the MCP spec and mainstream servers offer `streamable-http` |
 | Disabled global rows still claim the name | The collision check looks only at a row's module name and `serverName`, not at `disabled: true`; a disabled row therefore makes a same-named project server skip as "already provided globally" while the global side never connects |
 | Global rows are out of scope | MCP rows in profile patches still connect at DSH startup; this plugin detects them (the name list feeds the collision check only) but **does not warn**, and cannot prevent them. Editing the profile patch is the only remedy and lies outside this plugin's scope, so it does not interrupt startup over something you cannot act on |
@@ -152,6 +216,9 @@ subcommand spellings.
 | `.mcp.json` capped at 1 MiB | Anything larger is **refused unread** (never loaded into memory), with an "oversized" diagnostic. Reading happens on the synchronous session-creation path, and no cap would let an oversized file in an unfamiliar repo stall it; a real `.mcp.json` is far under 100 KiB |
 | Profiles without a `commands` service | This plugin injects `commands` / `loader` / `systemPrompt`; on a profile lacking one (e.g. `sdk-minimal`) it stays inactive, so `/mcp-project` does not appear either |
 | Mounting happens only at session creation or on this session's own approval | After another session approves, this session's plan already reads "approved" but the servers are not mounted into it automatically; `/mcp-project` lists them under "approved but not mounted in this session", and running `/mcp-project trust` mounts them |
+| `serve` does not manage the server's lifetime | A started server outlives DSH: the plugin never kills, monitors, or restarts it. That is what lets several instances share one server; the cost is that a mistyped `serve` leaves a resident process you must end yourself |
+| `serve` does not check port ownership | If the port is taken by something else, one log line is written; nothing is preempted or retried, and the entry is handed to DSH as usual (it may connect to that other instance) |
+| `serve`'s wait is bounded | Default 120 s (configurable, hard-capped at 30 min). After a timeout the entry is still mounted, the tools stay unavailable for a while, and DSH retries on its own |
 
 ## Uninstall
 

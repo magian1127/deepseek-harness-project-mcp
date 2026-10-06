@@ -41,6 +41,17 @@
    计划携带的值，不自行推导。
 9. 相对导入一律写 `.js` 扩展名（即使源文件是 `.ts`）；`lib/` 与 `.tsbuild/` 不得手改。
 10. 不主动 `git commit` / `git push`；用户明确批准后，提交标题以中文开头。
+11. `serve` 是**本插件自己的**元数据，不在 `mcp-client` 的 Config schema 里，必须在
+   `validateMountConfig` / `withSessionTag` / `ctx.plugin()` **之前**剥离（`splitServe`）。
+   带着它进 `ctx.plugin()` 一旦触发校验失败，schemastery 的 union 错误会把**整个 config**
+   （含展开后的 `serve.env` 凭据）写进 Cordis 自己的日志——红线 3 的隐蔽通道。
+12. `spawnDetached` 的五个要素缺一不可：`detached: true`、`stdio: 'ignore'`、
+   `windowsHide: true`、`child.on('error', …)`、`unref()`。**`'error'` 监听器不是防御性
+   代码**：Node 对它没有默认处理器，无监听器时一个写错的 `serve.command`（ENOENT）会以
+   未捕获异常**带崩宿主进程**（已实测）。启动后不 kill、不 await、不监听 exit——生命周期
+   归服务自己。
+13. 健康检查 URL 只允许 `http://` / `https://`；`fetch` 还支持 `file:` / `data:`，放行它们
+   等于让不受信的 `.mcp.json` 指挥本插件读本机文件。
 
 ## 源码地图摘要
 
@@ -51,7 +62,10 @@
 | `src/types.ts` | 宿主服务的最小鸭子类型（不 import `@deepseek-ai/*`） |
 | `src/profile-modules.ts` | 从当前 profile 解析并预载 DSH 运行时模块 |
 | `src/discovery.ts` | 项目根发现（向上找 `.git`）、`.mcp.json` 读取与解析 |
-| `src/translate.ts` | 条目 → `McpClientConfig`、`serverName` 规范化、`${VAR}` 展开 |
+| `src/values.ts` | `${VAR}` 展开与不受信 JSON 的形状守卫（`translate.ts` 与 `serve.ts` 共用） |
+| `src/translate.ts` | 条目 → `McpClientConfig`、`serverName` 规范化、解析 `serve` 字段 |
+| `src/health.ts` | `checkHealth` / `waitReady` / `isHttpUrl`：就绪探测与轮询（I/O 全部注入） |
+| `src/serve.ts` | `planServeStart`（`serve` → 启动计划）、`deriveHealthUrl`、`splitServe`（剥离 `serve`）、`ensureServeReady`（编排 + 并发去重）、`spawnDetached`（脱离进程启动，**真实进程 I/O**） |
 | `src/trust.ts` | 信任存储、规范化指纹、批准/撤销 |
 | `src/global-rows.ts` | 从 Loader 树收集全局 `mcp-client` 行的 `serverName` |
 | `src/session.ts` | `planSessionMount`：会话 → 挂载决策（纯函数，零 I/O） |
@@ -64,28 +78,33 @@
 ```
 index.ts ──> session.ts ──> discovery.ts, translate.ts, trust.ts, global-rows.ts
    │                              │
-   ├──> commands.ts, notice.ts    └──> types.ts
+   │                              ├──> serve.ts ──> health.ts, values.ts, config-guard.ts
+   │                              └──> values.ts, types.ts
+   ├──> commands.ts, notice.ts
    ├──> config-guard.ts ──> types.ts
    ├──> session-tag.ts ──> types.ts
+   ├──> serve.ts（ensureServeReady / spawnDetached / splitServe）
    └──> profile-modules.ts
 ```
 
 `session.ts` / `translate.ts` / `discovery.ts` / `trust.ts` / `global-rows.ts` /
-`config-guard.ts` / `session-tag.ts` 各自只承担一件事、互不依赖，全部通过注入 I/O
-（或干脆无 I/O）保持可彻底单测。
+`config-guard.ts` / `session-tag.ts` / `values.ts` / `health.ts` / `serve.ts` 各自只承担
+一件事、互不依赖（除上面标出的单向依赖），全部通过注入 I/O（或干脆无 I/O）保持可彻底单测。
 
 **"唯一做 I/O"的准确范围**：`index.ts` 是唯一做**会话数据** I/O（`.mcp.json` 与信任
-存储的读写）与 Cordis 交互的模块。`profile-modules.ts` 是**显式例外**——它做真实 I/O
+存储的读写）与 Cordis 交互的模块。两个**显式例外**：`profile-modules.ts` 做真实 I/O
 （`readFileSync` 读 `package.json`、`createRequire`、动态 `import`），但那是 profile
 模块解析，与会话数据无关，且刻意独立成模块以便隔离"从 profile 载入 DSH 运行时模块"
-这一副作用。不要把会话数据 I/O 搬出 `index.ts`，也不要把 profile 解析搬进来。
+这一副作用；`serve.ts` 的 `spawnDetached` 启动一个外部进程，同样不属于会话数据，且与
+"怎么启动服务"的全部知识同处一室才不会被误改。不要把会话数据 I/O 搬出 `index.ts`，
+也不要把 profile 解析或进程启动搬进来。
 
 ## 本地验证命令
 
 ```powershell
 npm install
 npm run typecheck                        # tsc -p tsconfig.json --noEmit
-npm test                                 # 190 个用例，13 个测试文件
+npm test                                 # 262 个用例，15 个测试文件
 npm pack --dry-run                       # 核对 tarball 内容（files 字段）
 (Get-Content AGENTS.md).Count            # 必须 ≤ 200
 ```
