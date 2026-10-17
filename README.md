@@ -27,7 +27,8 @@ DSH 的 MCP 配置原本只有 profile（进程）作用域：写进 profile 补
 
 ## 环境要求
 
-- DeepSeek Harness 0.2.x（源码核对基线 0.2.1-alpha.1）
+- **DeepSeek Harness `>=0.2.0-rc.2 <0.3.0-0`**（`package.json` 的 `engines.dsh`，由宿主在安装与 profile 启动时强制校验；0.1.x 及更早会被判不兼容并拒绝加载）
+- 实测基线 DSH 0.2.1-rc.2（`@deepseek-ai/dsh-mcp-client` 与 `@deepseek-ai/dsh-atomic-write` 均为 `0.2.1-rc.2`）
 - Node.js `^22.19.0 || >=24.0.0`
 - 本插件只有 Host 半边，没有 Web 配置表单，也不注册模型工具
 

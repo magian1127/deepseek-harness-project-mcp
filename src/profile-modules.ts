@@ -73,6 +73,11 @@ async function importFromProfile(name: string, state: ModuleState): Promise<void
     const requireFromProfile = createRequire(join(profileDir(), 'package.json'))
     const entry = profileEntryPath(requireFromProfile, name)
     const mod = (await import(pathToFileURL(entry).href)) as { default?: unknown } | null | undefined
+    // DSH 0.2.1-rc.2 实测：这两个包都**没有** default 导出，聚合面就是整个
+    // 命名空间（mcp-client 导出 name/inject/Config/apply；atomic-write 导出
+    // writeFileAtomic/withFileLock，见各自 package.json 的 exports["."]）。
+    // 因此这里取到的是命名空间本身；保留 default 优先的写法只为兼容将来
+    // 可能出现的 default 聚合面，取到的成员名不变。
     state.cache = mod !== null && mod !== undefined && mod.default !== undefined ? mod.default : mod
   } catch {
     state.cache = undefined

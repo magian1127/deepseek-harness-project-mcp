@@ -104,7 +104,7 @@ index.ts ──> session.ts ──> discovery.ts, translate.ts, trust.ts, global
 ```powershell
 npm install
 npm run typecheck                        # tsc -p tsconfig.json --noEmit
-npm test                                 # 262 个用例，15 个测试文件
+npm test                                 # 264 个用例，16 个测试文件
 npm pack --dry-run                       # 核对 tarball 内容（files 字段）
 (Get-Content AGENTS.md).Count            # 必须 ≤ 200
 ```

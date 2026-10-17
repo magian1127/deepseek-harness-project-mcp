@@ -25,7 +25,10 @@
     "tsconfig.json",
     "tsconfig.tests.json"
   ],
-  "engines": { "node": "^22.19.0 || >=24.0.0" },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0",
+    "dsh": ">=0.2.0-rc.2 <0.3.0-0"
+  },
   "keywords": [
     "deepseek-harness",
     "dsh",

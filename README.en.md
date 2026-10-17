@@ -28,7 +28,8 @@ approve it per project.
 
 ## Requirements
 
-- DeepSeek Harness 0.2.x (source-verified baseline 0.2.1-alpha.1)
+- **DeepSeek Harness `>=0.2.0-rc.2 <0.3.0-0`** (the `engines.dsh` field in `package.json`, enforced by the host on install and profile startup; 0.1.x and earlier are rejected as incompatible)
+- Verified baseline: DSH 0.2.1-rc.2 (`@deepseek-ai/dsh-mcp-client` and `@deepseek-ai/dsh-atomic-write` are both `0.2.1-rc.2`)
 - Node.js `^22.19.0 || >=24.0.0`
 - Host side only: no web settings form, and no model tools of its own
 

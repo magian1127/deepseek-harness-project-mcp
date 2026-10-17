@@ -110,6 +110,23 @@ DSH 0.1.7-rc 起，宿主的组合批次经模块 hooks 管线并行动态 impor
 4. 预载失败后才走同步 `require` 兜底（脱离 profile 的测试 / CLI 环境），再失败即
    **永久降级**并返回 `null`。
 
+**0.2.1-rc.2 实测的包形状**（`src/tests/profile-export-contract.test.mts` 守护）：
+
+| 包 | 版本 | `exports["."]` | 实际导出 |
+| --- | --- | --- | --- |
+| `@deepseek-ai/dsh-mcp-client` | 0.2.1-rc.2 | `{"types":"./lib/types/index.d.ts","default":"./lib/index.js"}` | `name` / `inject` / `Config` / `apply` / `createMcpToolDefinition`；**无 `default` 导出** |
+| `@deepseek-ai/dsh-atomic-write` | 0.2.1-rc.2 | 同上形状 | `writeFileAtomic` / `withFileLock`；**无 `default` 导出** |
+
+两者都没有 `default`，所以 `export default undefined` 时取到的是**命名空间本身**。
+`profile-modules.ts` 里"`mod.default` 优先"的写法对这两个包等价于取命名空间；保留该分支只为
+兼容将来可能出现的 default 聚合面。**不要**把这层判断当成已验证的多余逻辑删掉——一旦上游给
+某个包加了 `default`，删掉就会拿错对象；对应断言在 `profile-export-contract.test.mts` 里，
+变化会以测试失败的形式暴露。
+
+注意 `@deepseek-ai/dsh-llm` 是**相反**的情况（`default` 是 `LlmRuntime` 类，`HarnessError`
+在具名导出里），`deepseek-harness-hashline` 踩过这个坑；本插件目前不解析 `dsh-llm`，若将来
+需要，别照抄"只取 default"。
+
 **profile 名解析**：`--profile <name>` 优先；无该标志时，Electron 环境（桌面版 Host）固定
 为 `desktop`，否则为 `web`。桌面版不能落回 `web` 默认，否则 `createRequire` 会锚到 web
 profile，拿不到与桌面运行时同实例的 DSH 模块。
@@ -117,6 +134,28 @@ profile，拿不到与桌面运行时同实例的 DSH 模块。
 **路径拼接**统一用 `posix.join`（输出跨平台确定，Windows 的 `fs` / `createRequire` 同样
 接受正斜杠）；但**向上回溯**必须用平台感知的 `dirname`——`posix.dirname` 对 Windows 盘符
 路径会返回 `.`，会让 Windows 上的项目根发现静默止步于 cwd。
+
+### 3.3 `engines.dsh` 准入门禁
+
+`package.json` 声明 `"engines": { "node": …, "dsh": ">=0.2.0-rc.2 <0.3.0-0" }`。这是 DSH
+0.2.1-alpha.3 引入的规则（`packages/boot/app-boot/src/plugin-compatibility.ts`）：
+
+- 清单有 `engines.dsh` 时**它单独决定**结果，`@deepseek-ai/dsh-*` 的 `peerDependencies` 被完全忽略；
+- 判定用 `semver.satisfies(version, range, { includePrerelease: true })`，否则 `0.2.1-rc.2` 会被误拒；
+- `engines` 不是对象、或 `engines.dsh` 不是字符串 → 该包被**拒绝加载**；
+- `engines.dsh` 里写 `workspace:` 协议一律视为不兼容（只有 peer 里允许）。
+
+改动清单后用宿主真实的 `evaluatePluginCompatibility` 验证，不要自己复刻 semver 逻辑：
+
+```powershell
+# 在 DSH 检出目录下执行；正向必须退出 0
+npx tsx <工作区>/temp/check-engines-dsh.mjs deepseek-harness-project-mcp
+
+# 负向必须退出 1（证明门禁真的生效）
+npx tsx <工作区>/temp/check-engines-dsh.mjs deepseek-harness-project-mcp --runtime 0.1.7-alpha.2
+```
+
+负向版本**不要**用 `0.2.0-rc.2`：它是范围下界本身，必然通过。
 
 ## 4. 不可破坏的约束
 
@@ -207,15 +246,16 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 | --- | --- | --- |
 | 纯函数单测 | `discovery` / `translate` / `values` / `health` / `serve` / `trust` / `global-rows` / `session` / `notice` / `config-guard` / `session-tag` | `npm test` |
 | 装配集成 | `plugin-smoke`（假 ctx，验证注册与清理可逆）、`commands`（注入 `CommandDeps`，验证命令输出）、`mount`（真实 fs + 假 agent ctx，验证挂载路径）、`mount-guard`（真实 fs + 假 mcp-client，验证非法 config 被拦在 `ctx.plugin()` 之前）、`serve-mount`（真实 fs + 假 agent ctx + **真实 spawn**，验证拉起链路） | `npm test` |
-| 模块解析 | `profile-modules`（`--profile` 解析、`DSH_HOME` 落点）、`profile-config-contract`（对**已安装的 profile 模块**断言 `Config['~standard']` 契约） | `npm test` |
+| 模块解析 | `profile-modules`（`--profile` 解析、`DSH_HOME` 落点）、`profile-config-contract`（对**已安装的 profile 模块**断言 `Config['~standard']` 契约）、`profile-export-contract`（对**已安装的 profile 模块**断言 `mcp-client` / `atomic-write` 的导出形状） | `npm test` |
 | 类型 | `tsc --noEmit` | `npm run typecheck` |
 | 打包 | tarball 内容 | `npm pack --dry-run` |
 
-### 7.2 测试文件与用例数（当前 262）
+### 7.2 测试文件与用例数（当前 264）
 
 | 文件 | 用例 | 覆盖 |
 | --- | --- | --- |
 | `profile-modules.test.mts` | 5 | `--profile` 标志、Electron 默认 `desktop`、非 Electron 默认 `web`、伪值忽略、`DSH_HOME/profiles/<name>` 落点 |
+| `profile-export-contract.test.mts` | 2 | 对**已安装的 profile 模块**断言 0.2.1-rc.2 实测的导出形状：`mcp-client` 的 `name`/`inject`（含 `tools`）/`Config`/`apply` 与"无 `default` 导出"；`atomic-write` 的 `writeFileAtomic`/`withFileLock` 与"无 `default` 导出"。锚点按 `DSH_CHECKOUT` → 当前 profile 顺序解析，都不可用时跳过（纯 CI 预期） |
 | `config-guard.test.mts` | 20 | 合法放行且**返回原 config（不是 schema 规范化后的 `value`）**、`value` 缺失时同样返回原配置、非法 `serverName` / 缺失 `command` 的诊断只含字段路径、无 `path` 时的通用摘要、`env` 键名可入诊断、不可信 path 段整条作废（含 `=`、超长、换行、非原始值、symbol）、数组下标合法、段数上限截断、**根级 union 无 `path` 时下钻 union 成员取字段**、成员抛错/返回 thenable 不影响主判定、非 union 不下钻、空 `issues` 视为失败、异步校验拦下、校验抛错只记类型名、非对象结果拦下、schema 缺失放行、`validate` 以 `~standard` 对象为接收者调用、`errorName` 只回类型名 |
 | `mount-guard.test.mts` | 4 | **schema 不通过时非法 config 被拦在 `ctx.plugin()` 之前且日志不含敏感值**、**多条非法配置全部拦下**、**被拦下的项不进挂载记账**、**命令层 trust 路径共用同一守卫** |
 | `profile-config-contract.test.mts` | 6 | 对**已安装的 profile 模块**断言：`Config` 是带 `~standard` 的 schemastery union、`validate` 同步、合法返回补齐默认值的 `value`、**非法时 `issue.message` 回显整个 config（泄密源）**、`validateMountConfig` 在真实 schema 上放行合法/拦下非法且不泄漏 |
