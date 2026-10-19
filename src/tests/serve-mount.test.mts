@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type { TrustStore } from '../trust.js'
 
 /**
  * `serve` 的**端到端**守护：穿过真实 `apply` + 真实 `agent/created` + 真实 spawn。
@@ -129,7 +130,8 @@ export default class FakeMcpClient {
 `)
 
 const { apply } = await import('../index.js')
-const { approve, fingerprint, trustStorePath } = await import('../trust.js')
+const { approve, configHashOf, trustStorePath } = await import('../trust.js')
+const { normalizeServerName } = await import('../translate.js')
 
 interface Project {
   root: string
@@ -146,15 +148,20 @@ function makeProject(servers: Record<string, unknown>): Project {
   return { root, raw }
 }
 
-/** 写信任存储，批准该项目全部指定服务器（指纹必须针对 `.mcp.json` 的确切文本）。 */
+/**
+ * 写信任存储，批准该项目指定的服务器（v2：服务器 × 配置哈希）。
+ *
+ * 哈希从 `.mcp.json` 的**原文条目**算出，与计划算的是同一份输入——手搓哈希会让
+ * "批准了却没挂上"这类失配缺陷在测试里看不见。
+ */
 function approveAll(project: Project, servers: string[]): void {
-  const store = approve(
-    { version: 1, projects: {} },
-    project.root,
-    fingerprint(project.raw),
-    servers,
-    't',
-  )
+  const parsed = JSON.parse(project.raw) as { mcpServers: Record<string, unknown> }
+  let store: TrustStore = { version: 2, projects: {} }
+  for (const serverName of servers) {
+    const originalKey =
+      Object.keys(parsed.mcpServers).find(key => normalizeServerName(key) === serverName) ?? serverName
+    store = approve(store, project.root, serverName, configHashOf(parsed.mcpServers[originalKey]), 't')
+  }
   writeFileSync(trustStorePath(), JSON.stringify(store, null, 2))
 }
 
@@ -195,7 +202,7 @@ function createHarness() {
 
   const host = {
     get(name: string) {
-      if (name === 'commands') return { register: () => () => {} }
+      // 命令面已删除；`loader` 缺席意味着全局撞名名单为空（本文件不关心撞名）。
       if (name === 'loader') return undefined
       return undefined
     },

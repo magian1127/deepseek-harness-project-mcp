@@ -16,15 +16,15 @@ approve it per project.
 | --- | --- |
 | Project-level config | A `.mcp.json` at the project root (Claude Code convention) declares the MCP servers specific to that project |
 | No approval, no connection | Unapproved servers spawn no process and open no connection; cloning an unknown repository and opening it executes nothing from it |
-| Fingerprint binding | Approval is bound to the exact contents of `.mcp.json`, so a `git pull` that adds a server forces re-approval |
+| Config-hash binding | Approval is bound to **each server's current configuration**, so a `git pull` only forces re-approval for the servers it changed |
 | A repository cannot approve itself | Approval records live only in `${DSH_HOME:-~/.dsh}`; the project has no writable approval channel |
-| Approve from the session | `/mcp-project trust` mounts the servers into the current session immediately, with no restart |
+| Approve from the UI | A composer button plus a popup: pressing [Start] approves and mounts into the current session immediately, with no restart |
 | Two transports | `stdio` and `streamable-http` (`http` is an alias) |
 | On-demand HTTP server startup | An HTTP entry can declare `serve`: how to start the server when it is not running. If the health check fails, the plugin starts it and waits for readiness before connecting |
 | Variable expansion | `command` / `args` / `env` / `url` / `headers` / `serve.*` support `${VAR}` and `${VAR:-default}` |
 | Global name-collision guard | A project server sharing a name with a global profile MCP row is not mounted twice |
 | No double mount for subagents | A subagent session (`origin === 'subagent'`) shares its parent's workspace, so no extra connection or child process is created; a forked session is an independent conversation and is mounted normally |
-| Non-intrusive | With no `.mcp.json` the plugin stays completely silent; session notices appear only when you need to act |
+| Non-intrusive | With no `.mcp.json` the plugin stays completely silent, and it **never writes into the system prompt**; needing action only shows as a state label on the button |
 
 ## Requirements
 
@@ -56,8 +56,11 @@ should show a `dsh-project-mcp` row:
 dsh plugin --profile web list
 ```
 
-This plugin is Host-side only and has no client settings form. The Host half has no hot channel:
-getting a new build into a long-running process needs one `dsh web` restart from you.
+The Host half has no settings form; the Client half is only the composer button and its popup.
+Getting a new build into a long-running process needs **no restart**: remove and reinstall the
+bundle from the Plugins page (measured). The Client half hot-reloads on its own, without a page
+refresh. Only the very **first** supply of the Client half needs one DSH restart, because the
+host's module table caches "not a client package" per process.
 
 ## `.mcp.json` format
 
@@ -138,8 +141,11 @@ Behavior:
   session are mounted immediately.
 - **A timeout still connects**: one log line is written and DSH retries on its own (tools register
   but stay unavailable for a while).
-- **A started server outlives DSH**: it is launched in its own process group, inherits no pipes, and
-  the reference is dropped immediately. The plugin never kills, monitors, or restarts it — several
+- **A started server outlives DSH**: it inherits no pipes and the reference is dropped immediately.
+  On POSIX it also gets its own process group. On Windows it depends on the command: PowerShell gets
+  no `detached` (there `detached` means `DETACHED_PROCESS`, and PowerShell then exits without running
+  a single line), while everything else keeps it — otherwise the server stays attached to the host
+  console and dies together with DSH. The plugin never kills, monitors, or restarts it — several
   DSH instances (or a DSH restart) share one server, and the server decides when to exit. To stop
   it, end the process yourself.
 - **Two sessions mounting the same `url` start it only once** (deduplicated by `url`).
@@ -152,42 +158,39 @@ Diagnosing "the server was not started" and "why is it taking so long":
 
 ## Trust and approval
 
-1. Open a session in a project that has a `.mcp.json`.
-2. If the file declares mountable servers that are not yet approved, the session gets a notice
-   listing the servers **pending approval**.
-3. Run, inside the session:
+1. Open a session in a project that has a `.mcp.json`. A plug icon appears in the composer tool row,
+   with a state label that follows the status（"Detecting" / "N pending" / "MCP ready"）. With no `.mcp.json` the button is not rendered at all.
+2. Click it to open the popup, read each server's state and reason, and press **[Start]**:
 
-| Command | Behavior |
+| Action | Behavior |
 | --- | --- |
-| `/mcp-project` | Lists project path, state, mounted, unapproved, skipped (with reasons), and normalized renames |
-| `/mcp-project trust` | Approves the whole file (recording the current fingerprint) and mounts into the current session immediately |
-| `/mcp-project trust <name>…` | Approves only the named servers; other approved entries are preserved |
-| `/mcp-project untrust` | Revokes approval for the project and unmounts its servers from the current session |
+| [Start] | Approves **that server's current configuration** and mounts it into the current session immediately |
+| [Retry] | Mounts a failed server again (without rewriting the approval when the config is unchanged) |
+| [Revoke] | Deletes that server's approval record and unmounts it from the current session |
 
-Approving needs no session restart. Any change to `.mcp.json` (including added entries) invalidates
-the fingerprint and forces re-approval — that is exactly the protection when a `git pull` brings in
-a new server.
+Approving needs no session restart. Changing a server's configuration invalidates **its** hash and
+forces re-approval — that is exactly the protection when a `git pull` brings in a new server, and
+servers you did not touch keep their approval.
 
 **Approval is persistent, not per-session.** The record lives in
 `${DSH_HOME:-~/.dsh}/project-mcp-trust.json`, so once a project is approved every later session mounts
 directly without asking. Only two situations require approving again:
 
 - the project's **first** use;
-- the contents of `.mcp.json` changed (for example a `git pull` brought in a new server).
+- a server's configuration changed (for example a `git pull` rewrote it).
 
 Diagnostics (why each server was skipped, which name was normalized, "this file has no usable
-server") live in `/mcp-project` output rather than session notices. Session notices appear only when
-**you need to act**: the file cannot be used (unparsable, or over 1 MiB), or entries are pending
-approval.
+server") live in the popup. **The plugin never writes anything into the system prompt** — anything
+that needs your attention shows up on the button.
 
-`/mcp-project` ends its output with the **exact next command to copy**, so you never have to remember
-subcommand spellings.
+On profiles without a Web UI (headless / SDK) there is no console and therefore **no way to approve**;
+only Host logs remain there.
 
 ## Data boundaries
 
 | Data | Location | Contents |
 | --- | --- | --- |
-| Trust record | `${DSH_HOME:-~/.dsh}/project-mcp-trust.json` (mode `0600`) | Version, project root paths, approval timestamps, `.mcp.json` content fingerprints (`sha256:<hex>`), and the approved server names |
+| Trust record | `${DSH_HOME:-~/.dsh}/project-mcp-trust.json` (mode `0600`) | Version, project root paths, and per-server approval timestamps plus configuration hashes (`sha256:<hex>`) |
 
 - The trust file contains **no** `.mcp.json` contents and **no** expanded environment values.
 - `.mcp.json` is read-only: this plugin never writes or manages it.
@@ -215,9 +218,10 @@ subcommand spellings.
 | Global rows are out of scope | MCP rows in profile patches still connect at DSH startup; this plugin detects them (the name list feeds the collision check only) but **does not warn**, and cannot prevent them. Editing the profile patch is the only remedy and lies outside this plugin's scope, so it does not interrupt startup over something you cannot act on |
 | Exact module-name match | Global-row detection requires the row's module name to be **exactly** `@deepseek-ai/dsh-mcp-client`; subpath or relative forms are missed |
 | `.mcp.json` capped at 1 MiB | Anything larger is **refused unread** (never loaded into memory), with an "oversized" diagnostic. Reading happens on the synchronous session-creation path, and no cap would let an oversized file in an unfamiliar repo stall it; a real `.mcp.json` is far under 100 KiB |
-| Profiles without a `commands` service | This plugin injects `commands` / `loader` / `systemPrompt`; on a profile lacking one (e.g. `sdk-minimal`) it stays inactive, so `/mcp-project` does not appear either |
-| Mounting happens only at session creation or on this session's own approval | After another session approves, this session's plan already reads "approved" but the servers are not mounted into it automatically; `/mcp-project` lists them under "approved but not mounted in this session", and running `/mcp-project trust` mounts them |
+| Profiles without a Web UI | This plugin injects only `loader`, so it still activates on headless / SDK profiles; but with no `webServer` there is no console and therefore **no way to approve** — only Host logs remain |
+| Mounting happens only at session creation or on this session's own approval | After another session approves, this session's plan already reads "approved" but the servers are not mounted into it automatically; the console lists them as `not mounted here` and counts them in the button label, and pressing [Start] mounts them |
 | `serve` does not manage the server's lifetime | A started server outlives DSH: the plugin never kills, monitors, or restarts it. That is what lets several instances share one server; the cost is that a mistyped `serve` leaves a resident process you must end yourself |
+| On Windows, "outlives DSH" also depends on how the server is launched | When `serve.command` is PowerShell the plugin does not use `detached` (with it, PowerShell would not run a single line). Whether the server then outlives DSH depends on how that script creates it: a process created by `Start-Process -WindowStyle Hidden` has no console and survives, while one running in the script's foreground dies with the host console. Any other command keeps `detached` and survives independently |
 | `serve` does not check port ownership | If the port is taken by something else, one log line is written; nothing is preempted or retried, and the entry is handed to DSH as usual (it may connect to that other instance) |
 | `serve`'s wait is bounded | Default 120 s (configurable, hard-capped at 30 min). After a timeout the entry is still mounted, the tools stay unavailable for a while, and DSH retries on its own |
 
@@ -227,14 +231,14 @@ subcommand spellings.
 dsh plugin --profile web remove deepseek-harness-project-mcp
 ```
 
-Uninstalling reclaims the project-level MCP mounts and notice sections it created in live sessions,
-and never deletes DSH session data. `${DSH_HOME:-~/.dsh}/project-mcp-trust.json` is kept, so
+Uninstalling reclaims the project-level MCP mounts and every console registration it created in
+live sessions (routes, page injection, listeners), and never deletes DSH session data. `${DSH_HOME:-~/.dsh}/project-mcp-trust.json` is kept, so
 approvals survive a reinstall. To remove it too, delete that file yourself once no other project
 still needs the record.
 
 ## Documentation
 
-- [Behavior contract](docs/behavior.md): `.mcp.json` field semantics, transport matrix, name normalization, trust model, command output, failure modes
+- [Behavior contract](docs/behavior.md): `.mcp.json` field semantics, transport matrix, name normalization, trust model, console (button and popup), failure modes
 - [Design](docs/design.md): goals, architectural rationale, trade-offs
 - [Development](docs/development.md): source map, dependency policy, build and test
 - [Troubleshooting](docs/troubleshooting.md): diagnose by symptom

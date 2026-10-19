@@ -1,7 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { apply } from '../index.js'
-import { renderNotice } from '../notice.js'
 import type { HostContext } from '../types.js'
 
 interface MockCall { kind: string; idOrName: string }
@@ -77,12 +76,16 @@ function createMockContext(options?: { loader?: unknown; agents?: unknown }) {
   }
 }
 
-test('apply 注册命令与提示段，清理可逆', () => {
+test('apply 不再注册命令，也不注册任何提示段（命令面与 G4）', () => {
+  // 命令族与系统提示注入随控制台化一起删除。这里在**装配面**上钉住"不再注册"：
+  // 把 `registerCommands` 或 `injectNotice` 加回来，本用例立刻变红。
+  // 端到端的"未批准时提示词里什么都没有"由 `mount.test.mts` 的 G4 用例守护。
   const mock = createMockContext()
   apply(mock.ctx, {})
-  assert.ok(mock.live.has('command:mcp-project'))
+  assert.equal(mock.registeredCommands.size, 0, '插件不得再注册 /mcp-project 命令')
+  assert.deepEqual(mock.registeredSections, [], '插件不得再注册系统提示段')
   mock.runDisposers()
-  assert.equal(mock.live.size, 0)
+  assert.equal(mock.live.size, 0, '插件卸载后不留任何注册')
 })
 
 test('apply 注册 agent/created 监听，且随插件卸载注销', () => {
@@ -103,30 +106,6 @@ test('apply 注册 agent/created 监听，且随插件卸载注销', () => {
   assert.equal(mock.listenerCount('agent/disposed'), 0, '插件卸载后清理钩子未注销')
 })
 
-test('renderNotice 对未信任计划列出待批准服务器', () => {
-  const text = renderNotice(
-    { kind: 'untrusted', projectRoot: '/repo', fingerprint: 'sha256:x', pending: ['gh', 'mem'] },
-    '/repo',
-  )
-  assert.match(text, /\/repo/)
-  assert.match(text, /gh/)
-  assert.match(text, /mem/)
-})
-
-test('renderNotice 对挂载计划为空', () => {
-  const text = renderNotice(
-    { kind: 'mount', projectRoot: '/repo', fingerprint: 'sha256:x', configs: [], skipped: [] },
-    '/repo',
-  )
-  assert.equal(text, '')
-})
-
-test('renderNotice 对跳过计划为空', () => {
-  assert.equal(renderNotice({ kind: 'skip', reason: 'no cwd' }, '/repo'), '')
-})
-
-test('renderNotice 对无法解析的文件给出诊断', () => {
-  const text = renderNotice({ kind: 'invalid', reason: 'not valid JSON' }, '/repo')
-  assert.match(text, /\/repo/)
-  assert.notEqual(text, '')
-})
+// 提示注入（`renderNotice` / `injectNotice`）已随控制台化删除：未批准时系统提示词里
+// 不得出现任何项目级 MCP 内容（G4）。"什么都不注入"这条由 `mount.test.mts` 的 G4 用例
+// 在穿过 `apply` 的端到端面上守护，比单测一个纯文本函数更有意义。

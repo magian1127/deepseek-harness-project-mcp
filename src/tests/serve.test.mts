@@ -5,10 +5,14 @@ import {
   MAX_READY_TIMEOUT_MS,
   deriveHealthUrl,
   ensureServeReady,
+  isPowerShellCommand,
   planServeStart,
+  spawnDetached,
+  spawnOptionsFor,
   splitServe,
 } from '../serve.js'
 import type { ServeIo } from '../serve.js'
+import type { SpawnOptions } from 'node:child_process'
 import { POLL_INTERVAL_MS, PROBE_TIMEOUT_MS, checkHealth, isHttpUrl, waitReady } from '../health.js'
 import type { HealthIo } from '../health.js'
 import type { McpClientConfig, ServeMetadata } from '../types.js'
@@ -706,4 +710,141 @@ test('ensureServeReady：url 推导不出 health 且无 serve.health → 完全�
   assert.deepEqual(probed, [], '无从探测就不探测（也不猜地址）')
   assert.equal(spawned.length, 0)
   assert.deepEqual(warnings, [], '这不是配置错误：url 合法性由 translate 层负责')
+})
+
+// —— spawnDetached 的 spawn 选项（平台 × 命令）——
+//
+// 这一组是**缺陷回归**：曾经无条件写 `detached: true`，而 Node 在 Windows 上把它实现成
+// `DETACHED_PROCESS`（子进程没有控制台），PowerShell 在那种情形下**立刻以退出码 0 结束、
+// 一行都不执行**（实测：`pwsh -Command "exit 7"` 在 detached 下退出码是 0，在非 detached 下
+// 是 7；`Set-Content` 写的标记文件根本没出现；powershell 5.1 同样）。后果是
+// `serve.command: pwsh` 静默空转，插件白等满 `readyTimeoutMs`（默认 120 秒），而会话创建
+// 正卡在这段等待上。
+//
+// 但 Windows 上**不能**一刀切改成 `detached: false`：那样普通控制台程序会挂在宿主控制台上，
+// 控制台拆除时被 `CTRL_CLOSE_EVENT` 带走（实测：同一个 dotnet 服务在 `detached: false` 下随
+// 父进程消失、在 `detached: true` 下存活），违反设计 §4.3"DSH 关掉服务还在"。而 Node 又无法
+// 表达两全的 `CREATE_NO_WINDOW`（`windowsHideConsole` / `windowsHideGui` 实测被忽略）。
+// 所以按命令分流：PowerShell 走"能执行"，其余走"能存活"。详见 `spawnOptionsFor` 的实测矩阵
+// 与 `docs/design-http-serve.md` §4.3。
+
+/** 记录一次 spawn 调用，以及子进程上注册了什么（`error` 监听器与 `unref`）。 */
+function makeFakeSpawn() {
+  const calls: Array<{ command: string; args: string[]; options: SpawnOptions }> = []
+  const child = {
+    errorListeners: 0,
+    unrefCount: 0,
+    on(event: string) {
+      if (event === 'error') child.errorListeners += 1
+      return child
+    },
+    unref() {
+      child.unrefCount += 1
+      return child
+    },
+  }
+  const fake = (command: string, args: string[], options: SpawnOptions) => {
+    calls.push({ command, args, options })
+    return child
+  }
+  return { fake, calls, child }
+}
+
+test('isPowerShellCommand：命中 pwsh / powershell 的常见写法', () => {
+  for (const command of [
+    'pwsh', 'PWSH', 'pwsh.exe', 'PWSH.EXE',
+    'powershell', 'powershell.exe', 'PowerShell.EXE',
+    'C:\\Program Files\\PowerShell\\7\\pwsh.exe',
+    'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+    '/usr/bin/pwsh', '/usr/local/bin/pwsh',
+    '  pwsh  ',
+  ]) {
+    assert.equal(isPowerShellCommand(command), true, `应命中：${command}`)
+  }
+})
+
+test('isPowerShellCommand：不误伤其他命令与带后缀的变体（判据保守，未实测的一律不猜）', () => {
+  for (const command of [
+    '', '   ', 'dotnet', 'dotnet.exe', 'node', 'python', 'cmd', 'cmd.exe', 'sh',
+    'pwsh-preview', 'pwsh7', 'mypwsh', 'powershell-runner',
+    'C:\\tools\\pwsh\\run.exe',
+  ]) {
+    assert.equal(isPowerShellCommand(command), false, `不应命中：${command || '(空)'}`)
+  }
+})
+
+test('spawnOptionsFor：Windows + PowerShell → detached 必须为 false（DETACHED_PROCESS 会让它一行都不执行）', () => {
+  assert.equal(spawnOptionsFor('win32', 'pwsh').detached, false)
+  assert.equal(spawnOptionsFor('win32', 'C:\\Program Files\\PowerShell\\7\\pwsh.exe').detached, false)
+  assert.equal(spawnOptionsFor('win32', 'powershell.exe').detached, false)
+})
+
+test('spawnOptionsFor：Windows + 其他命令 → 保持 detached（否则服务随宿主控制台一起死）', () => {
+  assert.equal(spawnOptionsFor('win32', 'dotnet').detached, true)
+  assert.equal(spawnOptionsFor('win32', 'node').detached, true)
+  assert.equal(spawnOptionsFor('win32', 'C:\\svc\\server.exe').detached, true)
+})
+
+test('spawnOptionsFor：POSIX 上无论什么命令都 detached', () => {
+  for (const platform of ['linux', 'darwin']) {
+    for (const command of ['pwsh', 'powershell', 'dotnet', 'sh']) {
+      assert.equal(spawnOptionsFor(platform, command).detached, true, `${platform} + ${command}`)
+    }
+  }
+})
+
+test('spawnOptionsFor：stdio 与 windowsHide 与平台、命令都无关', () => {
+  for (const platform of ['win32', 'linux', 'darwin']) {
+    for (const command of ['pwsh', 'dotnet']) {
+      const options = spawnOptionsFor(platform, command)
+      assert.equal(options.stdio, 'ignore', `${platform} + ${command}: 必须不继承管道`)
+      assert.equal(options.windowsHide, true, `${platform} + ${command}: 必须不弹窗`)
+    }
+  }
+})
+
+test('spawnDetached：按平台与命令决定 detached', () => {
+  const winPwsh = makeFakeSpawn()
+  spawnDetached('pwsh', ['-NoProfile', '-File', 'start.ps1'], {}, { platform: 'win32', spawn: winPwsh.fake })
+  assert.equal(winPwsh.calls.length, 1)
+  assert.equal(winPwsh.calls[0]!.options.detached, false, 'win32 + pwsh 不得用 DETACHED_PROCESS')
+
+  const winDotnet = makeFakeSpawn()
+  spawnDetached('dotnet', ['srv.dll'], {}, { platform: 'win32', spawn: winDotnet.fake })
+  assert.equal(winDotnet.calls[0]!.options.detached, true, 'win32 + 普通命令必须 detached，否则服务随宿主控制台死')
+
+  const posix = makeFakeSpawn()
+  spawnDetached('pwsh', ['start.ps1'], {}, { platform: 'linux', spawn: posix.fake })
+  assert.equal(posix.calls[0]!.options.detached, true)
+})
+
+test('spawnDetached：默认走 process.platform（本机平台必须与 spawnOptionsFor 一致）', () => {
+  const { fake, calls } = makeFakeSpawn()
+  spawnDetached('dotnet', [], {}, { spawn: fake })
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0]!.options.detached, spawnOptionsFor(process.platform, 'dotnet').detached)
+})
+
+test('spawnDetached：env 是在宿主环境之上**追加**，不是替换', () => {
+  const hostKey = 'PROJECT_MCP_TEST_HOST_VAR'
+  const previous = process.env[hostKey]
+  process.env[hostKey] = 'from-host'
+  try {
+    const { fake, calls } = makeFakeSpawn()
+    spawnDetached('srv', [], { SERVE_ONLY: 'from-serve' }, { platform: 'win32', spawn: fake })
+    const env = calls[0]!.options.env as Record<string, string | undefined>
+    assert.equal(env[hostKey], 'from-host', '宿主环境必须被继承')
+    assert.equal(env.SERVE_ONLY, 'from-serve', 'serve.env 必须被叠加')
+    assert.equal(env.PATH ?? env.Path, process.env.PATH ?? process.env.Path, 'PATH 不得被抹掉')
+  } finally {
+    if (previous === undefined) delete process.env[hostKey]
+    else process.env[hostKey] = previous
+  }
+})
+
+test('spawnDetached：注册 error 监听器并 unref（缺监听器会让 ENOENT 带崩宿主）', () => {
+  const { fake, child } = makeFakeSpawn()
+  spawnDetached('不存在的命令', [], {}, { platform: 'win32', spawn: fake })
+  assert.equal(child.errorListeners, 1, '必须挂 error 监听器')
+  assert.equal(child.unrefCount, 1, '必须 unref，不持有句柄')
 })

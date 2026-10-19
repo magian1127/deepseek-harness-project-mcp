@@ -133,20 +133,80 @@ HTTP 模式下 DSH **不 spawn 子进程**（`packages/mcp/mcp-client/src/transp
 | **DSH 的 Job 对象不影响独立 spawn** | `createKillOnCloseJob`（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`）只用于 `spawnJobProcess`（`packages/subprocess/win32-process/src/process.ts:340,422`），出口是 `spawnInheritedJobProcess` / `spawnCurrentTokenJobProcess` —— **DSH 自己的沙箱子进程**，不是任意外部 spawn |
 | 当前 DSH 不在 Job 里 | 进程链 `node.exe ← cmd.exe ← powershell.exe ← pwsh.exe ← explorer.exe`（普通 explorer 启动链） |
 | 孤儿进程确实能长期存活 | 当前 MudMCP 服务 PID 44696 的父进程已退出，它仍运行 10+ 分钟 |
+| **Windows 上 `detached: true` 会让 PowerShell 静默空转** | 实测：`detached: true` + `pwsh -Command "exit 7"` 退出码是 **0**、零输出，`Set-Content` 的标记文件根本没出现；去掉 `detached` 后退出码是 **7**、脚本正常执行。`powershell.exe`(5.1) 同样。同一个服务改用 `dotnet <dll>` 在 `detached: true` 下**正常**（0.1 秒就绪）——只有 PowerShell 会哑掉。见下面的"Windows 例外" |
 
 #### 实现要求
 
 ```js
 const child = spawn(command, args, {
-  detached: true,          // 新进程组，不随父进程的信号
+  // 按平台与命令取值：Windows 上 detached 会变成 DETACHED_PROCESS（子进程没有控制台），
+  // PowerShell 在那种情形下一行都不执行；而其他命令又需要它来脱离宿主控制台。
+  // 见下面的「Windows 例外」。
+  detached: platform === 'win32' ? !isPowerShellCommand(command) : true,
   stdio: 'ignore',         // 不继承任何管道（否则父进程退出会触发 EPIPE / 阻塞）
   windowsHide: true,       // 不弹控制台窗口
   env: { ...process.env, ...serveEnv },
 })
+child.on('error', () => {}) // 必需：无监听器时 ENOENT 会带崩宿主（见 §7）
 child.unref()              // 不持有句柄，不阻塞事件循环
 ```
 
 **启动后立即 `unref()` 并丢弃 `child` 引用**：插件**不** kill 它、**不** await 它退出、**不**监听它的 exit 事件。生命周期完全归服务自己。
+
+#### Windows 例外：`detached` 与 PowerShell 互斥，只能按命令分流（已实测）
+
+Node 在 Windows 上把 `detached: true` 实现成 `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`
+（libuv 的 `uv_spawn`），其中 `DETACHED_PROCESS` 意味着子进程**没有控制台**。两个方向的实测
+证据都存在，而且**互相冲突**：
+
+| 实验（同一台机器、同一个 Node，每次只改一个变量） | 结果 |
+| --- | --- |
+| `detached: true` + `pwsh -NoProfile -Command "exit 7"` | 退出码 **0**（不是 7），零输出 |
+| `detached: true` + `pwsh -Command "Set-Content <标记文件>"` | 标记文件**没有被创建**（脚本体一行都没跑） |
+| `detached: true` + `powershell.exe`（5.1）同一条命令 | 同样退出码 0 |
+| `detached: false` + `pwsh -NoProfile -Command "exit 7"` | 退出码 **7**（正常执行） |
+| `detached: true` + `dotnet <服务 dll>` | 正常，0.1 秒就绪，父进程退出后**仍存活** |
+| `detached: false` + `dotnet <服务 dll>` | 能起来（health 200），但父进程退出、控制台拆除后**跟着消失** |
+| `detached: false` + `pwsh -File <启动脚本>`（脚本内用 `Start-Process -WindowStyle Hidden`） | 脚本正常执行、服务数秒就绪，父进程退出后**仍存活**（孙进程没有控制台） |
+| `windowsHideConsole` / `windowsHideGui`（期望 `CREATE_NO_WINDOW` / `DETACHED_PROCESS`） | Node **不认**这两个选项：`windowsHideGui` 本该让 pwsh 哑掉，实测仍退出码 7 → 被忽略 |
+
+**方向一：`detached: true` 让 PowerShell 一行都不执行。** `serve.command` 写成 `pwsh` /
+`powershell`（Windows 上极常见——用它包一层启动脚本）时，插件 spawn 出一个立刻空转退出的
+进程，然后**白等满 `readyTimeoutMs`（默认 120 秒）**，而会话创建正卡在这段等待上；
+`stdio: 'ignore'` 又让失败完全无声。用户看到的是"新建会话卡了两分钟，服务还是没起来"，
+日志里只有一条"等待就绪超时"。表中 `dotnet` 那行也解释了为什么本节最初的实测没有暴露它：
+那次用的是 `dotnet` 直接拉起，而普通控制台程序在 `DETACHED_PROCESS` 下工作正常——**只有
+PowerShell 会哑掉**。
+
+**方向二：`detached: false` 让服务随宿主控制台一起死。** 不 detached 的子进程挂在宿主的控制台
+上；控制台被拆除（用户 Ctrl+C、关掉终端、父进程退出）时，挂在它上面的进程会收到
+`CTRL_CLOSE_EVENT` 并被带走——表中 `detached: false` + `dotnet` 那行就是这个现象。这与本节
+"必须跨 DSH 存活"的硬要求直接冲突。
+
+**两全的 `CREATE_NO_WINDOW` 拿不到。** 它恰好同时满足两边：进程没有控制台（免疫控制台事件），
+又不像 `DETACHED_PROCESS` 那样让 PowerShell 哑掉——PowerShell 自己的 `Start-Process
+-WindowStyle Hidden` 用的就是它，实测那种方式起的 pwsh 能正常执行。但 Node 只向 libuv 转发
+`windowsHide` 与 `windowsVerbatimArguments`，`windowsHideConsole` / `windowsHideGui` 都不是
+公开选项（表中最后一行实测被忽略）。于是 Node 能表达的只有两种：
+"`DETACHED_PROCESS` + 新进程组"或"继承宿主控制台"。
+
+**结论：按命令分流。** Windows 上只对 PowerShell 关掉 `detached`（先保证"能执行"），其余命令
+保持 `detached`（保住"能存活"）。这不会牺牲 PowerShell 那条路径的存活性：这类 `serve.command`
+在实践中只是个转手的启动脚本，真正的服务由脚本自己创建，而 `Start-Process -WindowStyle Hidden`
+创建出来的进程没有控制台，因此免疫（表中倒数第二行已实测）。
+
+| 平台 | `serve.command` | `detached` |
+| --- | --- | --- |
+| POSIX | 任意 | `true` |
+| Windows | PowerShell（`pwsh` / `powershell`） | `false` |
+| Windows | 其他 | `true` |
+
+判定刻意保守（按**基名**匹配 `pwsh` / `powershell`，大小写不敏感、容忍 `.exe` 后缀，因此绝对
+路径写法同样命中）：误判成"是"会让一个本该 detached 的命令失去控制台隔离，误判成"不是"会让
+PowerShell 静默空转；带后缀的变体（如 `pwsh-preview`）行为未实测，不猜。
+
+实现上这条决策落在 `src/serve.ts` 的 `isPowerShellCommand` 与 `spawnOptionsFor(platform, command)`
+（都是纯函数，各分支都有单测覆盖，且经过双向变异测试），`spawnDetached` 只是消费它。
 
 #### 参考实现：AIVC 的三层策略
 

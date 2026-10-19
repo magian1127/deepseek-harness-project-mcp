@@ -45,11 +45,18 @@
    `validateMountConfig` / `withSessionTag` / `ctx.plugin()` **之前**剥离（`splitServe`）。
    带着它进 `ctx.plugin()` 一旦触发校验失败，schemastery 的 union 错误会把**整个 config**
    （含展开后的 `serve.env` 凭据）写进 Cordis 自己的日志——红线 3 的隐蔽通道。
-12. `spawnDetached` 的五个要素缺一不可：`detached: true`、`stdio: 'ignore'`、
+12. `spawnDetached` 的五个要素缺一不可：`detached`（**按平台与命令**取值，见
+   `spawnOptionsFor`：POSIX 恒为 `true`；Windows 上对 PowerShell 为 `false`、其余为 `true`）、
+   `stdio: 'ignore'`、
    `windowsHide: true`、`child.on('error', …)`、`unref()`。**`'error'` 监听器不是防御性
    代码**：Node 对它没有默认处理器，无监听器时一个写错的 `serve.command`（ENOENT）会以
    未捕获异常**带崩宿主进程**（已实测）。启动后不 kill、不 await、不监听 exit——生命周期
-   归服务自己。
+   归服务自己。**Windows 上不得写 `detached: true`**：Node 在 Windows 把它实现成
+   `DETACHED_PROCESS`（子进程没有控制台），而 PowerShell 在那种情形下**立刻以退出码 0 结束、
+   一行都不执行**（已实测），于是 `serve.command: pwsh` 静默空转、插件白等满
+   `readyTimeoutMs`（默认 120 秒），而会话创建正卡在这段等待上。**Windows + 其他命令又必须 `detached: true`**：
+   不 detached 的子进程挂在宿主控制台上，控制台拆除时被 `CTRL_CLOSE_EVENT` 带走（已实测），
+   服务会随 DSH 一起消失；而 Node 无法表达两全的 `CREATE_NO_WINDOW`，因此只能按命令分流。
 13. 健康检查 URL 只允许 `http://` / `https://`；`fetch` 还支持 `file:` / `data:`，放行它们
    等于让不受信的 `.mcp.json` 指挥本插件读本机文件。
 
@@ -70,8 +77,9 @@
 | `src/global-rows.ts` | 从 Loader 树收集全局 `mcp-client` 行的 `serverName` |
 | `src/session.ts` | `planSessionMount`：会话 → 挂载决策（纯函数，零 I/O） |
 | `src/session-tag.ts` | `withSessionTag`：给 stdio config 追加 `--project-mcp-session <SessionId>` 会话标记（纯函数，返回新对象） |
-| `src/commands.ts` | `/mcp-project` 命令族（依赖经 `CommandDeps` 注入） |
-| `src/notice.ts` | `renderNotice`：会话提示文本（只在需用户行动时非空） |
+| `src/console-view.ts` | `composeConsoleView`：计划 + 挂载记账 + serve 进行中表 → 控制台视图（纯函数，需动作数口径在此钉死） |
+| `src/console-bridge.ts` | `installConsoleBridge`：`webServer` 前缀路由（status / start / revoke）+ boot 级 nonce 注入（**真实 HTTP I/O**） |
+| `client.js` | Client 半边（plain-JS bundle）：输入区按钮 + 内联锚定弹层（点外部/Esc 关闭）；会话 id 经注册项 `inject` 注入（不做任何会话数据折叠） |
 
 依赖方向单向无环：
 
@@ -80,10 +88,10 @@ index.ts ──> session.ts ──> discovery.ts, translate.ts, trust.ts, global
    │                              │
    │                              ├──> serve.ts ──> health.ts, values.ts, config-guard.ts
    │                              └──> values.ts, types.ts
-   ├──> commands.ts, notice.ts
+   ├──> console-view.ts, console-bridge.ts
    ├──> config-guard.ts ──> types.ts
    ├──> session-tag.ts ──> types.ts
-   ├──> serve.ts（ensureServeReady / spawnDetached / splitServe）
+   ├──> serve.ts（ensureServeReady / spawnDetached / spawnOptionsFor / splitServe）
    └──> profile-modules.ts
 ```
 
@@ -104,7 +112,7 @@ index.ts ──> session.ts ──> discovery.ts, translate.ts, trust.ts, global
 ```powershell
 npm install
 npm run typecheck                        # tsc -p tsconfig.json --noEmit
-npm test                                 # 264 个用例，16 个测试文件
+npm test                                 # 252 个用例，16 个测试文件
 npm pack --dry-run                       # 核对 tarball 内容（files 字段）
 (Get-Content AGENTS.md).Count            # 必须 ≤ 200
 ```
@@ -130,7 +138,10 @@ npm run build && node --test ".tsbuild/tests/session.test.mjs"
 - 非阻塞挂载下 fiber 在 agent dispose 时的清理时机；
 - 从 `agent.ctx` 遍历 Loader 树能否拿到完整条目集；
 - 首条消息是否真的赶不上工具注册；
-- `/mcp-project` 与提示段在真实 GUI 会话中的实际渲染。
+- 控制台按钮与弹层在真实 GUI 会话中的实际渲染（本环境无浏览器控制，只做安装级验证）。
 
-Host 半边没有热通道：新构建进入长跑进程需要使用者重启一次 DSH，代理不得自行重启。
+Host 半边换血：**官方插件页删除 → 安装**即可让新构建进入长跑进程（2026-10-18 以带标记的
+apply 日志实测），不需要重启；`set_plugin` 停用→启用只修结构、复用旧模块命名空间，**不**载入
+新构建。Client 半边由宿主自动热更新，但**首次供应**需要一次重启（宿主模块表按进程缓存
+"非 client 包"）。代理不得自行重启 DSH。
 详见 [`docs/development.md#8-验证分层与未验证项`](docs/development.md#8-验证分层与未验证项)。

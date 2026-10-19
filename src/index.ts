@@ -35,18 +35,19 @@ import { errorName, validateMountConfig } from './config-guard.js'
 import { McpFileTooLargeError, readProjectMcpFile, findProjectRoot } from './discovery.js'
 import { collectGlobalServerNames } from './global-rows.js'
 import { POLL_INTERVAL_MS, PROBE_TIMEOUT_MS } from './health.js'
-import { renderNotice } from './notice.js'
 import { loadAtomicWrite, loadMcpClient } from './profile-modules.js'
 import { ensureServeReady, spawnDetached, splitServe } from './serve.js'
 import type { ServeIo } from './serve.js'
+import { composeConsoleView } from './console-view.js'
+import { installConsoleBridge } from './console-bridge.js'
+import type { ConsoleActionResult, ConsoleBridgeDeps, WebServerShape } from './console-bridge.js'
+import { randomBytes } from 'node:crypto'
 import { planSessionMount } from './session.js'
 import type { SessionMountInput, SessionMountPlan } from './session.js'
 import { withSessionTag } from './session-tag.js'
-import { approve, fingerprint, readTrustStore, writeTrustStore } from './trust.js'
+import { approve, configHashOf, readTrustStore, revoke, writeTrustStore } from './trust.js'
 import type { TrustStore } from './trust.js'
 import { normalizeServerName } from './translate.js'
-import { registerCommands } from './commands.js'
-import type { CommandDeps, ProjectInspection } from './commands.js'
 import type {
   AgentShape,
   Disposer,
@@ -68,7 +69,7 @@ export const name = 'project-mcp'
  * `commands` 缺失会让命令面无声消失、`loader` 缺失会让撞名守卫静默退化为空集，
  * 这两种退化都必须留下可查的日志（规格 §8.2 / §12）。
  */
-export const inject = ['commands', 'loader', 'systemPrompt'] as const
+export const inject = ['loader'] as const
 
 /**
  * 本插件没有可配置字段：`.mcp.json` 即配置源（规格 §4.1）。
@@ -79,12 +80,6 @@ export const inject = ['commands', 'loader', 'systemPrompt'] as const
  * 在这里放 schemastery schema，config 会以普通值传入 `apply`。
  */
 export const Config = undefined
-
-/** 会话提示段的排序位：与内置 MCP 段同档（`SECTION_ORDERS.MCP_SERVERS = 3100`）。 */
-const MCP_SERVERS_ORDER = 3100
-
-/** 会话提示段名；同一 scope 内重名会抛错，因此固定不变。 */
-const NOTICE_SECTION = 'project-mcp'
 
 /**
  * `.mcp.json` 的尺寸上限：1 MiB。
@@ -198,8 +193,14 @@ async function writeStoreAtomic(store: TrustStore): Promise<void> {
 interface AgentRegistrations {
   /** 已挂载的项目级 MCP 服务器：`serverName` → `agent.ctx.plugin()` 返回的 fiber。 */
   servers: Map<string, PluginFiberShape>
-  /** 提示段的 section disposer；未注入过提示时为 `undefined`。 */
-  notice?: Disposer
+  /**
+   * 挂载失败记账：`serverName` → 错误类型名（只记类型名，红线 3）。
+   *
+   * 控制台弹层用它把"失败"与"还没连上"区分开；同名服务器重新挂载成功即清除。
+   * 不放进 fiber 本身：fiber 被拒绝后停在 FAILED 态且已从 `servers` 摘除（见挂载处），
+   * 摘除之后"为什么失败"就没有归属了，而弹层必须答得出来。
+   */
+  failed: Map<string, string>
 }
 
 /**
@@ -246,7 +247,7 @@ function registrationsOf(
   if (key === undefined) return undefined
   let record = agents.get(key)
   if (record === undefined) {
-    record = { servers: new Map() }
+    record = { servers: new Map(), failed: new Map() }
     agents.set(key, record)
   }
   return record
@@ -397,6 +398,7 @@ async function mountInto(
       // fiber 登记在插件侧：插件卸载时由 apply 的 effect 统一 dispose（见
       // AgentRegistrations）。agent 销毁时 agent.ctx 也会回收它，两条路径都成立。
       servers.set(bare.serverName, fiber)
+      record.failed.delete(bare.serverName)
       // 只观察启动结果，不阻塞：`then` 走 `fiber.await()`，不触发 dispose。
       //
       // 刻意**不**透传 `message(error)`：fiber 拒绝的一种来源是 Config 校验失败，而
@@ -416,29 +418,25 @@ async function mountInto(
         //
         // 按身份摘除：条目可能已被**后来者**替换（同名重挂，或本名被重新批准后挂上新的
         // fiber），那种情况下旧 fiber 的拒绝不得误删新条目。比较引用即可，不需要额外代际号。
-        if (servers.get(bare.serverName) === fiber) servers.delete(bare.serverName)
+        if (servers.get(bare.serverName) === fiber) {
+          servers.delete(bare.serverName)
+          // 失败账同样按身份记：迟到的旧 fiber 拒绝不得把**活着的新条目**标成 failed，
+          // 否则控制台会对一个正在工作的服务器说谎。
+          record.failed.set(bare.serverName, errorName(error))
+        }
       })
     } catch (error) {
       // 同步抛出同样可能是 Config 校验（`ctx.plugin()` 内部 resolveConfig 是同步的），
       // 因此这里的诊断口径与上面一致。
+      //
+      // 同步抛错也必须记进失败账：fiber 从未建立，拒绝路径的记账不会跑，
+      // 不记就会让控制台把这条永远显示成"启动中"（既不说挂了也不说失败）。
+      record.failed.set(bare.serverName, errorName(error))
       ctx.logger?.error?.(
         `project-mcp：挂载项目级 MCP 服务器「${bare.serverName}」失败（错误类型：${errorName(error)}）`,
       )
     }
   }
-}
-
-/** 卸载该 agent 已挂载的全部项目服务器（`/mcp-project untrust`）。 */
-function unmountFrom(
-  ctx: HostContext,
-  agents: Map<AgentKey, AgentRegistrations>,
-  agent: AgentShape,
-): void {
-  const key = agentKeyOf(agent)
-  if (key === undefined) return
-  const record = agents.get(key)
-  if (record === undefined) return
-  disposeServers(ctx, record.servers)
 }
 
 /**
@@ -477,16 +475,19 @@ function collectMountable(
     serverName: normalizeServerName(originalName),
   }))
 
-  const everyName = [...new Set(normalized.map(item => item.serverName))]
-  if (everyName.length === 0) return none
+  if (normalized.length === 0) return none
 
-  const everythingApproved: TrustStore = approve(
-    { version: 1, projects: {} },
-    projectRoot,
-    fingerprint(parsed.raw),
-    everyName,
-    '',
-  )
+  // v2：合成"全部批准"的探针存储按**服务器 × 配置哈希**逐条批准。
+  let everythingApproved: TrustStore = { version: 2, projects: {} }
+  for (const item of normalized) {
+    everythingApproved = approve(
+      everythingApproved,
+      projectRoot,
+      item.serverName,
+      configHashOf(parsed.servers[item.originalName]),
+      '',
+    )
+  }
   const probe = planSessionMount({ ...input, trust: everythingApproved })
   // 全部候选被过滤掉时探针是 `skip`（第 9 步），此时计划本身也是 `skip` 且自带
   // `skipped`，调用方回退到 `plan.skipped` 即可。
@@ -498,6 +499,31 @@ function collectMountable(
     item => item.originalName !== item.serverName && mountableSet.has(item.serverName),
   )
   return { mountable, renamed, skipped: probe.skipped }
+}
+
+/**
+ * 一次项目检视的结果：挂载计划 + 展示所需的完整名单。
+ *
+ * 为什么不直接只用 `SessionMountPlan`：部分批准时，未获批准的条目**既不在** `configs`
+ * （只含已批准项）**也不在** `skipped`（只含被跳过项），直接照搬会让这些服务器在控制台
+ * 里静默消失。`mountable` 补齐这份名单；而 `plan.pending`（v2）直接给出未批准项与它们的
+ * 配置哈希，控制台据此渲染"未授权"行。
+ *
+ * （原定义在 `commands.ts`；命令面删除后随检视函数一起留在装配层。）
+ */
+export interface ProjectInspection {
+  /** 项目根路径；无法定位（会话没有工作区）时为 `undefined`。 */
+  projectRoot?: string
+  /** 当前信任状态下的挂载计划。 */
+  plan: SessionMountPlan
+  /** 文件里全部**可挂载**服务器的规范化名（与信任状态无关，按挂载顺序）。 */
+  mountable: string[]
+  /** 规范化后与文件里的键不同的服务器（原名 → 规范名），用于展示重命名。 */
+  renamed: Array<{ originalName: string; serverName: string }>
+  /** 与信任状态无关的完整跳过诊断（`untrusted` 计划不携带 `skipped`，需探针补齐）。 */
+  skipped: Array<{ name: string; reason: string }>
+  /** 本会话**实际**挂载的项目服务器名（插件侧挂载记账，按挂载顺序）。 */
+  mounted: string[]
 }
 
 /** 检视该 agent 所在项目：当前计划 + 展示所需的完整名单 + 真实挂载记账。 */
@@ -549,107 +575,6 @@ function inspectAgent(
     // 会话 A 批准后，此前已创建、`agent/created` 早已触发过的会话 B 计划同样是
     // `mount`，但 B 一个服务器都没挂上——按计划渲染会把"计划要挂"报成"已挂载"。
     mounted: mountedServers(agents, agent),
-  }
-}
-
-/**
- * 撤下该会话的提示段（若已注入）。
- *
- * 必须先撤下再重注入：同一 scope 内重名 section 会抛错，而 `injectNotice` 原本对
- * 已注入的会话**直接 return**——这正是"批准后提示段不刷新"的另一半成因。
- *
- * 只清 `record.notice` 而**不**删登记项：`servers` 记账必须留着（见 `AgentRegistrations`）。
- * 重复调用幂等（`notice` 已清空时直接返回）。
- */
-function removeNotice(
-  ctx: HostContext,
-  agents: Map<AgentKey, AgentRegistrations>,
-  agent: AgentShape,
-): void {
-  const key = agentKeyOf(agent)
-  if (key === undefined) return
-  const record = agents.get(key)
-  if (record?.notice === undefined) return
-  const dispose = record.notice
-  record.notice = undefined
-  try {
-    dispose()
-  } catch (error) {
-    // 撤下失败降级为警告：提示段陈旧会误导模型，但不该反过来打断命令执行。
-    ctx.logger?.warn?.(`project-mcp：移除会话提示段失败：${message(error)}`)
-  }
-}
-
-/**
- * 把提示写进该会话的系统提示（规格 §12）。
- *
- * 只在需要用户行动时调用（`renderNotice` 对 `mount` / `skip` 返回空串）。段文本用
- * `interpolate: false`：默认的严格 `{{变量}}` 插值会在渲染期对未知引用**抛错**，
- * 而这里的文本含用户路径，任何 `{{` 都会让整个会话的提示渲染失败。
- *
- * 段注册在 `agent.ctx` 上（作用域正确：提示只属于该会话），但返回的 section
- * disposer **同时**留在插件侧登记项里：`agent.ctx` 上的注册有两个 owner，插件卸载
- * 不会回收它们（`practices.md` 第 8 / 19 行）。已经注入过提示的会话不重复注册——
- * 同一 scope 内重名 section 会抛错。
- *
- * 键不可用（`agent.id` 不是非空字符串）时**不注入**：登记项建立不了，disposer 就无处
- * 存放，插件卸载时无法回收这条 section（`agent.ctx` 只是它的第二个 owner）。宁可不注入。
- */
-function injectNotice(
-  ctx: HostContext,
-  agents: Map<AgentKey, AgentRegistrations>,
-  agent: AgentShape,
-  text: string,
-): void {
-  const agentCtx = agent.ctx
-  if (agentCtx === undefined || typeof agentCtx.effect !== 'function') return
-  const systemPrompt = agentCtx.get('systemPrompt') as SystemPromptService | undefined
-  if (systemPrompt === undefined || typeof systemPrompt.section !== 'function') return
-
-  const record = registrationsOf(agents, agent)
-  if (record === undefined) return
-  if (record.notice !== undefined) return
-
-  // 先把注册结果交给 agent.ctx（作用域归属），再把同一个 disposer 记进插件侧：
-  // `ctx.effect` 返回的是该 effect 的 disposer，与 section 的 disposer 等价可逆。
-  record.notice = agentCtx.effect(
-    () =>
-      systemPrompt.section({
-        name: NOTICE_SECTION,
-        order: MCP_SERVERS_ORDER,
-        interpolate: false,
-        text: () => text,
-      }),
-    NOTICE_SECTION,
-  )
-}
-
-/**
- * 把该会话的提示段对齐到**当前**计划（缺陷修复：批准/撤销后提示必须刷新）。
- *
- * 主流程是"首次会话 → 提示尚未批准 → `/mcp-project trust` → 挂载成功"，而
- * `injectNotice` 原本只在 `agent/created` 触发，于是挂载成功后提示段仍写着"本会话
- * 未启用任何项目级 MCP"——模型在整个会话剩余时间里被持续误导。
- *
- * 修法是"先撤下、再按新计划重注入或留空"：同一 scope 内重名 section 会抛错，不先
- * 拆除旧段就无法替换文本。判据刻意复用 `renderNotice` 而不是在命令层另写一套：
- * 提示文本与会话创建时**同源**，两条路径不可能分叉。
- *
- * 不抛异常：本函数由同步命令处理器调用，抛错会让 `/mcp-project trust` 在信任存储
- * 已写入之后报失败——批准其实生效了，报错会让用户以为没生效。
- */
-function refreshNotice(
-  ctx: HostContext,
-  agents: Map<AgentKey, AgentRegistrations>,
-  agent: AgentShape,
-): void {
-  try {
-    removeNotice(ctx, agents, agent)
-    const view = inspectAgent(ctx, agents, agent)
-    const text = renderNotice(view.plan, view.projectRoot ?? '')
-    if (text !== '') injectNotice(ctx, agents, agent, text)
-  } catch (error) {
-    ctx.logger?.warn?.(`project-mcp：刷新会话提示段失败：${message(error)}`)
   }
 }
 
@@ -719,19 +644,108 @@ export function apply(ctx: HostContext, config: unknown): void {
     spawnDetached,
   }
 
-  const deps: CommandDeps = {
-    readStore: () => readTrustStore(readFileUtf8),
-    writeStore: writeStoreAtomic,
-    inspect: agent => inspectAgent(ctx, agents, agent),
-    mountInto: (agent, configs) =>
-      mountInto(ctx, agents, McpClient, agent, configs, { inflight: serveInflight, io: serveIo }),
-    unmountFrom: agent => unmountFrom(ctx, agents, agent),
-    mountedServers: agent => mountedServers(agents, agent),
-    refreshNotice: agent => refreshNotice(ctx, agents, agent),
+  // —— 控制台桥接（design-mcp-console.md §4.3/§4.4）：输入区按钮与弹层的 Host 半边 ——
+  //
+  // nonce 随进程生命周期：经 tapIndex 注入 GUI 页面，路由校验它，于是只有真正拿到页面
+  // （即已通过宿主连接认证）的 Client 才能读状态、触发动作（详见 console-bridge.ts 模块头）。
+  const consoleNonce = randomBytes(16).toString('base64url')
+  const consoleDeps: ConsoleBridgeDeps = {
+    viewFor: sessionId => {
+      const agent = ctx.get('agents')?.get?.(sessionId) as AgentShape | undefined
+      if (agent === undefined || agent.session === undefined) return null
+      const record = agents.get(sessionId)
+      const view = inspectAgent(ctx, agents, agent)
+      return composeConsoleView({
+        plan: view.plan,
+        renamed: view.renamed,
+        mounted: new Set(view.mounted),
+        failed: record?.failed ?? new Map(),
+        sessionKnown: record !== undefined,
+        startingUrls: new Set(serveInflight.keys()),
+      })
+    },
+    start: async (sessionId, serverName): Promise<ConsoleActionResult> => {
+      const agent = ctx.get('agents')?.get?.(sessionId) as AgentShape | undefined
+      if (agent === undefined || agent.session === undefined) return { ok: false, reason: 'session-not-found' }
+      // 批准先行：用户在弹层里的点击就是授权来源；仓库内依旧没有可写入的批准通道。
+      const before = inspectAgent(ctx, agents, agent)
+      const root = before.projectRoot
+      const pending =
+        before.plan.kind === 'mount' || before.plan.kind === 'untrusted' ? before.plan.pending : []
+      const target = pending.find(item => item.serverName === serverName)
+      if (root !== undefined && target !== undefined) {
+        // 用户在弹层里的点击就是授权来源：只授权这一个服务器的当前配置（v2）。
+        //
+        // 必须 await：真实 profile 下 `writeStoreAtomic` 走 `await withFileLock(...)`，
+        // 不 await 就重算计划会读到旧存储，刚批准的项会被判成"不可挂载"。2026-10-19 真机
+        // 实测到这一竞态；测试 profile 没有 atomic-write、走同步兜底，所以单测抓不到。
+        await writeStoreAtomic(
+          approve(
+            readTrustStore(readFileUtf8),
+            root,
+            serverName,
+            target.configHash,
+            new Date().toISOString(),
+          ),
+        )
+      }
+      // 批准后**重算**计划再挂：`untrusted` 的计划不带 configs，必须重算一次。
+      const after = inspectAgent(ctx, agents, agent)
+      if (after.plan.kind !== 'mount') return { ok: false, reason: 'not-mountable' }
+      const configs = after.plan.configs.filter(config => config.serverName === serverName)
+      if (configs.length === 0) return { ok: false, reason: 'unknown-server' }
+      await mountInto(ctx, agents, McpClient, agent, configs, { inflight: serveInflight, io: serveIo })
+      return { ok: true }
+    },
+    revoke: async (sessionId, serverName): Promise<ConsoleActionResult> => {
+      const agent = ctx.get('agents')?.get?.(sessionId) as AgentShape | undefined
+      if (agent === undefined || agent.session === undefined) return { ok: false, reason: 'session-not-found' }
+      const view = inspectAgent(ctx, agents, agent)
+      const root = view.projectRoot
+      if (root === undefined) return { ok: false, reason: 'no-project' }
+      const store = readTrustStore(readFileUtf8)
+      if (store.projects[root] === undefined) return { ok: false, reason: 'not-approved' }
+      await writeStoreAtomic(revoke(store, root, serverName))
+      const record = agents.get(sessionId)
+      const fiber = record?.servers.get(serverName)
+      if (record !== undefined && fiber !== undefined) {
+        record.servers.delete(serverName)
+        record.failed.delete(serverName)
+        disposeServers(ctx, new Map([[serverName, fiber]]))
+      }
+      return { ok: true }
+    },
   }
 
-  // 所有注册走 ctx.effect，随 fiber 卸载可逆清理（宿主 ctx 与 agent ctx 皆是）。
-  ctx.effect(() => registerCommands(ctx, deps), 'project-mcp:commands')
+  let consoleInstalled = false
+  const tryInstallConsoleBridge = (): void => {
+    if (consoleInstalled) return
+    const webServer = ctx.get('webServer') as WebServerShape | undefined
+    if (
+      webServer === undefined ||
+      webServer === null ||
+      typeof webServer.register !== 'function' ||
+      typeof webServer.tapIndex !== 'function'
+    ) {
+      return
+    }
+    consoleInstalled = true
+    ctx.effect(
+      () => installConsoleBridge(webServer, consoleDeps, consoleNonce),
+      'project-mcp:console-bridge',
+    )
+  }
+  tryInstallConsoleBridge()
+  // webServer 可能晚于本插件出现（zcode_mask 同款情形）：秒级重试直到装上，装上即停。
+  ctx.effect(() => {
+    const timer = setInterval(() => {
+      if (!consoleInstalled) tryInstallConsoleBridge()
+    }, 1000)
+    // 必须 unref：假 ctx 的集成测试不会跑 effect 清理，未 unref 的定时器会把测试进程
+    // 吊到超时（2026-10-18 实测 npm test 挂住）。真实宿主里有别的句柄，不受影响。
+    timer.unref()
+    return () => clearInterval(timer)
+  }, 'project-mcp:console-bridge-retry')
 
   ctx.effect(
     () =>
@@ -756,8 +770,7 @@ export function apply(ctx: HostContext, config: unknown): void {
             })
           }
 
-          const notice = renderNotice(view.plan, view.projectRoot ?? '')
-          if (notice !== '') injectNotice(ctx, agents, agent, notice)
+          // G4：不注入任何系统提示；"需要行动"由控制台按钮承载。
           return undefined
         } catch (error) {
           ctx.logger?.error?.(`project-mcp：会话挂载失败：${message(error)}`)
@@ -784,7 +797,6 @@ export function apply(ctx: HostContext, config: unknown): void {
           if (record === undefined) return
           agents.delete(key)
           disposeServers(ctx, record.servers)
-          record.notice?.()
         } catch (error) {
           ctx.logger?.warn?.(`project-mcp：清理已销毁会话的登记项失败：${message(error)}`)
         }
@@ -799,11 +811,6 @@ export function apply(ctx: HostContext, config: unknown): void {
     () => () => {
       for (const record of agents.values()) {
         disposeServers(ctx, record.servers)
-        try {
-          record.notice?.()
-        } catch (error) {
-          ctx.logger?.warn?.(`project-mcp：移除会话提示段失败：${message(error)}`)
-        }
       }
       agents.clear()
     },

@@ -16,6 +16,8 @@
  * | `splitServe` | **纯函数**：把 `serve` 从 config 里剥离出来 |
  * | `deriveHealthUrl` | **纯函数**：`url` 的 origin + `/health/ready` |
  * | `ensureServeReady` | 编排：健康检查 → spawn → 等待就绪；**全部 I/O 经 `ServeIo` 注入** |
+ * | `isPowerShellCommand` | **纯函数**：`serve.command` 是不是 PowerShell（Windows 分支的判据） |
+ * | `spawnOptionsFor` | **纯函数**：平台 + 命令 → spawn 选项（Windows 上对 PowerShell **不**用 `detached`，理由与实测矩阵见该函数） |
  * | `spawnDetached` | **本模块唯一的真实 I/O**：真正 spawn 那个脱离 DSH 的进程 |
  *
  * `spawnDetached` 留在这里而不是塞进 `index.ts`：它不是**会话数据** I/O（AGENTS.md 的
@@ -30,6 +32,7 @@
  *   `error.name`；`spawnDetached` 刻意不把 `env` 传出去，也不监听子进程输出。
  */
 import { spawn } from 'node:child_process'
+import type { SpawnOptions } from 'node:child_process'
 
 import { errorName } from './config-guard.js'
 import { POLL_INTERVAL_MS, PROBE_TIMEOUT_MS, checkHealth, waitReady } from './health.js'
@@ -465,24 +468,136 @@ function describeFailure(result: { reason: string; status?: number }): string {
   }
 }
 
+/** `spawnDetached` 用到的子进程能力子集（测试注入不必复刻整个 `ChildProcess`）。 */
+export interface SpawnedChild {
+  /** 只关心 `'error'`：缺监听器会带崩宿主（见下）。 */
+  on(event: 'error', listener: (error: unknown) => void): unknown
+  /** 不持有句柄，不阻塞事件循环。 */
+  unref(): unknown
+}
+
+/** `spawnDetached` 的可注入依赖；两者都只为"能被单测覆盖"而存在。 */
+export interface SpawnDetachedDeps {
+  /** 平台名，默认 `process.platform`。注入它才能同时覆盖 Windows 与 POSIX 两个分支。 */
+  platform?: string
+  /** `spawn` 实现，默认取 `node:child_process`。注入它才能在测试里不留真进程。 */
+  spawn?: (command: string, args: string[], options: SpawnOptions) => SpawnedChild
+}
+
+/** `spawnDetached` 传给 `spawn` 的选项（由 `spawnOptionsFor` 按平台与命令产出）。 */
+export interface DetachedSpawnOptions {
+  /** 是否脱离父进程的进程组与控制台；**按平台与命令**取值，理由见 `spawnOptionsFor`。 */
+  detached: boolean
+  /** 固定 `'ignore'`：不继承任何管道（否则父进程退出会触发 EPIPE / 阻塞）。 */
+  stdio: 'ignore'
+  /** 固定 `true`：不弹控制台窗口。 */
+  windowsHide: boolean
+}
+
+/** Windows 上"没有控制台就一行都不执行"的解释器基名（小写、不含 `.exe`）。 */
+const POWERSHELL_BASENAMES = new Set(['pwsh', 'powershell'])
+
+/**
+ * `serve.command` 是不是 PowerShell（按**基名**判断，大小写不敏感，容忍 `.exe` 后缀）。
+ *
+ * 只认 `pwsh` / `powershell` 两个基名，判定刻意保守：误判成"是"会让一个本该 detached 的命令
+ * 失去控制台隔离，误判成"不是"会让 PowerShell 静默空转。因此只覆盖**确定**会哑掉的那两个
+ * 可执行文件名，其余（`cmd` / `dotnet` / `node` / `python` …）一律按普通控制台程序处理；
+ * 带后缀的变体（如 `pwsh-preview`）行为未实测，不猜。
+ *
+ * 取命令的最后一段路径判断，因此绝对路径写法（`C:\...\pwsh.exe`、`/usr/bin/pwsh`）同样命中。
+ */
+export function isPowerShellCommand(command: string): boolean {
+  const trimmed = command.trim()
+  if (trimmed === '') return false
+  const lastSegment = trimmed.split(/[\\/]/).pop() ?? trimmed
+  const basename = lastSegment.toLowerCase().replace(/\.exe$/, '')
+  return POWERSHELL_BASENAMES.has(basename)
+}
+
+/**
+ * 按**平台与命令**决定 spawn 选项（纯函数，各分支都能被单测覆盖）。
+ *
+ * ## 结论先行
+ *
+ * | 平台 | `serve.command` | `detached` | 理由 |
+ * | --- | --- | --- | --- |
+ * | POSIX | 任意 | `true` | 那里 `detached` 承担真实职责（新进程组、不随父进程信号一起死） |
+ * | Windows | PowerShell（`pwsh` / `powershell`） | **`false`** | `detached` 会让它一行都不执行（见下） |
+ * | Windows | 其他 | `true` | 保住"服务不随宿主控制台一起死"（见下） |
+ *
+ * ## 实测矩阵（同一台机器、同一个 Node，每次只改一个变量）
+ *
+ * | 实验 | 结果 |
+ * | --- | --- |
+ * | `detached: true` + `pwsh -NoProfile -Command "exit 7"` | 退出码 **0**（不是 7）、零输出 |
+ * | `detached: true` + `pwsh -Command "Set-Content <标记文件>"` | 标记文件**根本没被创建** |
+ * | `detached: true` + `powershell.exe`(5.1) 同一条命令 | 同样退出码 0 |
+ * | `detached: false` + `pwsh -NoProfile -Command "exit 7"` | 退出码 **7**（正常执行） |
+ * | `detached: true` + `dotnet <服务 dll>` | 正常，0.1 秒就绪，父进程退出后**仍存活** |
+ * | `detached: false` + `dotnet <服务 dll>` | 能起来（health 200），但父进程退出、控制台拆除后**跟着消失** |
+ * | `detached: false` + `pwsh -File <启动脚本>`（脚本内用 `Start-Process -WindowStyle Hidden`） | 脚本正常执行、服务数秒就绪，父进程退出后**仍存活**（孙进程没有控制台） |
+ * | `windowsHideConsole` / `windowsHideGui`（期望 `CREATE_NO_WINDOW` / `DETACHED_PROCESS`） | Node **不认**：`windowsHideGui` 本该让 pwsh 哑掉，实测仍退出码 7 → 两个选项都被忽略 |
+ *
+ * ## 为什么 Windows + PowerShell 必须 `detached: false`
+ *
+ * Node 在 Windows 上把 `detached: true` 实现成 `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`
+ * （libuv 的 `uv_spawn`），其中 `DETACHED_PROCESS` 意味着子进程**没有控制台**。PowerShell 在
+ * 没有控制台时**立刻以退出码 0 结束、一行都不执行**（矩阵前四行）。于是 `serve.command` 写成
+ * `pwsh`（Windows 上极常见：用它包一层启动脚本）时，插件 spawn 出一个立刻空转退出的进程，
+ * 然后白等满 `readyTimeoutMs`（默认 120 秒）——而这段等待就在会话创建路径上，`stdio: 'ignore'`
+ * 又让失败完全无声。用户看到的是"新建会话卡了两分钟，服务还是没起来"，日志里只有一条
+ * "等待就绪超时"。
+ *
+ * 矩阵第 5 行也解释了为什么这个缺陷最初没被发现：`design-http-serve.md` §4.3 的首次实测用的是
+ * `dotnet` 直接拉起，而普通控制台程序在 `DETACHED_PROCESS` 下工作正常——**只有 PowerShell 会哑掉**。
+ *
+ * ## 为什么 Windows + 其他命令仍要 `detached: true`
+ *
+ * `detached: false` 时子进程**挂在宿主的控制台上**：宿主控制台被拆除（用户 Ctrl+C 或关掉终端）
+ * 时，挂在其上的进程会收到 `CTRL_CLOSE_EVENT` 并被带走——矩阵第 6 行就是这个现象（服务在父
+ * 进程退出后消失）。而 `DETACHED_PROCESS` 下子进程没有控制台，因此免疫（第 5 行：同一个服务
+ * 存活）。设计 §4.3 的硬要求是"DSH 关掉后服务还在"，所以对普通控制台程序必须保住 `detached`。
+ *
+ * ## 为什么不能"两全"（`CREATE_NO_WINDOW`）
+ *
+ * `CREATE_NO_WINDOW` 恰好同时满足两边：进程没有控制台（免疫控制台事件），但又不像
+ * `DETACHED_PROCESS` 那样让 PowerShell 哑掉——PowerShell 自己的 `Start-Process -WindowStyle
+ * Hidden` 就是用它，实测那种方式起的 pwsh 能正常执行。可惜 **Node 不暴露它**：
+ * `windowsHideConsole` / `windowsHideGui` 都不是公开选项（矩阵最后一行实测被忽略），
+ * 能表达的只有"`DETACHED_PROCESS` + 新进程组"或"继承宿主控制台"两种。
+ *
+ * 因此按命令分流是 Node 现有能力下的最优解：PowerShell 走"能执行"（放弃控制台隔离，但实践中
+ * 这类 `serve.command` 通常只是个转手的启动脚本，真正的服务由脚本自己以无控制台方式创建，
+ * 于是仍然存活——矩阵第 7 行），其余走"能存活"。
+ */
+export function spawnOptionsFor(platform: string, command: string): DetachedSpawnOptions {
+  return {
+    detached: platform === 'win32' ? !isPowerShellCommand(command) : true,
+    stdio: 'ignore',
+    windowsHide: true,
+  }
+}
+
 /**
  * 启动一个**脱离 DSH 存活**的服务进程（本模块唯一的真实 I/O）。
  *
- * ## 参数逐字对应设计 §4.3（硬要求，用户明确指定）
+ * ## 选项来自 `spawnOptionsFor`，不再逐字硬编码设计 §4.3
  *
- * - `detached: true` —— 新进程组，不随父进程的信号一起死；
- * - `stdio: 'ignore'` —— 不继承任何管道（否则父进程退出会触发 EPIPE / 阻塞）；
- * - `windowsHide: true` —— 不弹控制台窗口；
- * - `env: { ...process.env, ...serveEnv }` —— 在宿主环境之上追加 `serve.env`。
+ * 设计 §4.3 的硬要求是"服务必须跨 DSH 进程存活"，而**不是**"必须用 `detached`"——后者只是
+ * 当时在 POSIX 语义下的实现手段。Windows 上对 PowerShell 而言它反而让目标彻底落空（进程一行
+ * 都不执行，服务根本没被拉起来），因此按**平台与命令**取值：见 `spawnOptionsFor`。
+ *
+ * `env: { ...process.env, ...serveEnv }` 保持不变——在宿主环境之上**追加** `serve.env`。
  *
  * ## 为什么必须挂 `'error'` 监听器（这不是可选的防御性代码）
  *
  * Node 对 `ChildProcess` 的 `'error'` 事件**没有默认处理器**：无监听器时事件被 emit 到
  * 一个没有 handler 的 `EventEmitter` 上，直接升级为**未捕获异常并带崩整个进程**。实测
- * （Node 22，`detached + stdio: 'ignore'`）：`spawn('不存在的命令')` 同步返回，约一个
- * tick 后抛出未捕获的 `ENOENT`，进程退出码 1。也就是说——**没有这一行，一个写错的
- * `serve.command` 就能把 DSH 打挂**。监听到之后 ENOENT 被吞掉，降级为"服务没起来"，
- * 而 `mcp-client` 那边会以"连不上"的形式如实报告。
+ * （Node 22，`stdio: 'ignore'`）：`spawn('不存在的命令')` 同步返回，约一个 tick 后抛出未捕获的
+ * `ENOENT`，进程退出码 1。也就是说——**没有这一行，一个写错的 `serve.command` 就能把 DSH
+ * 打挂**。监听到之后 ENOENT 被吞掉，降级为"服务没起来"，而 `mcp-client` 那边会以"连不上"
+ * 的形式如实报告。
  *
  * 不把失败记进日志：`'error'` 是异步事件，而本函数是同步的、没有 logger；调用方
  * （`runStart`）拿不到它。刻意**不**为此改成异步——那会让 `spawnDetached` 的调用点
@@ -496,7 +611,12 @@ function describeFailure(result: { reason: string; status?: number }): string {
  *
  * ## 已实测验证（写进注释，不要重新调研）
  *
- * - Node `detached + unref` 能让服务脱离直接父进程（父脚本退出后服务仍存活、健康检查正常）；
+ * - POSIX：`detached + unref` 能让服务脱离直接父进程（父脚本退出后服务仍存活、健康检查正常）；
+ * - Windows + 普通控制台程序：`detached + unref` 同样能让服务脱离直接父进程**与控制台**
+ *   （父进程退出后服务仍存活、健康检查正常）；
+ * - Windows + PowerShell：`detached: false` 时启动脚本能正常执行并把服务拉起来；服务能否在
+ *   宿主控制台拆除后存活，取决于**脚本自己怎么创建它**——`Start-Process -WindowStyle Hidden`
+ *   创建的进程没有控制台，因此存活（已实测）。逐项证据见 `spawnOptionsFor` 的实测矩阵；
  * - DSH 的 Job 对象（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`）只用于它自己的沙箱子进程
  *   （`packages/subprocess/win32-process/src/process.ts:340,422` 的 `spawnJobProcess`），
  *   **不影响独立 spawn**；
@@ -504,13 +624,21 @@ function describeFailure(result: { reason: string; status?: number }): string {
  *
  * **前提**：以上成立依赖"DSH 由 explorer 这类普通父进程启动、自身不在 Job 里"。若将来
  * DSH 被放进 Job（例如由某个 IDE 或计划任务启动），脱离可能失败，届时需要退化为
- * `CREATE_BREAKAWAY_FROM_JOB` 之类的方案，或接受"服务随 DSH 退出"。
+ * `CREATE_BREAKAWAY_FROM_JOB` 之类的方案，或接受"服务随 DSH 退出"。注意 `detached`
+ * 本来也不脱离 Job，所以这条前提与本次的平台分支无关。
  */
-export function spawnDetached(command: string, args: string[], env: Record<string, string>): void {
-  const child = spawn(command, args, {
-    detached: true, // 新进程组，不随父进程的信号
-    stdio: 'ignore', // 不继承任何管道（否则父进程退出会触发 EPIPE / 阻塞）
-    windowsHide: true, // 不弹控制台窗口
+export function spawnDetached(
+  command: string,
+  args: string[],
+  env: Record<string, string>,
+  deps: SpawnDetachedDeps = {},
+): void {
+  // node 的 `spawn` 是重载签名，与上面那个最小子集不直接互相赋值；这里只需要一次显式
+  // 收窄（参数更严、返回类型更宽），不改变任何运行期行为。
+  const spawnImpl =
+    deps.spawn ?? (spawn as unknown as NonNullable<SpawnDetachedDeps['spawn']>)
+  const child = spawnImpl(command, args, {
+    ...spawnOptionsFor(deps.platform ?? process.platform, command),
     env: { ...process.env, ...env },
   })
   // 必需，不是防御性代码：无监听器时 `'error'`（如 ENOENT）会带崩宿主进程。见函数注释。

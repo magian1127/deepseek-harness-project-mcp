@@ -3,6 +3,8 @@ import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, renameSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { EventEmitter } from 'node:events'
+import type { TrustStore } from '../trust.js'
 
 /**
  * `agent/created` 挂载路径的集成测试（规格 §5.1 / §13.4）。
@@ -122,7 +124,9 @@ export default class FakeMcpClient {
 `)
 
 const { apply, inject } = await import('../index.js')
-const { approve, fingerprint, trustStorePath } = await import('../trust.js')
+const { approve, configHashOf, trustStorePath } = await import('../trust.js')
+const { normalizeServerName } = await import('../translate.js')
+const { CONSOLE_ROUTE_PREFIX, NONCE_HEADER, NONCE_META_NAME } = await import('../console-bridge.js')
 
 interface Project {
   root: string
@@ -140,20 +144,20 @@ function makeProject(servers: Record<string, unknown>): Project {
 }
 
 /**
- * 写信任存储，批准该项目全部指定服务器。
+ * 写信任存储，批准该项目指定的服务器（v2：服务器 × 配置哈希）。
  *
- * 指纹针对 `.mcp.json` 的**确切文本**计算——`isApproved` 比对的是逐字内容，
- * 用任何重新序列化出来的等价文本都会让批准静默失效（"批准了却没挂上"的经典
- * 成因，也正是本文件要守护的对象）。
+ * 哈希必须从 `.mcp.json` 的**原文条目**算出——与计划算的是同一份输入。手搓哈希会让
+ * "批准了却没挂上"这类哈希失配缺陷在测试里看不见，而那正是本文件要守护的对象。
  */
 function approveAll(project: Project, servers: string[]): void {
-  const store = approve(
-    { version: 1, projects: {} },
-    project.root,
-    fingerprint(project.raw),
-    servers,
-    't',
-  )
+  const parsed = JSON.parse(project.raw) as { mcpServers: Record<string, unknown> }
+  let store: TrustStore = { version: 2, projects: {} }
+  for (const serverName of servers) {
+    // 测试传的是规范名；条目按文件里的原始键存（两者在重命名用例里不同）。
+    const originalKey =
+      Object.keys(parsed.mcpServers).find(key => normalizeServerName(key) === serverName) ?? serverName
+    store = approve(store, project.root, serverName, configHashOf(parsed.mcpServers[originalKey]), 't')
+  }
   writeFileSync(trustStorePath(), JSON.stringify(store, null, 2))
 }
 
@@ -170,11 +174,19 @@ interface SectionRecord {
   disposed: number
 }
 
-function createHarness(options: { loader?: unknown; withCommands?: boolean } = {}) {
-  const withCommands = options.withCommands ?? true
+/** 桥接返回的视图形状（测试只关心这几列，刻意不复刻 `ConsoleView` 的全部字段）。 */
+interface ConsoleViewLike {
+  rows: Array<{ serverName: string; state: string; detail?: string }>
+  actionCount: number
+  fileNote?: string
+}
+
+function createHarness(
+  options: { loader?: unknown; withWebServer?: boolean; nonceHeader?: string } = {},
+) {
+  const withWebServer = options.withWebServer ?? true
   const listeners = new Map<string, Set<(payload: unknown) => void>>()
   const effects: Array<() => void> = []
-  const commands = new Map<string, { handler: (invocation: unknown) => unknown }>()
   const logs: Array<{ level: string; message: string }> = []
   /**
    * 传给 `ctx.plugin()` 的每一对 (模块, 配置)，按调用顺序。
@@ -188,18 +200,30 @@ function createHarness(options: { loader?: unknown; withCommands?: boolean } = {
   }> = []
   const fibers: FiberShape[] = []
   const sections: SectionRecord[] = []
+  /** 活 agent 注册表：桥接的 `viewFor` / `start` 经 `ctx.get('agents').get(id)` 取会话。 */
+  const agentsById = new Map<string, unknown>()
+  /** 假 webServer 捕获的路由与 index 变换（控制台桥接的安装面）。 */
+  const routes: Array<{ path: string; handler: (req: never, res: never) => void }> = []
+  let indexTransform: ((html: string) => string) | null = null
+
+  const webServerFake = {
+    register(route: { kind: string; path: string; handler: (req: never, res: never) => void }) {
+      routes.push(route)
+      return () => {
+        const at = routes.indexOf(route)
+        if (at >= 0) routes.splice(at, 1)
+      }
+    },
+    tapIndex(transform: (html: string) => string) {
+      indexTransform = transform
+      return () => { indexTransform = null }
+    },
+  }
 
   const host = {
     get(name: string) {
-      if (name === 'commands') {
-        if (!withCommands) return undefined
-        return {
-          register: (definition: { name: string; handler: (i: unknown) => unknown }) => {
-            commands.set(definition.name, definition)
-            return () => { commands.delete(definition.name) }
-          },
-        }
-      }
+      if (name === 'agents') return { get: (id: string) => agentsById.get(id) }
+      if (name === 'webServer') return withWebServer ? webServerFake : undefined
       if (name === 'loader') return options.loader
       return undefined
     },
@@ -267,11 +291,60 @@ function createHarness(options: { loader?: unknown; withCommands?: boolean } = {
         })
       },
     }
+    if (typeof agent.id === 'string') agentsById.set(agent.id, agent)
     return agent
   }
 
   return {
-    host, logs, pluginCalls, fibers, sections, commands, makeAgent,
+    host, logs, pluginCalls, fibers, sections, makeAgent,
+    /**
+     * 控制台桥接的调用面：命令面删除后，批准 / 撤销 / 查询的唯一入口。
+     *
+     * 刻意走**真实路由**（假 req/res 打到捕获的 handler），而不是直接调内部函数：
+     * nonce 校验、路由分派、视图序列化因此都在观测范围内——把路由名或头名改错，
+     * 这些用例立刻变红。
+     */
+    consoleApi: () => {
+      const html = indexTransform !== null ? indexTransform('<html><head></head></html>') : ''
+      const nonce =
+        new RegExp(`name="${NONCE_META_NAME}" content="([^"]+)"`).exec(html)?.[1] ?? ''
+      const call = (
+        method: 'GET' | 'POST',
+        path: string,
+        body?: Record<string, unknown>,
+        headers: Record<string, string> = { [NONCE_HEADER]: nonce },
+      ): Promise<{ status: number; body: { ok: boolean; view?: unknown; reason?: string } | null }> =>
+        new Promise((resolve, reject) => {
+          const route = routes.find(item => item.path === CONSOLE_ROUTE_PREFIX)
+          if (route === undefined) return reject(new Error('控制台路由未安装'))
+          const req = new EventEmitter() as EventEmitter & Record<string, unknown>
+          req.method = method
+          req.url = path
+          req.headers = headers
+          req.destroy = () => {}
+          let statusCode = 0
+          const res = {
+            writeHead: (status: number) => { statusCode = status; return res },
+            end: (text?: string) => {
+              resolve({ status: statusCode, body: text === undefined ? null : JSON.parse(text) })
+              return res
+            },
+          }
+          route.handler(req as never, res as never)
+          if (body !== undefined) req.emit('data', Buffer.from(JSON.stringify(body)))
+          req.emit('end')
+        })
+      return {
+        nonce,
+        status: (session: string) =>
+          call('GET', `${CONSOLE_ROUTE_PREFIX}/status?session=${encodeURIComponent(session)}`),
+        start: (session: string, server: string) =>
+          call('POST', `${CONSOLE_ROUTE_PREFIX}/start`, { session, server }),
+        revoke: (session: string, server: string) =>
+          call('POST', `${CONSOLE_ROUTE_PREFIX}/revoke`, { session, server }),
+        raw: call,
+      }
+    },
     /**
      * 当前**活着**的提示段（已 dispose 的不算）。
      *
@@ -309,13 +382,9 @@ test('未批准时 agent/created 不调用 plugin（规格 §13.4 安全断言�
   await harness.fire('agent/created', { agent: harness.makeAgent(project) })
 
   assert.equal(harness.pluginCalls.length, 0, '未批准的项目服务器不得被挂载')
-  // 提示必须注入：这是用户能看到"待批准"的唯一会话内渠道。
-  assert.equal(harness.sections.length, 1, '未批准时应注入待批准提示段')
-  assert.equal(harness.sections[0]!.name, 'project-mcp')
-  assert.equal(harness.sections[0]!.order, 3100)
-  assert.equal(harness.sections[0]!.interpolate, false)
-  const text = (harness.sections[0]!.text as () => string)()
-  assert.match(text, /alpha/)
+  // G4（design-mcp-console.md §3.4）：未批准时**不得**往系统提示词写任何内容；
+  // "需要行动"的信号改由输入区按钮与弹层承载。把注入加回来本用例立刻变红。
+  assert.equal(harness.sections.length, 0, 'G4：未批准也不得注入任何提示段')
 })
 
 test('已批准时挂载进 agent scope，配置带 failOnStartupError: false', async () => {
@@ -362,7 +431,7 @@ test('ctx.get(loader) 传的是 Loader 本体：全局撞名项被跳过', async
   )
 })
 
-test('重复 trust 只挂载一次（幂等），命令层每次都按计划调用', async () => {
+test('重复启动只挂载一次（幂等）：批准走控制台，挂载层自己保证幂等', async () => {
   const project = makeProject({ alpha: { command: 'node' } })
   const harness = createHarness()
   apply(harness.host as never, {})
@@ -371,19 +440,17 @@ test('重复 trust 只挂载一次（幂等），命令层每次都按计划调�
   await harness.fire('agent/created', { agent })
   assert.equal(harness.pluginCalls.length, 0)
 
-  const definition = harness.commands.get('mcp-project')!
-  const run = (rawInput: string) => Promise.resolve(definition.handler({ agent, rawInput }))
-
-  const first = (await run('trust')) as { kind: string; text: string }
-  assert.equal(first.kind, 'success', first.text)
+  const api = harness.consoleApi()
+  const first = await api.start(agent.id, 'alpha')
+  assert.equal(first.body?.ok, true, first.body?.reason)
   assert.equal(harness.pluginCalls.length, 1, '批准后应立即挂载')
 
-  const second = (await run('trust')) as { kind: string; text: string }
-  assert.equal(second.kind, 'success', second.text)
+  const second = await api.start(agent.id, 'alpha')
+  assert.equal(second.body?.ok, true, second.body?.reason)
   assert.equal(harness.pluginCalls.length, 1, '重复批准不得重复挂载同一 serverName')
 })
 
-test('插件卸载回收 agent 维度注册：挂载 fiber 与提示段都被拆除', async () => {
+test('插件卸载回收 agent 维度注册：挂载 fiber 被拆除', async () => {
   const mounted = makeProject({ alpha: { command: 'node' } })
   approveAll(mounted, ['alpha'])
   const pending = makeProject({ beta: { command: 'node' } })
@@ -395,14 +462,13 @@ test('插件卸载回收 agent 维度注册：挂载 fiber 与提示段都被拆
   await harness.fire('agent/created', { agent: harness.makeAgent(pending) })
 
   assert.equal(harness.pluginCalls.length, 1)
-  assert.equal(harness.sections.length, 1)
+  assert.equal(harness.sections.length, 0, 'G4：不再注入提示段')
   assert.equal(harness.fibers[0]!.disposed, 0)
 
   // 插件被禁用 / HMR 重载：agent.ctx 上的注册**不会**自动消失，必须由插件自己回收。
   harness.unload()
 
   assert.equal(harness.fibers[0]!.disposed, 1, '插件卸载后项目级 MCP 挂载仍存活')
-  assert.equal(harness.sections[0]!.disposed, 1, '插件卸载后提示段仍存活')
 })
 
 test('agent 销毁清理插件侧登记项，且与插件卸载可任意顺序重复拆除', async () => {
@@ -436,61 +502,45 @@ test('loader 缺失时留下可查诊断（撞名守卫退化必须可见）', a
   )
 })
 
-test('commands 服务缺失时留下可查诊断，而不是命令面无声消失', async () => {
-  const harness = createHarness({ withCommands: false })
+test('webServer 缺席时降级为无控制台：挂载路径照常工作，不抛', async () => {
+  // 无 Web GUI 的 profile（headless / SDK）拿不到 `webServer`。控制台是辅助面，
+  // 缺它不得影响既有能力：已批准的服务器照常挂进会话（红线 4 的降级方向）。
+  const project = makeProject({ alpha: { command: 'node' } })
+  approveAll(project, ['alpha'])
+  const harness = createHarness({ withWebServer: false })
   apply(harness.host as never, {})
 
-  assert.ok(
-    harness.logs.some(entry => entry.message.includes('commands')),
-    `缺少 commands 服务时应记日志，实际：${JSON.stringify(harness.logs)}`,
-  )
+  const agent = harness.makeAgent(project)
+  await harness.fire('agent/created', { agent })
+  assert.equal(harness.pluginCalls.length, 1, '没有 webServer 也必须照常挂载')
 })
 
 test('声明 inject：apply 同步依赖的宿主服务必须显式列出', async () => {
-  // `apply` 同步调用 `ctx.get('commands')` 与 `ctx.get('loader')`，`injectNotice` 还
-  // 要 `systemPrompt`。不声明的话，缺少这些服务的 profile 上插件会以半个装配状态
-  // 运行，而 `practices.md`「Stability」要求放进 `inject` 让插件保持未激活并等待。
-  assert.deepEqual(
-    [...inject].sort(),
-    ['commands', 'loader', 'systemPrompt'],
-    'inject 必须声明 apply 同步依赖的全部服务',
-  )
+  // 命令面与系统提示注入删除后，`apply` 同步只依赖 `loader`（全局撞名名单）。
+  // `webServer` 刻意**不在** inject 里：它可能晚于本插件出现，桥接用秒级重试安装，
+  // 声明成硬依赖反而会让无 Web GUI 的 profile 上整个插件不激活（见上一条用例）。
+  assert.deepEqual([...inject], ['loader'], 'inject 必须声明 apply 同步依赖的全部服务')
 })
 
-test('批准后提示段被撤下：模型不再看到"未启用任何项目级 MCP"', async () => {
-  // 这是插件的主流程：首次会话 → 提示未批准 → `/mcp-project trust` → 挂载成功。
-  // 若提示段不刷新，模型在整个会话剩余时间里被"本会话未启用任何项目级 MCP"
-  // 持续误导，而挂载其实已经成功。
+test('G4：批准全流程不注入任何提示段（模型上下文零污染）', async () => {
+  // 控制台化（design-mcp-console.md §3.4）后，"需要行动"的信号由输入区按钮与弹层承载；
+  // 系统提示词在**任何**阶段都不得出现项目级 MCP 内容。主流程仍是
+  // 首次会话 → 未批准 → 控制台点"启动" → 挂载成功，只是全程无提示段。
   const project = makeProject({ alpha: { command: 'node' } })
   const harness = createHarness()
   apply(harness.host as never, {})
   const agent = harness.makeAgent(project)
 
   await harness.fire('agent/created', { agent })
-  assert.equal(harness.liveSections().length, 1, '未批准时应注入待批准提示段')
-  const before = (harness.liveSections()[0]!.text as () => string)()
-  assert.match(before, /尚未批准/, `创建时提示应说明未批准：${before}`)
+  assert.equal(harness.sections.length, 0, '未批准时不得注入提示段')
 
-  const definition = harness.commands.get('mcp-project')!
-  const out = (await Promise.resolve(definition.handler({ agent, rawInput: 'trust' }))) as {
-    kind: string
-    text: string
-  }
-  assert.equal(out.kind, 'success', out.text)
+  const out = await harness.consoleApi().start(agent.id, 'alpha')
+  assert.equal(out.body?.ok, true, out.body?.reason)
   assert.equal(harness.pluginCalls.length, 1, '批准后应立即挂载')
-
-  // 批准后计划是 `mount`，`renderNotice` 对它返回空串 → 旧段必须被撤下。
-  const live = harness.liveSections()
-  assert.equal(
-    live.length,
-    0,
-    `批准后不得留下"未启用"提示段；仍活着：${live.map(s => (s.text as () => string)()).join(' | ')}`,
-  )
-  // 旧段的 disposer 必须真的被调用过（不是"没记录"而是"已拆除"）。
-  assert.equal(harness.sections[0]!.disposed, 1, '批准后旧提示段的 disposer 未被调用')
+  assert.equal(harness.sections.length, 0, '批准后同样不得注入提示段')
 })
 
-test('撤销后提示段被刷新到当前状态（不留下已批准时期的旧段）', async () => {
+test('G4：撤销后也不注入提示段（状态只走控制台）', async () => {
   const project = makeProject({ alpha: { command: 'node' } })
   approveAll(project, ['alpha'])
   const harness = createHarness()
@@ -500,27 +550,18 @@ test('撤销后提示段被刷新到当前状态（不留下已批准时期的�
   // 已批准：挂载、无提示段。
   await harness.fire('agent/created', { agent })
   assert.equal(harness.pluginCalls.length, 1)
-  assert.equal(harness.liveSections().length, 0, 'mount 计划不注入提示')
+  assert.equal(harness.sections.length, 0)
 
-  const definition = harness.commands.get('mcp-project')!
-  const out = (await Promise.resolve(definition.handler({ agent, rawInput: 'untrust' }))) as {
-    kind: string
-    text: string
-  }
-  assert.equal(out.kind, 'success', out.text)
-
-  // 撤销后计划回到 `untrusted`，提示段必须出现并说明待批准——会话创建时没有段，
-  // 因此这是"新注入"，与会话创建路径的文本同源。
-  const live = harness.liveSections()
-  assert.equal(live.length, 1, `撤销后应有待批准提示段，实际 ${live.length} 条`)
-  const text = (live[0]!.text as () => string)()
-  assert.match(text, /尚未批准/, `撤销后提示应说明未批准：${text}`)
-  assert.match(text, /alpha/)
+  const api = harness.consoleApi()
+  const out = await api.revoke(agent.id, 'alpha')
+  assert.equal(out.body?.ok, true, out.body?.reason)
+  assert.equal(harness.sections.length, 0, '撤销回到 untrusted 也不得注入提示段')
 })
 
-test('撤销后若文件已不可用，提示段被撤下而不是留着旧文本', async () => {
-  // `refreshNotice` 按 `renderNotice(撤销后的计划)` 求值：`.mcp.json` 被删除后计划是
-  // 静默 `skip`，渲染空串 → 撤下。这条守护"刷新 == 重算"而不是"刷新 == 重新注入"。
+test('G4：撤销后文件不可用时同样不注入提示段', async () => {
+  // 旧实现里这条守护"刷新 == 重算"（文件消失 → 静默 skip → 撤下旧段）。控制台化后
+  // 所有计划状态都不得注入提示段，因此守护退化为"全程零段"，但流程仍要走完：
+  // 撤销 → 文件消失 → 再撤销，任何一步都不得冒出提示段。
   const project = makeProject({ alpha: { command: 'node' } })
   approveAll(project, ['alpha'])
   const harness = createHarness()
@@ -530,31 +571,23 @@ test('撤销后若文件已不可用，提示段被撤下而不是留着旧文�
   await harness.fire('agent/created', { agent })
   assert.equal(harness.liveSections().length, 0)
 
-  const definition = harness.commands.get('mcp-project')!
-  const run = (rawInput: string) =>
-    Promise.resolve(definition.handler({ agent, rawInput })) as Promise<{ kind: string; text: string }>
+  const api = harness.consoleApi()
+  const out = await api.revoke(agent.id, 'alpha')
+  assert.equal(out.body?.ok, true, out.body?.reason)
+  assert.equal(harness.liveSections().length, 0)
 
-  const out = await run('untrust')
-  assert.equal(out.kind, 'success', out.text)
-  // 撤销后是 `untrusted`（文件还在）→ 注入一条。
-  assert.equal(harness.liveSections().length, 1)
-
-  // 文件消失后计划是静默 `skip`（`silent: true`）→ 渲染空串 → 旧段必须撤下。
   // 用 rename 而不是删除：工作区规则禁止永久删除文件（临时目录同样适用）。
+  // 已撤销后再撤销：没有批准记录可撤，桥接如实回 `not-approved`，同样不得冒出提示段。
   renameSync(join(project.root, '.mcp.json'), join(project.root, '.mcp.json.moved'))
-  const again = await run('untrust')
-  assert.equal(again.kind, 'success', again.text)
-  assert.equal(
-    harness.liveSections().length,
-    0,
-    '文件消失后计划是静默 skip，旧提示段必须被撤下',
-  )
+  const again = await api.revoke(agent.id, 'alpha')
+  assert.equal(again.body?.ok, false)
+  assert.equal(harness.liveSections().length, 0, '任何计划状态下都不得注入提示段')
 })
 
-test('/mcp-project 的"已挂载"取自真实记账：会话 B 不谎报计划要挂的服务器', async () => {
-  // 会话 A 批准 → 挂载。会话 B 在此**之前**已创建（`agent/created` 早已触发，
+test('控制台状态取自真实挂载记账：会话 B 不谎报计划要挂的服务器', async () => {
+  // 会话 A 批准 → A 挂载。会话 B 在此**之前**已创建（`agent/created` 早已触发，
   // 那时还没批准），因此 B 的计划同样是 `mount`（信任是全局的）但一个都没挂上。
-  // 命令的唯一职责是回答"现在什么是活的"，按计划渲染会把 B 的情况报成"已挂载"。
+  // 视图的唯一职责是回答"现在什么是活的"，按计划渲染会把 B 的情况报成"已挂载"。
   const project = makeProject({ alpha: { command: 'node' } })
   const harness = createHarness()
   apply(harness.host as never, {})
@@ -566,27 +599,22 @@ test('/mcp-project 的"已挂载"取自真实记账：会话 B 不谎报计划�
   await harness.fire('agent/created', { agent: agentB })
   assert.equal(harness.pluginCalls.length, 0, '未批准时两个会话都不挂载')
 
-  const definition = harness.commands.get('mcp-project')!
-  const run = (agent: unknown, rawInput: string) =>
-    Promise.resolve(definition.handler({ agent, rawInput })) as Promise<{ kind: string; text: string }>
-
-  // A 批准：A 立即挂载，B 不受影响（挂载是 agent scope 的）。
-  const trust = await run(agentA, 'trust')
-  assert.equal(trust.kind, 'success', trust.text)
+  const api = harness.consoleApi()
+  const trust = await api.start(agentA.id, 'alpha')
+  assert.equal(trust.body?.ok, true, trust.body?.reason)
   assert.equal(harness.pluginCalls.length, 1, '只有 A 挂了')
 
-  const listA = await run(agentA, '')
-  assert.match(listA.text, /已挂载（模型可见的工具名为/, `A 确实挂了：${listA.text}`)
-  assert.match(listA.text, /- alpha/)
+  const viewA = (await api.status(agentA.id)).body?.view as ConsoleViewLike
+  assert.equal(viewA.rows.find(row => row.serverName === 'alpha')?.state, 'mounted')
+  assert.equal(viewA.actionCount, 0, 'A 没有需要用户处理的事')
 
-  const listB = await run(agentB, '')
-  assert.doesNotMatch(
-    listB.text,
-    /已挂载（模型可见的工具名为/,
-    `B 一个服务器都没挂，不得报"已挂载"：${listB.text}`,
+  const viewB = (await api.status(agentB.id)).body?.view as ConsoleViewLike
+  assert.equal(
+    viewB.rows.find(row => row.serverName === 'alpha')?.state,
+    'not-mounted',
+    'B 一个服务器都没挂，不得报 mounted；它是"已授权但本会话未挂载"，要让用户点得动',
   )
-  assert.match(listB.text, /已批准但本会话未挂载/, `B 应看到"已批准但本会话未挂载"：${listB.text}`)
-  assert.match(listB.text, /alpha/)
+  assert.equal(viewB.actionCount, 1, '这种情况必须上徽标，否则用户永远看不到自己缺工具')
 })
 
 test('trust 回报的是实际挂载结果，不是请求挂载的 configs', async () => {
@@ -601,14 +629,18 @@ test('trust 回报的是实际挂载结果，不是请求挂载的 configs', asy
   // 让 agent scope 拒绝挂载：`ctx.plugin` 抛错 → 记账里没有该项。
   agent.ctx.plugin = () => { throw new Error('mcp-client 不可用') }
 
-  const definition = harness.commands.get('mcp-project')!
-  const out = (await Promise.resolve(definition.handler({ agent, rawInput: 'trust' }))) as {
-    kind: string
-    text: string
-  }
-  assert.equal(out.kind, 'success', out.text)
-  assert.doesNotMatch(out.text, /本会话已挂载：/, `挂载失败时不得回报"已挂载"：${out.text}`)
-  assert.match(out.text, /本会话没有可挂载的服务器/)
+  const api = harness.consoleApi()
+  const out = await api.start(agent.id, 'alpha')
+  // 批准本身成功了；失败的是挂载——两件事必须能分开回答，否则用户以为"没批准"。
+  assert.equal(out.body?.ok, true, out.body?.reason)
+  assert.equal(harness.pluginCalls.length, 0, 'agent scope 拒绝了注册')
+  const view = (await api.status(agent.id)).body?.view as ConsoleViewLike
+  assert.equal(
+    view.rows.find(row => row.serverName === 'alpha')?.state,
+    'failed',
+    '同步抛错也必须落成 failed，否则控制台会永远显示"启动中"',
+  )
+  assert.equal(view.actionCount, 1, '失败要上徽标，用户才知道该点重试')
 })
 
 // —— 回归守卫：挂载失败的日志不得回显 config ——
@@ -698,21 +730,13 @@ test('fiber 启动失败后该名不再出现在"已挂载"里，并留下"已�
     `启动失败应留下"已从挂载记账移除"的可查诊断：${JSON.stringify(harness.logs)}`,
   )
 
-  const definition = harness.commands.get('mcp-project')!
-  const out = (await Promise.resolve(definition.handler({ agent, rawInput: '' }))) as {
-    kind: string
-    text: string
-  }
-  assert.doesNotMatch(
-    out.text,
-    /已挂载（模型可见的工具名为/,
-    `启动失败的服务器不得被报成"已挂载"：${out.text}`,
+  const view = (await harness.consoleApi().status(agent.id)).body?.view as ConsoleViewLike
+  assert.equal(
+    view.rows.find(row => row.serverName === 'alpha')?.state,
+    'failed',
+    '启动失败的服务器不得被报成"已挂载"',
   )
-  assert.match(
-    out.text,
-    /已批准但本会话未挂载/,
-    `应如实列在"已批准但本会话未挂载"下：${out.text}`,
-  )
+  assert.equal(view.actionCount, 1, '失败的项要计入需动作数，用户才看得到要点重试')
 })
 
 test('迟到的 fiber 拒绝不得摘掉同名的新条目（按身份摘除）', async () => {
@@ -745,21 +769,21 @@ test('迟到的 fiber 拒绝不得摘掉同名的新条目（按身份摘除）'
   await harness.fire('agent/created', { agent })
   assert.equal(calls, 1, '首次挂载应走被扣住拒绝的第一条 fiber')
 
-  const definition = harness.commands.get('mcp-project')!
-  const run = (rawInput: string) =>
-    Promise.resolve(definition.handler({ agent, rawInput })) as Promise<{ kind: string; text: string }>
-
-  // untrust 清空记账（旧 fiber 被 dispose）→ trust 挂上同名的**新**条目。
-  assert.equal((await run('untrust')).kind, 'success')
-  assert.equal((await run('trust')).kind, 'success')
-  assert.equal(calls, 2, 'untrust 之后应能重新挂载同名服务器')
+  const api = harness.consoleApi()
+  // revoke 清空记账（旧 fiber 被 dispose）→ start 挂上同名的**新**条目。
+  assert.equal((await api.revoke(agent.id, 'alpha')).body?.ok, true)
+  assert.equal((await api.start(agent.id, 'alpha')).body?.ok, true)
+  assert.equal(calls, 2, 'revoke 之后应能重新挂载同名服务器')
 
   // 旧 fiber 的拒绝现在才到：它不属于记账里的当前条目。
   rejectFirst?.(new Error('stale failure'))
 
-  const out = await run('')
-  assert.match(out.text, /已挂载（模型可见的工具名为/, `新条目仍在，必须报"已挂载"：${out.text}`)
-  assert.match(out.text, /- alpha/, `新条目仍在，必须列出 alpha：${out.text}`)
+  const view = (await api.status(agent.id)).body?.view as ConsoleViewLike
+  assert.equal(
+    view.rows.find(row => row.serverName === 'alpha')?.state,
+    'mounted',
+    '新条目仍在，迟到的旧失败不得把它标成 failed（控制台会对活着的服务器说谎）',
+  )
 })
 
 test('过大的 .mcp.json 被拒读：报"过大"而不是"没有 .mcp.json"，且不进入挂载路径', async () => {
@@ -785,31 +809,18 @@ test('过大的 .mcp.json 被拒读：报"过大"而不是"没有 .mcp.json"，�
 
   assert.equal(harness.pluginCalls.length, 0, '超限文件不得进入挂载路径')
 
-  const definition = harness.commands.get('mcp-project')!
-  const out = (await Promise.resolve(definition.handler({ agent, rawInput: '' }))) as {
-    kind: string
-    text: string
-  }
-  assert.match(out.text, /过大/, `应报"过大"而不是别的失败：${out.text}`)
-  assert.doesNotMatch(
-    out.text,
-    /没有 \.mcp\.json/,
-    `文件明明在，不得谎报"没有 .mcp.json"：${out.text}`,
-  )
+  // 诊断归控制台：`invalid` 计划折成一条 fileNote，用户点按钮就能看到。
+  const view = (await harness.consoleApi().status(agent.id)).body?.view as ConsoleViewLike
+  const note = view.fileNote ?? ''
+  assert.match(note, /过大/, `应报"过大"而不是别的失败：${note}`)
+  assert.doesNotMatch(note, /没有 \.mcp\.json/, `文件明明在，不得谎报"没有 .mcp.json"：${note}`)
   // 诊断必须给出可行动的尺寸信息，且只含路径/尺寸，不含文件内容（红线 3）。
-  assert.match(out.text, new RegExp(String(1024 * 1024)), `应报出上限：${out.text}`)
-  assert.equal(
-    out.text.includes('padding'),
-    false,
-    `诊断不得回显文件内容：${out.text}`,
-  )
+  assert.match(note, new RegExp(String(1024 * 1024)), `应报出上限：${note}`)
+  assert.equal(note.includes('padding'), false, `诊断不得回显文件内容：${note}`)
+  assert.equal(view.actionCount, 1, '文件坏了也要上徽标，否则用户根本不知道要点开看')
 
-  // `invalid` 计划会注入会话提示：用户必须在会话里就能看到"文件太大"。
-  const live = harness.liveSections()
-  assert.equal(live.length, 1, `超限应注入会话提示，实际 ${live.length} 条`)
-  const text = (live[0]!.text as () => string)()
-  assert.match(text, /过大/, `会话提示应说明过大：${text}`)
-  assert.equal(text.includes('padding'), false, `会话提示不得回显文件内容：${text}`)
+  // G4：`invalid` 计划也**不**注入会话提示；"文件太大"的诊断只走控制台弹层。
+  assert.equal(harness.liveSections().length, 0, '超限也不得注入会话提示')
 })
 
 // —— 端到端守护：`env` / `headers` 的 `__proto__` 键必须穿过守卫到达 ctx.plugin() ——
@@ -921,7 +932,7 @@ test('同一 sessionId 的第二个 agent 对象不再重复挂载（缺陷 1 �
   assert.equal(harness.fibers.length, 1, '不得多建一个 fiber')
 })
 
-test('同一 sessionId 的第二个 agent 对象复用同一份记账：untrust 卸载的是它挂的 fiber', async () => {
+test('同一 sessionId 的第二个 agent 对象复用同一份记账：revoke 卸载的是它挂的 fiber', async () => {
   const project = makeProject({ alpha: { command: 'node' } })
   approveAll(project, ['alpha'])
   const harness = createHarness()
@@ -931,18 +942,15 @@ test('同一 sessionId 的第二个 agent 对象复用同一份记账：untrust 
   await harness.fire('agent/created', { agent: first })
   assert.equal(harness.fibers[0]!.disposed, 0)
 
-  // 用**第二个**对象发 untrust：登记项必须落在同一个键上。按对象引用记账时这里什么都
-  // 不会卸载，第一个对象挂的 fiber 会一直活到插件卸载——"撤销了但进程还在"。
-  const definition = harness.commands.get('mcp-project')!
-  const out = (await Promise.resolve(definition.handler({ agent: second, rawInput: 'untrust' }))) as {
-    kind: string
-    text: string
-  }
-  assert.equal(out.kind, 'success', out.text)
+  // 用**第二个**对象发起撤销：登记项必须落在同一个键（会话 id）上。按对象引用记账时这里
+  // 什么都不会卸载，第一个对象挂的 fiber 会一直活到插件卸载——"撤销了但进程还在"。
+  // `second` 也登记进了活会话表，桥接按 id 取到的正是它，因此这条同时守护"按 id 取 agent"。
+  const out = await harness.consoleApi().revoke(second.id, 'alpha')
+  assert.equal(out.body?.ok, true, out.body?.reason)
   assert.equal(
     harness.fibers[0]!.disposed,
     1,
-    '第二个 agent 对象发起的 untrust 必须能卸载第一个对象挂的 fiber',
+    '第二个 agent 对象发起的撤销必须能卸载第一个对象挂的 fiber',
   )
 })
 
@@ -966,25 +974,19 @@ test('同一 sessionId 的第二个 agent 对象销毁时清理插件侧登记�
   assert.equal(harness.fibers[0]!.disposed, 1, '重复拆除不得再次 dispose')
 })
 
-test('同一 sessionId 的第二个 agent 对象命中提示段幂等，不重复注入', async () => {
-  // 未批准 → 会话创建时注入待批准提示段。两个 agent 对象的 ctx 各自独立，因此"幂等"只能
-  // 靠插件侧记账判定：按对象引用记账时第二个对象看不到 `record.notice`，会再注册一条。
+test('同一 sessionId 的第二个 agent 对象也不注入提示段（G4 幂等）', async () => {
+  // 旧实现里这条守护"提示段幂等"（按对象引用记账会注入两条）。控制台化后两个 agent
+  // 对象都不得注入任何段；挂载幂等由上面的缺陷 1 守护单独钉住。
   const project = makeProject({ alpha: { command: 'node' } })
   const harness = createHarness()
   apply(harness.host as never, {})
 
   const { first, second } = duplicateAgents(harness, project, 'session-dup')
   await harness.fire('agent/created', { agent: first })
-  assert.equal(harness.liveSections().length, 1, '未批准时应注入待批准提示段')
+  assert.equal(harness.liveSections().length, 0)
 
   await harness.fire('agent/created', { agent: second })
-  assert.equal(
-    harness.liveSections().length,
-    1,
-    `同一会话不得留下两条提示段：${harness.liveSections()
-      .map(section => (section.text as () => string)())
-      .join(' | ')}`,
-  )
+  assert.equal(harness.liveSections().length, 0, '同一会话的任何 agent 对象都不得注入提示段')
 })
 
 test('不同 sessionId 各自挂载，不误拦', async () => {
@@ -1026,8 +1028,9 @@ test('agent.id 缺失或非字符串时不挂载，并留下可查诊断', async
   }
 })
 
-test('id 不可用时命令层的"已挂载"如实为空（不得谎报）', async () => {
-  // 跳过挂载必须对命令面可见：否则用户看到"已挂载"却没有任何工具。
+test('会话不可寻址时控制台如实回空，而不是编一个状态', async () => {
+  // 没有会话键（id 缺失）就没有可寻址的视图。桥接此时必须回 `null` / `session-not-found`，
+  // 否则按钮会拿着一个凭空想象出来的"已挂载"骗用户。
   const project = makeProject({ alpha: { command: 'node' } })
   approveAll(project, ['alpha'])
   const harness = createHarness()
@@ -1035,18 +1038,17 @@ test('id 不可用时命令层的"已挂载"如实为空（不得谎报）', asy
 
   const agent = harness.makeAgent(project, { id: undefined })
   await harness.fire('agent/created', { agent })
+  assert.equal(harness.pluginCalls.length, 0, 'id 不可用时不得挂载')
 
-  const definition = harness.commands.get('mcp-project')!
-  const out = (await Promise.resolve(definition.handler({ agent, rawInput: '' }))) as {
-    kind: string
-    text: string
-  }
-  assert.doesNotMatch(
-    out.text,
-    /已挂载（模型可见的工具名为/,
-    `id 不可用时什么都没挂，不得报"已挂载"：${out.text}`,
-  )
-  assert.match(out.text, /已批准但本会话未挂载/, `应如实列在"已批准但本会话未挂载"下：${out.text}`)
+  const api = harness.consoleApi()
+  const ghost = await api.status('session-never-created')
+  assert.equal(ghost.status, 200)
+  assert.equal(ghost.body?.view, null, '无从按会话检视时如实回 null')
+
+  const start = await api.start('session-never-created', 'alpha')
+  assert.equal(start.body?.ok, false)
+  assert.equal(start.body?.reason, 'session-not-found')
+  assert.equal(harness.pluginCalls.length, 0, '查不到的会话不得挂到别的会话上')
 })
 
 // —— 功能 3：自动注入的会话标记 ——

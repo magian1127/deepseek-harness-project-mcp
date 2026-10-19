@@ -1,55 +1,64 @@
 /**
- * 信任存储与指纹绑定（规格 §7）。
+ * 信任存储与配置哈希绑定（规格 §7；控制台化后为 **version 2**）。
  *
  * 纯函数 + 注入 I/O：`readTrustStore` / `writeTrustStore` 的读写函数由调用方注入，
  * 本模块不 import `node:fs`，因此可被彻底单测。真实的原子写与 `0600` 权限由
- * 调用方（任务 7 的 apply）实现。
+ * 调用方（apply）实现。
  *
- * 安全：
- * - 指纹绑定 `.mcp.json` 的**确切内容**（规范化 JSON 的 sha256）。规范化只剔除
- *   空白与键序这类纯格式差异，内容变更（含 `git pull` 拉进来的新增条目）必然
- *   改变指纹（规格 §7.2）——没有指纹，"批准一次"就会永久授权该路径下未来的任何
- *   内容。
- * - 失败关闭（规格 §7.4）：文件缺失、损坏、版本不认识、结构不符，一律视为全部
- *   未信任，且不抛异常——本模块运行在会话创建路径上，抛异常会中断会话。规范化
- *   对深层嵌套输入同样不抛：递归设深度上限，超限与非法 JSON 一样降级返回原文
- *   （见 `MAX_CANONICAL_DEPTH`）。
- * - 本模块不产生日志，也不把文件内容放进返回值以外的任何地方：`.mcp.json` 与
- *   信任文件都可能含凭据（规格 §10）。
+ * ## v2 与 v1 的区别：批准粒度从"整文件指纹"降到"单服务器配置哈希"
+ *
+ * - v1：`{ approvedAt, fingerprint(整文件), servers: string[] }`。改文件里**任何一个**
+ *   服务器都会让全部批准失效；批准动作（旧 `/mcp-project trust`）一次授权一批。
+ * - v2：`servers: { [serverName]: { approvedAt, configHash } }`，`configHash` 是**该服务器
+ *   条目**（`.mcp.json` 里的字面量）规范化后的 sha256。改 A 不再连累 B；控制台里点一次
+ *   "启动"只授权那一个服务器的当前配置。
+ * - 安全属性不变且更强：条目内容有任何变化（含 `git pull` 拉进的新条目、改命令、改参数、
+ *   改 env 字面量）哈希即变 → 回到未授权 → 需要用户再点一次。**没有**哈希，"启动一次"
+ *   就会永久授权该名字下未来的任何配置。
+ * - **不做 v1 → v2 迁移**（已决策）：v1 只存整文件指纹、不存内容，展开不出 per-server
+ *   哈希；升级后每个项目点一次"启动"。v1 文件按失败关闭读为空存储。
+ *
+ * ## 安全
+ *
+ * - 失败关闭（规格 §7.4）：文件缺失、损坏、版本不认识、结构不符，一律视为全部未信任，
+ *   且不抛异常——本模块运行在会话创建路径上，抛异常会中断会话。
+ * - 哈希输入只是 `.mcp.json` 的字面量，**不含**展开后的环境变量值（红线 3）；本模块
+ *   不产生日志，也不把文件内容放进返回值以外的任何地方。
  */
 import { createHash } from 'node:crypto'
 import { posix } from 'node:path'
 
-/** 单个项目的批准记录。 */
-export interface TrustEntry {
+/** 单个服务器的批准记录。 */
+export interface TrustServerRecord {
   approvedAt: string
-  fingerprint: string
-  servers: string[]
+  /** 该服务器条目（`.mcp.json` 字面量）规范化后的 `sha256:<hex>`。 */
+  configHash: string
+}
+
+/** 单个项目的批准记录：服务器名 → 批准记录。 */
+export interface TrustEntry {
+  servers: Record<string, TrustServerRecord>
 }
 
 /** 信任存储：`projects` 以项目根路径为键（规格 §7.1）。 */
 export type TrustStore = {
-  version: 1
+  version: 2
   projects: Record<string, TrustEntry>
 }
 
 /**
- * 空存储。信任文件的缺失/损坏/未知版本都归一到它。
+ * 空存储。信任文件的缺失/损坏/未知版本（含 v1）都归一到它。
  *
  * 每次新建而非共享常量：返回值会交给调用方与 `approve` / `revoke`，共享一个可变
  * 对象会让某一处的改动泄漏到另一处。
  */
 function emptyStore(): TrustStore {
-  return { version: 1, projects: {} }
+  return { version: 2, projects: {} }
 }
 
 /** 非 null 的普通对象（排除数组与原始值）。与 discovery.ts 同判定。 */
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
-function isStringArray(value: unknown): value is string[] {
-  return Array.isArray(value) && value.every(item => typeof item === 'string')
 }
 
 /**
@@ -63,9 +72,8 @@ function isStringArray(value: unknown): value is string[] {
  * 64 层远超真实 `.mcp.json` 的需要（现实中不超过 5 层），因此不会误伤合法文件。
  *
  * **不要把上限调到数千层**：`JSON.stringify`（`canonicalize` 的最后一步）自身也是
- * 递归实现，本机实测约 4000 层开始抛同样的 `RangeError`。3000 层的原始复现输入里，
- * 抛异常的是本文件的递归下降（`JSON.stringify` 尚能处理）；但若把上限抬高到那附近，
- * 就会把风险转移给 `JSON.stringify`。64 层同时让两者都远离各自的栈极限。
+ * 递归实现，本机实测约 4000 层开始抛同样的 `RangeError`。64 层同时让两者都远离
+ * 各自的栈极限。
  */
 const MAX_CANONICAL_DEPTH = 64
 
@@ -82,8 +90,6 @@ class TooDeepError extends Error {}
  * 处理这几种情形。`depth` 为当前值的嵌套层数（根为 0），超过上限即抛哨兵。
  *
  * 深度检查发生在**递归之前**，所以在栈耗尽前必然先命中哨兵；`RangeError` 不可达。
- * 检查不区分容器与原始值，因此阈值判定是"深度 ≤ 64 的值仍被规范化，深度 ≥ 65
- * 一律降级"——比精确到容器更保守，代价只是病态输入更早降级。
  */
 function canonicalValue(value: unknown, depth: number): unknown {
   if (depth > MAX_CANONICAL_DEPTH) throw new TooDeepError()
@@ -91,7 +97,7 @@ function canonicalValue(value: unknown, depth: number): unknown {
   if (isPlainObject(value)) {
     // 键来自不受信文件，用 fromEntries 落成普通自有属性：`__proto__` 这类键必须
     // 是数据属性，而不是改写结果对象的原型。若改回 `out[key] = value`，`__proto__`
-    // 条目会被静默丢弃、指纹对它重新失敏——`trust.test.mts` 有该退化的回归守卫。
+    // 条目会被静默丢弃、哈希对它重新失敏——`trust.test.mts` 有该退化的回归守卫。
     const pairs = Object.keys(value)
       .sort()
       .map((key): [string, unknown] => [key, canonicalValue(value[key], depth + 1)])
@@ -109,11 +115,8 @@ function canonicalValue(value: unknown, depth: number): unknown {
  * - 递归超深（`TooDeepError`）——深层嵌套的**合法** JSON 同样来自不受信文件，不能
  *   让它把 `RangeError` 抛进会话创建路径。
  *
- * 这里的 catch 刻意不限定异常类型：递归阶段唯一可达的是 `TooDeepError`（解析产物
- * 无环、无 BigInt），但任何意外异常在此降级都比中断会话更符合本模块契约。
- *
- * 降级到 `raw` 不削弱安全属性：原文指纹对内容依然敏感（不同文本必然不同哈希），
- * 最坏后果只是格式差异也要求重新批准——偏保守的方向，不会让内容变更逃过指纹。
+ * 降级到 `raw` 不削弱安全属性：原文哈希对内容依然敏感（不同文本必然不同哈希），
+ * 最坏后果只是格式差异也要求重新批准——偏保守的方向，不会让内容变更逃过哈希。
  */
 export function canonicalize(raw: string): string {
   let parsed: unknown
@@ -129,10 +132,21 @@ export function canonicalize(raw: string): string {
   }
 }
 
-/** 内容指纹：`sha256:<hex>`，基于规范化文本（规格 §7.2）。 */
+/** 内容指纹：`sha256:<hex>`，基于规范化文本。 */
 export function fingerprint(raw: string): string {
   const digest = createHash('sha256').update(canonicalize(raw), 'utf8').digest('hex')
   return `sha256:${digest}`
+}
+
+/**
+ * 单个服务器条目的配置哈希：把条目序列化成 JSON 文本再走 `fingerprint`。
+ *
+ * 输入是 `.mcp.json` 解析产物里的**字面量**对象：不含展开后的环境变量值（展开只
+ * 发生在 translate/serve 层，且结果永不落盘），因此哈希可以安全地写进信任文件。
+ * 键序与空白不影响哈希（规范化保证）；任何实质改动都会改变它。
+ */
+export function configHashOf(entry: unknown): string {
+  return fingerprint(JSON.stringify(entry))
 }
 
 /**
@@ -152,20 +166,35 @@ export function trustStorePath(): string {
   return posix.join(home, 'project-mcp-trust.json')
 }
 
+/** 校验单条服务器记录；结构不符返回 null。 */
+function validateRecord(value: unknown): TrustServerRecord | null {
+  if (!isPlainObject(value)) return null
+  const { approvedAt, configHash } = value
+  if (typeof approvedAt !== 'string' || approvedAt === '') return null
+  if (typeof configHash !== 'string' || !configHash.startsWith('sha256:')) return null
+  return { approvedAt, configHash }
+}
+
 /** 校验单个项目条目；结构不符返回 null，由调用方据此失败关闭。 */
 function validateEntry(value: unknown): TrustEntry | null {
   if (!isPlainObject(value)) return null
-  const { approvedAt, fingerprint: fp, servers } = value
-  if (typeof approvedAt !== 'string') return null
-  if (typeof fp !== 'string') return null
-  if (!isStringArray(servers)) return null
-  return { approvedAt, fingerprint: fp, servers }
+  if (!isPlainObject(value.servers)) return null
+  const servers: Record<string, TrustServerRecord> = {}
+  for (const [serverName, record] of Object.entries(value.servers)) {
+    if (serverName === '') return null
+    const validated = validateRecord(record)
+    if (validated === null) return null
+    servers[serverName] = validated
+  }
+  return { servers }
 }
 
 /**
  * 读取并校验信任存储；任何异常情形都返回空存储（失败关闭，规格 §7.4）。
  *
  * 逐字段重建而不直接返回解析结果：文件内容不受信，只保留已知字段。
+ * **version 1（及任何非 2）一律读为空存储**：v1 只存整文件指纹，展开不出
+ * per-server 哈希，不做迁移（已决策）。
  */
 export function readTrustStore(readFile: (p: string) => string): TrustStore {
   let raw: string
@@ -183,16 +212,19 @@ export function readTrustStore(readFile: (p: string) => string): TrustStore {
   }
 
   if (!isPlainObject(parsed)) return emptyStore()
-  if (parsed.version !== 1) return emptyStore()
+  if (parsed.version !== 2) return emptyStore()
   if (!isPlainObject(parsed.projects)) return emptyStore()
 
   const entries: [string, TrustEntry][] = []
   for (const [projectRoot, value] of Object.entries(parsed.projects)) {
+    // 空串项目根只可能来自损坏文件：`findProjectRoot` 永远返回真实路径，接受它等于
+    // 允许一条永远查不到的批准记录存在（失败关闭，规格 §7.4）。
+    if (projectRoot === '') return emptyStore()
     const entry = validateEntry(value)
     if (entry === null) return emptyStore()
     entries.push([projectRoot, entry])
   }
-  return { version: 1, projects: Object.fromEntries(entries) }
+  return { version: 2, projects: Object.fromEntries(entries) }
 }
 
 /**
@@ -209,47 +241,64 @@ export function writeTrustStore(
 }
 
 /**
- * 该项目的当前指纹下，指定服务器是否已被批准。
+ * 指定服务器的**当前配置**是否已被批准。
  *
- * 指纹不匹配或服务器不在批准列表内都返回 false：批准列表与当前文件列表的交集由
- * 调用方在挂载时计算（规格 §7.1）。
+ * 哈希不匹配（配置改过）或没有记录都返回 false。粒度是"服务器 × 配置"，因此
+ * 同名服务器换了配置等于没批准（git-pull 保护）。
  */
 export function isApproved(
   store: TrustStore,
   projectRoot: string,
-  fingerprint: string,
-  serverName: string
+  serverName: string,
+  configHash: string
 ): boolean {
   const entry: TrustEntry | undefined = store.projects[projectRoot]
   if (entry === undefined) return false
-  return entry.fingerprint === fingerprint && entry.servers.includes(serverName)
+  const record = entry.servers[serverName]
+  return record !== undefined && record.configHash === configHash
 }
 
 /**
- * 批准某项目在当前指纹下的服务器列表，返回**新存储**（不改动入参）。
+ * 批准一个服务器的当前配置，返回**新存储**（不改动入参）；其余服务器的记录原样保留。
  *
- * `servers` 记录批准时该指纹下实际存在且被批准的服务器名（规格 §7.1）。复制传入
- * 数组：调用方后续改动自己的数组不应静默改变存储。
+ * 这就是控制台里"启动"按钮的授权语义：用户动作 = 授权来源，且只授权这一个服务器的
+ * 当前配置。
  */
 export function approve(
   store: TrustStore,
   projectRoot: string,
-  fingerprint: string,
-  servers: string[],
+  serverName: string,
+  configHash: string,
   now: string
 ): TrustStore {
+  const current = store.projects[projectRoot]
   return {
-    version: 1,
+    version: 2,
     projects: {
       ...store.projects,
-      [projectRoot]: { approvedAt: now, fingerprint, servers: [...servers] },
+      [projectRoot]: {
+        servers: {
+          ...(current?.servers ?? {}),
+          [serverName]: { approvedAt: now, configHash },
+        },
+      },
     },
   }
 }
 
-/** 撤销某项目的批准，返回**新存储**（不改动入参）；未知项目为空操作。 */
-export function revoke(store: TrustStore, projectRoot: string): TrustStore {
+/**
+ * 撤销一个服务器的批准，返回**新存储**（不改动入参）。
+ *
+ * 该项目下最后一个记录被撤销后，项目条目整体删除：不留空壳，`readTrustStore` 的
+ * 逐条校验也不会在意，但空壳会让"这个项目批准过什么"永远答不出有意义的内容。
+ */
+export function revoke(store: TrustStore, projectRoot: string, serverName: string): TrustStore {
+  const current = store.projects[projectRoot]
+  if (current === undefined) return store
+  const servers = { ...current.servers }
+  delete servers[serverName]
   const projects = { ...store.projects }
-  delete projects[projectRoot]
-  return { version: 1, projects }
+  if (Object.keys(servers).length === 0) delete projects[projectRoot]
+  else projects[projectRoot] = { servers }
+  return { version: 2, projects }
 }

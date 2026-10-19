@@ -30,13 +30,14 @@
 | `values.ts` | `${VAR}` 展开与不受信 JSON 的形状守卫（`asStringArray` / `asStringRecord` / `expandRecord` / `expandList`） | 纯函数 |
 | `translate.ts` | 条目 → `McpClientConfig`、`serverName` 规范化、解析 `serve` 字段 | 纯函数 |
 | `health.ts` | `checkHealth` / `waitReady` / `isHttpUrl`：就绪探测与轮询（`fetch`、定时器、时钟全部注入） | 纯函数 + 注入 I/O |
-| `serve.ts` | `planServeStart`（`serve` → 启动计划）、`deriveHealthUrl`、`splitServe`（剥离 `serve`）、`ensureServeReady`（编排 + 并发去重）、`spawnDetached`（脱离进程启动） | 纯函数 + 注入 I/O；`spawnDetached` 是**真实进程 I/O** |
+| `serve.ts` | `planServeStart`（`serve` → 启动计划）、`deriveHealthUrl`、`splitServe`（剥离 `serve`）、`ensureServeReady`（编排 + 并发去重）、`isPowerShellCommand` / `spawnOptionsFor`（平台 + 命令 → spawn 选项）、`spawnDetached`（脱离进程启动） | 纯函数 + 注入 I/O；`spawnDetached` 是**真实进程 I/O**，但 `spawn` 与 `platform` 可注入（平台 × 命令各分支都有单测，并做过双向变异测试） |
 | `trust.ts` | 信任存储读写、规范化指纹、批准/撤销、存储路径 | 纯函数 + 注入 I/O |
 | `global-rows.ts` | 从 Loader 树收集全局 `mcp-client` 行的 `serverName` | 纯函数（只读遍历） |
 | `session.ts` | `planSessionMount`：会话 → 挂载决策（纯函数，零 I/O） | 纯函数 |
 | `session-tag.ts` | `withSessionTag`：给 stdio config 追加 `--project-mcp-session <SessionId>` 标记（返回新对象） | 纯函数 |
-| `commands.ts` | `/mcp-project` 命令族（列表 / trust / untrust） | 无（依赖经 `CommandDeps` 注入） |
-| `notice.ts` | `renderNotice`：会话提示文本 | 纯函数 |
+| `console-view.ts` | `composeConsoleView`：计划 + 挂载记账 + serve 进行中表 → 控制台视图 | 纯函数 |
+| `console-bridge.ts` | `installConsoleBridge`：`webServer` 前缀路由（status/start/revoke）+ nonce 注入 | 注入 I/O；真实 HTTP I/O |
+| `client.js` | Client 半边（plain-JS bundle）：输入区按钮 + 内联锚定弹层，只渲染 Host 算好的视图 | 浏览器侧；不做会话数据折叠 |
 
 **依赖方向**（单向，无环）：
 
@@ -45,12 +46,29 @@ index.ts ──> session.ts ──> discovery.ts, translate.ts, trust.ts, global
    │                              │
    │                              ├──> serve.ts ──> health.ts, values.ts, config-guard.ts
    │                              └──> values.ts, types.ts
-   ├──> commands.ts, notice.ts
+   ├──> console-view.ts, console-bridge.ts
    ├──> config-guard.ts ──> types.ts
    ├──> session-tag.ts ──> types.ts
    ├──> serve.ts（ensureServeReady / spawnDetached / splitServe）
    └──> profile-modules.ts
 ```
+
+**Client 半边（`client.js`）的槽位契约**（与 `@deepseek-ai/dsh-client-ui-slots` 的真实契约逐条对应，2026-10-19 以源码核实）：
+
+- `conversation.input.left` 是**严格会话槽位**，但 owner 渲染时只传 `{}`（`InputBar.tsx`
+  的 `renderSlot('conversation.input.left', {})`）——**标准 props 与 owner props 里都没有
+  `sessionId`**。当前会话 id 必须经注册项的 `inject: sessionId => ({ sessionId })` 注入：
+  SlotCore 对严格会话槽位以**确定的 `sessionId` 调用 inject**，返回值并入组件 props
+  （官方 `ui-plan` / `ui-permission-presets` 同此用法；`ui-slots` 的 `InjectParams` 类型钉死该形状）。
+- 弹层由按钮组件**内联渲染**（fixed，锚定按钮上方）：点外部 / Esc / 窗口缩放关闭，动作后保持
+  打开看状态更新。刻意**不用** `shell.overlay`——它是 root 作用域（inject 收到的 `sessionId`
+  是 `undefined`），上一版跨组件共享开关状态还曾导致弹层无法关闭；也**不** require primitives
+  的 `Menu`：那要在 package.json 声明 `dsh.client.external`，而 dsh.client 元数据按包名缓存到
+  进程重启才失效，为一个 dismiss 行为不值得再要一次重启。
+- 检测中按钮显示"图标 + 转圈"（behavior §7.1）；检测完成且无可用计划才隐藏。
+- `package.json` 的 `dsh.client` 形状（platform/immediately/inject）与官方 decoration 模板一致；
+  **client 半边首次供应需要一次 DSH 重启**（`clientModules` 的"非 client 包"否定判定按
+  Loader specifier 缓存、直到进程重启才失效——删除 → 重装不刷新它，见 §8）。
 
 **职责边界**：`session.ts` / `translate.ts` / `discovery.ts` / `trust.ts` / `global-rows.ts`
 / `session-tag.ts` / `values.ts` / `health.ts` / `serve.ts` 各自只承担一件事、互不依赖（除上面
@@ -185,7 +203,7 @@ npx tsx <工作区>/temp/check-engines-dsh.mjs deepseek-harness-project-mcp --ru
 `src/index.ts` 导出：
 
 ```ts
-export const inject = ['commands', 'loader', 'systemPrompt'] as const
+export const inject = ['loader'] as const
 ```
 
 显式声明而不是在 `apply` 里碰运气：缺少任一服务时 Cordis 让插件保持**未激活**并等待，
@@ -250,7 +268,7 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 | 类型 | `tsc --noEmit` | `npm run typecheck` |
 | 打包 | tarball 内容 | `npm pack --dry-run` |
 
-### 7.2 测试文件与用例数（当前 264）
+### 7.2 测试文件与用例数（当前 252）
 
 | 文件 | 用例 | 覆盖 |
 | --- | --- | --- |
@@ -343,9 +361,14 @@ tarball 内容。
   而 `failOnStartupError: false` 时 mcp-client 自己**不抛**（`packages/mcp/mcp-client/src/index.ts`
   的 `if (outcome.error !== undefined && config.failOnStartupError)`）——因此"启动失败但
   fiber 并不拒绝"时记账不会被摘除，与 `mount.test.mts` 那条守护的假设不同。属未验证。
-- **DSH 退出后被 `serve` 拉起的服务是否存活**：`detached + unref` 能让服务脱离**直接父
-  进程**（已用独立脚本实测），但"DSH 进程整体退出"这条只能等真实会话验证——`serve-mount`
-  的用例里父进程就是测试进程，且子进程写完标记即退出，不构成证据。
+- **DSH 退出后被 `serve` 拉起的服务是否存活**：脱离手段按平台与命令不同（POSIX 用
+  `detached`；Windows 上对 PowerShell 不用，见 `spawnOptionsFor`）。已用独立脚本实测的是
+  "父进程退出、控制台拆除之后服务是否还在"：`detached` 路径存活；Windows + PowerShell 路径
+  下，由 `Start-Process -WindowStyle Hidden` 创建的服务也存活（直接前台跑的会随控制台消失）。
+  但"DSH 进程整体退出"这条只能等真实会话验证——`serve-mount` 的用例里父进程就是测试进程，
+  且子进程写完标记即退出，不构成证据。
+- **Windows + PowerShell 路径下的 Ctrl+C 时间窗**：控制台拆除会带走挂在其上的进程已实测，
+  但 Ctrl+C 这一具体触发方式与其时间窗未单独测量。
 - **真实 MudMCP 的首次建索引耗时**：默认 120 秒的依据是实测"可能超过 90 秒"，但那是在
   本机、本仓库条件下的观测；不同项目/机器上的合适上限可能需要调整（可配）。
 - **`agent/created` 的 serial 等待是否真的挡住首条消息**：契约（`runtime-types.ts:257`
@@ -353,8 +376,10 @@ tarball 内容。
   （`packages/core/agent/src/index.ts:550` 的 `await this.ctx.serial(...)`）都已核实，但
   "用户实际感受到的等待时长"未经真实会话测量。
 
-Host 半边没有热通道，验证这些需要由使用者重启一次 DSH。**不要在未重启的情况下**用旧
-进程的行为推断新构建的行为。
+Host 半边换血：**官方插件页删除 → 安装**即可让新构建进入长跑进程（2026-10-18 以带标记的
+apply 日志实测，免重启）；`set_plugin` 停用→启用只修结构、复用旧模块命名空间，**不**载入
+新构建。Client 半边由宿主自动热更新，但**首次供应**需要一次 DSH 重启（`clientModules` 对
+"非 client 包"有进程级负缓存）。
 
 ### 8.1 文档与已提交代码的一致性
 

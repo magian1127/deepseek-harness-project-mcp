@@ -10,7 +10,7 @@
  */
 import { findProjectRoot, readProjectMcpFile } from './discovery.js'
 import { translateServer } from './translate.js'
-import { fingerprint, isApproved } from './trust.js'
+import { configHashOf, isApproved } from './trust.js'
 import type { TrustStore } from './trust.js'
 import type { McpClientConfig } from './types.js'
 
@@ -29,15 +29,22 @@ export interface SessionMountInput {
   env: Record<string, string | undefined>
 }
 
+/** 待批准的服务器：名字 + 当前配置哈希（批准要记的就是这个哈希）。 */
+export interface PendingServer {
+  serverName: string
+  configHash: string
+}
+
 export type SessionMountPlan =
   | { kind: 'skip'; reason: string; silent?: boolean; skipped?: Array<{ name: string; reason: string }> }
   | { kind: 'invalid'; reason: string }
-  | { kind: 'untrusted'; projectRoot: string; fingerprint: string; pending: string[] }
+  | { kind: 'untrusted'; projectRoot: string; pending: PendingServer[] }
   | {
       kind: 'mount'
       projectRoot: string
-      fingerprint: string
       configs: McpClientConfig[]
+      /** 可挂载但**未批准**的服务器：控制台把它们显示为"未授权"行并计入需动作数。 */
+      pending: PendingServer[]
       skipped: Array<{ name: string; reason: string }>
       /**
        * **非致命**诊断：条目本身可用，但其中某个可选字段被丢弃了。
@@ -57,6 +64,8 @@ interface Candidate {
   originalName: string
   serverName: string
   config: McpClientConfig
+  /** 该条目字面量的配置哈希（v2 批准粒度）。 */
+  configHash: string
 }
 
 /** 被跳过的服务器及原因，供 `/mcp-project` 展示。 */
@@ -97,8 +106,8 @@ export function planSessionMount(input: SessionMountInput): SessionMountPlan {
   }
   if (parsed.kind === 'invalid') return { kind: 'invalid', reason: parsed.reason }
 
-  // 5. 指纹绑定文件的确切内容，`git pull` 带来的任何改动都会改变它（规格 §7.2）。
-  const fp = fingerprint(parsed.raw)
+  // 5. 批准粒度是"服务器 × 配置哈希"（v2）：哈希在逐条翻译时随候选一起算出，
+  //    整文件指纹不再参与批准判定（见 `trust.ts` 模块头）。
 
   // 6. 逐条翻译。诊断只含原因与变量名，绝不含展开后的值（规格 §10）。
   //    `cwd` 传会话工作区而不是项目根：与规格 §6 的 stdio 行一致，服务器以用户
@@ -109,7 +118,12 @@ export function planSessionMount(input: SessionMountInput): SessionMountPlan {
   for (const [name, entry] of Object.entries(parsed.servers)) {
     const result = translateServer(name, entry, { cwd, env: input.env, diagnostics })
     if (result.kind === 'ok') {
-      candidates.push({ originalName: name, serverName: result.serverName, config: result.config })
+      candidates.push({
+        originalName: name,
+        serverName: result.serverName,
+        config: result.config,
+        configHash: configHashOf(entry),
+      })
     } else {
       skipped.push({ name, reason: result.reason })
     }
@@ -166,31 +180,34 @@ export function planSessionMount(input: SessionMountInput): SessionMountPlan {
     }
   }
 
-  // 10. 信任判定用**规范化后**的名字，与信任存储里记录的一致（规格 §7.1）。
-  const approved = mountable.filter(candidate =>
-    isApproved(input.trust, projectRoot, fp, candidate.serverName),
-  )
-
-  // 11. 有可挂载项、但一条都没被批准 → 要求批准。`pending` 列真正需要批准的名字。
-  if (approved.length === 0 && mountable.length > 0) {
-    return {
-      kind: 'untrusted',
-      projectRoot,
-      fingerprint: fp,
-      pending: mountable.map(candidate => candidate.serverName),
+  // 10. 信任判定按"服务器 × 配置哈希"（v2）：同名服务器换了配置等于没批准
+  //     （git-pull 保护）；改 A 不再连累 B 的批准。
+  const pending: PendingServer[] = []
+  const approved: Candidate[] = []
+  for (const candidate of mountable) {
+    if (isApproved(input.trust, projectRoot, candidate.serverName, candidate.configHash)) {
+      approved.push(candidate)
+    } else {
+      pending.push({ serverName: candidate.serverName, configHash: candidate.configHash })
     }
   }
 
-  // 12. 挂载（真正挂载由任务 7 执行，本函数只产出配置）。`configs` 为空且
-  //     `mountable` 为空时，代表这份文件没有任何可挂载项，原因见 `skipped`。
+  // 11. 有可挂载项、但一条都没被批准 → `untrusted`：控制台把整份显示为待处理。
+  if (approved.length === 0 && mountable.length > 0) {
+    return { kind: 'untrusted', projectRoot, pending }
+  }
+
+  // 12. 挂载已批准的；未批准的进 `pending`，由控制台显示为"未授权"行并计入需动作数。
+  //     `configs` 为空且 `mountable` 为空时，代表这份文件没有任何可挂载项，原因见
+  //     `skipped`。
   //
   //     `diagnostics` 原样带出：`serve` 字段畸形时条目仍然可用，那条诊断既不属于
   //     `skipped`（整条没被跳过），也不该无声丢弃——去哪里由装配层决定。
   return {
     kind: 'mount',
     projectRoot,
-    fingerprint: fp,
     configs: approved.map(candidate => candidate.config),
+    pending,
     skipped,
     diagnostics,
   }

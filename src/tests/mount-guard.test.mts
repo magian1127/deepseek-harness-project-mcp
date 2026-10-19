@@ -3,6 +3,8 @@ import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { EventEmitter } from 'node:events'
+import type { TrustStore } from '../trust.js'
 
 /**
  * 非法 config 被拦在 `ctx.plugin()` **之前**的集成守护（本轮补修的核心断言）。
@@ -109,7 +111,9 @@ export default { Config, apply() {} }
 `)
 
 const { apply } = await import('../index.js')
-const { approve, fingerprint, trustStorePath } = await import('../trust.js')
+const { approve, configHashOf, trustStorePath } = await import('../trust.js')
+const { normalizeServerName } = await import('../translate.js')
+const { CONSOLE_ROUTE_PREFIX, NONCE_HEADER, NONCE_META_NAME } = await import('../console-bridge.js')
 
 interface Project {
   root: string
@@ -125,9 +129,21 @@ function makeProject(servers: Record<string, unknown>): Project {
   return { root, raw }
 }
 
-/** 写信任存储，批准该项目全部指定服务器（指纹必须针对 `.mcp.json` 的确切文本）。 */
+/**
+ * 写信任存储，批准该项目指定的服务器（v2：服务器 × 配置哈希）。
+ *
+ * 哈希从 `.mcp.json` 原文条目算出，与计划同源：本文件的探针是"schema 不再接受插件
+ * 产出的 config"，批准若与计划的哈希对不上，测试会在守卫之前就失败（挂载压根没发生），
+ * 断言就测不到想测的东西。
+ */
 function approveAll(project: Project, servers: string[]): void {
-  const store = approve({ version: 1, projects: {} }, project.root, fingerprint(project.raw), servers, 't')
+  const parsed = JSON.parse(project.raw) as { mcpServers: Record<string, unknown> }
+  let store: TrustStore = { version: 2, projects: {} }
+  for (const serverName of servers) {
+    const originalKey =
+      Object.keys(parsed.mcpServers).find(key => normalizeServerName(key) === serverName) ?? serverName
+    store = approve(store, project.root, serverName, configHashOf(parsed.mcpServers[originalKey]), 't')
+  }
   writeFileSync(trustStorePath(), JSON.stringify(store, null, 2))
 }
 
@@ -142,10 +158,29 @@ function createHarness() {
   const logs: Array<{ level: string; message: string }> = []
   const pluginCalls: Array<{ module: unknown; config: unknown }> = []
   const fibers: FiberShape[] = []
+  /** 活会话表：桥接按 `ctx.get('agents').get(id)` 取会话。 */
+  const agentsById = new Map<string, unknown>()
+  const routes: Array<{ path: string; handler: (req: never, res: never) => void }> = []
+  let indexTransform: ((html: string) => string) | null = null
+
+  const webServerFake = {
+    register(route: { kind: string; path: string; handler: (req: never, res: never) => void }) {
+      routes.push(route)
+      return () => {
+        const at = routes.indexOf(route)
+        if (at >= 0) routes.splice(at, 1)
+      }
+    },
+    tapIndex(transform: (html: string) => string) {
+      indexTransform = transform
+      return () => { indexTransform = null }
+    },
+  }
 
   const host = {
     get(name: string) {
-      if (name === 'commands') return { register: () => () => {} }
+      if (name === 'agents') return { get: (id: string) => agentsById.get(id) }
+      if (name === 'webServer') return webServerFake
       return undefined
     },
     on(name: string, callback: (payload: unknown) => void) {
@@ -186,11 +221,50 @@ function createHarness() {
         })
       },
     }
+    agentsById.set(agent.id, agent)
     return agent
   }
 
   return {
     host, logs, pluginCalls, fibers, makeAgent,
+    /**
+     * 控制台桥接调用面：批准路径（`start`）与自动路径（`agent/created`）共用同一个守卫，
+     * 这条守护要靠它才能覆盖到第二条入口。走真实路由而不是内部函数，理由见
+     * `mount.test.mts` 的同名辅助。
+     */
+    consoleApi: () => {
+      const html = indexTransform !== null ? indexTransform('<html><head></head></html>') : ''
+      const nonce = new RegExp(`name="${NONCE_META_NAME}" content="([^"]+)"`).exec(html)?.[1] ?? ''
+      const call = (
+        method: 'GET' | 'POST',
+        path: string,
+        body?: Record<string, unknown>,
+      ): Promise<{ status: number; body: { ok: boolean; reason?: string } | null }> =>
+        new Promise((resolve, reject) => {
+          const route = routes.find(item => item.path === CONSOLE_ROUTE_PREFIX)
+          if (route === undefined) return reject(new Error('控制台路由未安装'))
+          const req = new EventEmitter() as EventEmitter & Record<string, unknown>
+          req.method = method
+          req.url = path
+          req.headers = { [NONCE_HEADER]: nonce }
+          req.destroy = () => {}
+          let statusCode = 0
+          const res = {
+            writeHead: (status: number) => { statusCode = status; return res },
+            end: (text?: string) => {
+              resolve({ status: statusCode, body: text === undefined ? null : JSON.parse(text) })
+              return res
+            },
+          }
+          route.handler(req as never, res as never)
+          if (body !== undefined) req.emit('data', Buffer.from(JSON.stringify(body)))
+          req.emit('end')
+        })
+      return {
+        start: (session: string, server: string) =>
+          call('POST', `${CONSOLE_ROUTE_PREFIX}/start`, { session, server }),
+      }
+    },
     /** 全部日志文本（含 warn 与 error），用于"不含敏感值"断言。 */
     joined: () => logs.map(entry => entry.message).join('\n'),
     fire: async (name: string, payload: unknown) => {
@@ -248,7 +322,7 @@ test('多条非法配置全部被拦下，每条各留一条安全诊断', async
   assert.equal(logs.includes(SECRET), false, `日志不得回显展开后的环境变量值：${logs}`)
 })
 
-test('挂载记账不含被拦下的服务器：/mcp-project 不得谎报已挂载', async () => {
+test('挂载记账不含被拦下的服务器：控制台不得谎报已挂载', async () => {
   // 自校验在 `servers.set()` **之前** `continue`，因此被拦下的项不进记账。
   // 这条守护"批准成功但没挂上"不会伪装成"已挂载"。
   const project = makeProject(PROBED_SERVERS)
@@ -264,38 +338,25 @@ test('挂载记账不含被拦下的服务器：/mcp-project 不得谎报已挂�
   assert.equal(harness.pluginCalls.length, 0)
 })
 
-test('命令层 trust 路径同样被拦下（两条挂载入口共用同一守卫）', async () => {
-  // 挂载有两个入口：`agent/created` 与 `/mcp-project trust`。守卫必须在 `mountInto` 里，
+test('控制台 start 路径同样被拦下（两条挂载入口共用同一守卫）', async () => {
+  // 挂载有两个入口：`agent/created` 与控制台的 `start`。守卫必须在 `mountInto` 里，
   // 才能同时覆盖两者——放在事件回调里只堵住一半。
   const project = makeProject(PROBED_SERVERS)
   const harness = createHarness()
-  const commands = new Map<string, { handler: (invocation: unknown) => unknown }>()
-  harness.host.get = (name: string) => {
-    if (name !== 'commands') return undefined
-    return {
-      register: (definition: { name: string; handler: (i: unknown) => unknown }) => {
-        commands.set(definition.name, definition)
-        return () => { commands.delete(definition.name) }
-      },
-    }
-  }
   apply(harness.host as never, {})
 
   const agent = harness.makeAgent(project)
   await harness.fire('agent/created', { agent })
   await new Promise(resolve => setTimeout(resolve, 0))
+  assert.equal(harness.pluginCalls.length, 0, '自动路径已被拦下')
 
-  const out = (await Promise.resolve(
-    commands.get('mcp-project')!.handler({ agent, rawInput: 'trust' }),
-  )) as { kind: string; text: string }
-
-  assert.equal(out.kind, 'success', out.text)
-  assert.equal(harness.pluginCalls.length, 0, 'trust 路径同样不得把非法配置交给 ctx.plugin()')
+  // start 会先写批准再挂载：这条要测的是"批准之后仍然进不了 ctx.plugin()"。
+  const out = await harness.consoleApi().start(agent.id, 'alpha')
+  assert.equal(out.body?.ok, true, out.body?.reason)
+  assert.equal(harness.pluginCalls.length, 0, 'start 路径同样不得把非法配置交给 ctx.plugin()')
   assert.equal(
     harness.joined().includes(SECRET),
     false,
-    `trust 路径日志不得回显展开后的环境变量值：${harness.joined()}`,
+    `start 路径日志不得回显展开后的环境变量值：${harness.joined()}`,
   )
-  // 如实回报：没有挂上就不能说"本会话已挂载"。
-  assert.match(out.text, /本会话没有可挂载的服务器/, `不得谎报已挂载：${out.text}`)
 })
