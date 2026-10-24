@@ -79,7 +79,10 @@
 | `src/session-tag.ts` | `withSessionTag`：给 stdio config 追加 `--project-mcp-session <SessionId>` 会话标记（纯函数，返回新对象） |
 | `src/console-view.ts` | `composeConsoleView`：计划 + 挂载记账 + serve 进行中表 → 控制台视图（纯函数，需动作数口径在此钉死） |
 | `src/console-bridge.ts` | `installConsoleBridge`：`webServer` 前缀路由（status / start / revoke）+ boot 级 nonce 注入（**真实 HTTP I/O**） |
-| `client.js` | Client 半边（plain-JS bundle）：输入区按钮 + 内联锚定弹层（点外部/Esc 关闭）；会话 id 经注册项 `inject` 注入（不做任何会话数据折叠） |
+| `src/debug-view.ts` | 工具调试台的纯函数投影：MCP 名解析、分组、关键词过滤、schema → 表单、表单 → 参数（**零 I/O**） |
+| `src/debug-executor.ts` | `DebugExecutor`：`callId` 序列 + 取消表 + 结果块投影（`.value` 优先、图片 4 MiB 截断） |
+| `src/debug-bridge.ts` | `installDebugBridge`：`webServer` 前缀路由（tools / call / cancel / prompt-sections / skills / skill）。准入用**同源三重围栏**（peer 回环 + `Host` 白名单 + `sec-fetch-site`/`Origin`），**刻意不用 nonce**；技能按**会话作用域**列举（`session` 解析成 agent 当 `scope`，否则 preset 的 `customSkillDirs` 技能看不到）（**真实 HTTP I/O**） |
+| `client.js` | Client 半边（plain-JS bundle）：输入区按钮 + 内联锚定弹层（点外部/Esc 关闭）；`conversation.view` 的「工具调试」Tab（工具树 / 调用 / 结果 / 技能 / 提示词面）；会话 id 经注册项 `inject` 注入（不做任何会话数据折叠） |
 
 依赖方向单向无环：
 
@@ -89,11 +92,17 @@ index.ts ──> session.ts ──> discovery.ts, translate.ts, trust.ts, global
    │                              ├──> serve.ts ──> health.ts, values.ts, config-guard.ts
    │                              └──> values.ts, types.ts
    ├──> console-view.ts, console-bridge.ts
+   ├──> debug-bridge.ts ──> debug-executor.ts, debug-view.ts
    ├──> config-guard.ts ──> types.ts
    ├──> session-tag.ts ──> types.ts
    ├──> serve.ts（ensureServeReady / spawnDetached / spawnOptionsFor / splitServe）
    └──> profile-modules.ts
 ```
+
+调试台是**通用**调试面：它读宿主全局 `tools` 服务，与项目级 MCP 无语义关系，只是搭在本插件
+已装配的 webServer 通道上。schema → 表单的规则**只**在 `debug-view.ts` 实现一次，`client.js`
+只渲染 Host 投影好的 `fields`——两处实现分叉会让"表单字段与真实 schema 不符"，而那正是调试台
+最不该骗人的地方。`tools` 服务缺席时不装配调试路由。
 
 `session.ts` / `translate.ts` / `discovery.ts` / `trust.ts` / `global-rows.ts` /
 `config-guard.ts` / `session-tag.ts` / `values.ts` / `health.ts` / `serve.ts` 各自只承担
@@ -112,7 +121,7 @@ index.ts ──> session.ts ──> discovery.ts, translate.ts, trust.ts, global
 ```powershell
 npm install
 npm run typecheck                        # tsc -p tsconfig.json --noEmit
-npm test                                 # 252 个用例，16 个测试文件
+npm test                                 # 294 个用例，19 个测试文件
 npm pack --dry-run                       # 核对 tarball 内容（files 字段）
 (Get-Content AGENTS.md).Count            # 必须 ≤ 200
 ```

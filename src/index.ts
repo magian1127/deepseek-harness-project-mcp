@@ -41,6 +41,10 @@ import type { ServeIo } from './serve.js'
 import { composeConsoleView } from './console-view.js'
 import { installConsoleBridge } from './console-bridge.js'
 import type { ConsoleActionResult, ConsoleBridgeDeps, WebServerShape } from './console-bridge.js'
+import { installDebugBridge } from './debug-bridge.js'
+import type { DebugWebServerShape, PromptSectionsShape, SkillsShape } from './debug-bridge.js'
+import { DebugExecutor } from './debug-executor.js'
+import type { DebugToolsShape } from './debug-executor.js'
 import { randomBytes } from 'node:crypto'
 import { planSessionMount } from './session.js'
 import type { SessionMountInput, SessionMountPlan } from './session.js'
@@ -736,16 +740,73 @@ export function apply(ctx: HostContext, config: unknown): void {
     )
   }
   tryInstallConsoleBridge()
-  // webServer 可能晚于本插件出现（zcode_mask 同款情形）：秒级重试直到装上，装上即停。
+
+  // —— 工具调试控制台（通用调试面；与项目级 MCP 语义无关）——
+  //
+  // 它读的是宿主**全局** tools 服务（不是本插件挂载的 MCP 服务器），因此这个
+  // 插件只是"恰好住在同一进程里"的宿主：把调试台放在这里是因为它需要一个已经
+  // 长期存活的 Host 半边，而不是因为它跟 `.mcp.json` 有关。
+  //
+  // **刻意不复用 console-bridge 的 nonce**（2026-10-24 真机教训）：那套机制靠
+  // `tapIndex` 把 meta 注入页面，而 `tapIndex` 在真实组合里没有生效——调试台最初
+  // 照抄后整个工具面拿不到任何工具（请求全 403）。调试台改用与它所在的会话视图同级
+  // 的同源三重围栏（见 debug-bridge.ts 模块头），不依赖任何页面注入。
+  //
+  // tools 服务缺席时**不装配**调试路由：没有工具面可调试，路由只会返回空列表，
+  // 而空列表会让用户以为"工具全都消失了"。
+  //
+  // `tools` 必须**每次重试时重新取**，不能在 apply 时取一次就缓存：Cordis 的服务
+  // 可能晚于本插件就绪（与 webServer 同款情形），缓存下来的 `undefined` 会让重试
+  // 永远短路，路由一辈子装不上。
+  const debugExecutor = new DebugExecutor()
+  let debugInstalled = false
+  const tryInstallDebugBridge = (): void => {
+    if (debugInstalled) return
+    const tools = ctx.get('tools') as DebugToolsShape | undefined
+    if (tools === undefined || tools === null || typeof tools.schemas !== 'function') return
+    const webServer = ctx.get('webServer') as DebugWebServerShape | undefined
+    if (webServer === undefined || webServer === null || typeof webServer.register !== 'function') return
+    debugInstalled = true
+    const promptService = ctx.get('systemPrompt') as PromptSectionsShape | undefined | null
+    // `skills` 与 `tools` 一样每次重试时重新取（同上：服务可能晚到）。
+    // 技能目录缺席时调试台仍可用，只是「技能」页为空——不像 `tools` 缺席那样
+    // 整体不装配：调试台的核心是工具面，技能是附加的只读视图。
+    const skillsService = ctx.get('skills') as SkillsShape | undefined | null
+    ctx.effect(
+      () =>
+        installDebugBridge(webServer, {
+          tools,
+          systemPrompt: promptService,
+          skills: skillsService,
+          // 技能按 scope 分层：把会话 id 解析成 agent 当 scope，才能看见该会话专属的
+          // 技能（如 agent preset 用 customSkillDirs 声明的那些）。解析不到就退回全局视角。
+          skillScopeOf: sessionId => {
+            try {
+              const agent = ctx.get('agents')?.get?.(sessionId) as AgentShape | undefined
+              return agent
+            } catch {
+              return undefined
+            }
+          },
+          executor: debugExecutor,
+          warn: message => ctx.logger?.warn?.(message),
+        }),
+      'project-mcp:debug-bridge',
+    )
+  }
+  tryInstallDebugBridge()
+
+  // webServer 可能晚于本插件出现（zcode_mask 同款情形）：秒级重试直到两座桥都装上。
   ctx.effect(() => {
     const timer = setInterval(() => {
       if (!consoleInstalled) tryInstallConsoleBridge()
+      if (!debugInstalled) tryInstallDebugBridge()
     }, 1000)
     // 必须 unref：假 ctx 的集成测试不会跑 effect 清理，未 unref 的定时器会把测试进程
     // 吊到超时（2026-10-18 实测 npm test 挂住）。真实宿主里有别的句柄，不受影响。
     timer.unref()
     return () => clearInterval(timer)
-  }, 'project-mcp:console-bridge-retry')
+  }, 'project-mcp:bridge-retry')
 
   ctx.effect(
     () =>

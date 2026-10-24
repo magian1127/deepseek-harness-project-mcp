@@ -24,6 +24,7 @@ approve it per project.
 | Variable expansion | `command` / `args` / `env` / `url` / `headers` / `serve.*` support `${VAR}` and `${VAR:-default}` |
 | Global name-collision guard | A project server sharing a name with a global profile MCP row is not mounted twice |
 | No double mount for subagents | A subagent session (`origin === 'subagent'`) shares its parent's workspace, so no extra connection or child process is created; a forked session is an independent conversation and is mounted normally |
+| Tool Debug tab | A conversation view that browses the host's global tool surface, calls a tool by form or raw JSON, shows results and history, lists the skills visible to the current session, and lists prompt sections read-only. It is unrelated to project-level MCP; it simply rides this plugin's host half |
 | Non-intrusive | With no `.mcp.json` the plugin stays completely silent, and it **never writes into the system prompt**; needing action only shows as a state label on the button |
 
 ## Requirements
@@ -31,7 +32,7 @@ approve it per project.
 - **DeepSeek Harness `>=0.2.0-rc.2 <0.3.0-0`** (the `engines.dsh` field in `package.json`, enforced by the host on install and profile startup; 0.1.x and earlier are rejected as incompatible)
 - Verified baseline: DSH 0.2.1-rc.2 (`@deepseek-ai/dsh-mcp-client` and `@deepseek-ai/dsh-atomic-write` are both `0.2.1-rc.2`)
 - Node.js `^22.19.0 || >=24.0.0`
-- Host side only: no web settings form, and no model tools of its own
+- A host half plus a minimal client half (the composer button with its popup, and the Tool Debug tab); no web settings form, and no model tools of its own
 
 ## Install
 
@@ -186,6 +187,40 @@ that needs your attention shows up on the button.
 On profiles without a Web UI (headless / SDK) there is no console and therefore **no way to approve**;
 only Host logs remain there.
 
+## Tool Debug tab
+
+The conversation view row (next to "Chat" and "Trajectory") gains a **Tool Debug** page. It browses
+the host's **global** tool surface — built-in tools, tools registered by other plugins, and the
+`mcp__<name>__*` tools this plugin mounts. It has no semantic relation to project-level MCP; it
+rides this plugin only because that is where a long-lived host half already exists.
+
+| Column | Purpose |
+| --- | --- |
+| Left | Search plus a grouped tool tree (one group per MCP server, `Built-in`, `Other tools`) |
+| Middle | Parameter form for the selected tool (or raw JSON mode), [Run] / [Cancel] |
+| Right | Result of the latest call (images render), history of the last 50 calls on this machine, the skills visible to the current session (bodies load on expand), and a read-only list of the current `systemPrompt` sections |
+
+Behavior notes:
+
+- The form is generated from the **top level** of the tool's JSON Schema (scalars, booleans, enums);
+  objects and arrays fall back to a JSON field. Leaving a required field empty reports an error in
+  place and sends nothing. The form does **not** validate against the schema — the tool does that.
+- Results prefer the tool's **raw content blocks**, so images are visible instead of being reduced
+  to placeholder text.
+- When the tool name or its arguments contain `unsafe`, a confirmation dialog **always** appears
+  ("skip confirms this session" does not apply to it).
+- The **Skills** sub-page reads the host `skills` service and lists skills visible to the **current
+  session's scope**, so skills an agent preset declares through `customSkillDirs` show up too. It is
+  read-only and never sends a skill file's local path to the browser.
+- The debug console **never** writes into the system prompt and registers **no** model tools, so the
+  model cannot see it.
+- Deployments without a `tools` service do not mount it; profiles without `webServer` (headless /
+  SDK) have no such tab either.
+
+> This is a manual debugging entry point that executes tools from the global host view (no session
+> scope), so session-level tool restrictions do **not** apply to it. Only a same-origin page can
+> trigger it (loopback peer + `Host` allowlist + `sec-fetch-site` / `Origin`).
+
 ## Data boundaries
 
 | Data | Location | Contents |
@@ -206,6 +241,17 @@ only Host logs remain there.
 - **Process startup**: the plugin starts a process only when `serve` is declared and the health
   check failed, and only ever starts `serve.command` — with no shell interpretation, so `&&`,
   pipes, redirection, and globs do not apply. Without approval it neither spawns nor connects.
+- **Tool Debug data**: the call history lives only in your browser's `localStorage` (key
+  `dsh-project-mcp-tool-debug-history`, at most 50 entries). It is never reported anywhere and never
+  written to the host; tool results travel only in that HTTP response to the current page, and the
+  host keeps no call log.
+- **Admission to the debug console**: every `/project-mcp/debug/*` request passes the same-origin
+  fence — the peer must be a loopback address, `Host` must be a local authority, `sec-fetch-site`
+  may only be `same-origin` / `none`, and an `Origin` (when present) must match `Host`. It can
+  execute any registered tool, so it is meant for the loopback GUI only.
+  > This route does **not** use a nonce: nonces depend on `tapIndex` injecting a meta tag into the
+  > page, and that injection does not take effect in the real composition (measured 2026-10-24:
+  > copying the nonce scheme made every request 403 and the tool surface always empty).
 
 ## Known limitations
 
@@ -224,6 +270,8 @@ only Host logs remain there.
 | On Windows, "outlives DSH" also depends on how the server is launched | When `serve.command` is PowerShell the plugin does not use `detached` (with it, PowerShell would not run a single line). Whether the server then outlives DSH depends on how that script creates it: a process created by `Start-Process -WindowStyle Hidden` has no console and survives, while one running in the script's foreground dies with the host console. Any other command keeps `detached` and survives independently |
 | `serve` does not check port ownership | If the port is taken by something else, one log line is written; nothing is preempted or retried, and the entry is handed to DSH as usual (it may connect to that other instance) |
 | `serve`'s wait is bounded | Default 120 s (configurable, hard-capped at 30 min). After a timeout the entry is still mounted, the tools stay unavailable for a while, and DSH retries on its own |
+| The debug console ignores session scope | It lists and executes tools from the global host view (`schemas()` / `execute()` carry no agent scope), so session-level tool deny patches do **not** apply to it. This is deliberate: the console's whole value is seeing the real tool surface, and only someone holding the page can trigger it |
+| The debug form does not validate against the schema | It generates controls from the top level of the JSON Schema and does not validate before submitting; the tool decides whether the arguments are valid (the same path a model call takes). For deeply nested schemas, use raw JSON mode |
 
 ## Uninstall
 

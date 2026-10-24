@@ -37,7 +37,10 @@
 | `session-tag.ts` | `withSessionTag`：给 stdio config 追加 `--project-mcp-session <SessionId>` 标记（返回新对象） | 纯函数 |
 | `console-view.ts` | `composeConsoleView`：计划 + 挂载记账 + serve 进行中表 → 控制台视图 | 纯函数 |
 | `console-bridge.ts` | `installConsoleBridge`：`webServer` 前缀路由（status/start/revoke）+ nonce 注入 | 注入 I/O；真实 HTTP I/O |
-| `client.js` | Client 半边（plain-JS bundle）：输入区按钮 + 内联锚定弹层，只渲染 Host 算好的视图 | 浏览器侧；不做会话数据折叠 |
+| `debug-view.ts` | 调试台纯函数投影：`parseMcpToolName` / `groupTools` / `groupIdOf` / `filterTools` / `formFields` / `buildArguments` | 纯函数 |
+| `debug-executor.ts` | `DebugExecutor`：`callId` 序列、取消表、结果块投影（`.value` 优先、图片 4 MiB 截断）、`CallIdConflictError` | 纯函数 + 注入时钟 |
+| `debug-bridge.ts` | `installDebugBridge`：`webServer` 前缀路由（tools / call / cancel / prompt-sections）+ `projectTools` / `projectGroups` 投影 | 注入 I/O；真实 HTTP I/O |
+| `client.js` | Client 半边（plain-JS bundle）：输入区按钮 + 内联锚定弹层；`conversation.view` 的「工具调试」Tab（工具树 / 调用 / 结果 / 提示词面）。只渲染 Host 算好的视图 | 浏览器侧；不做会话数据折叠 |
 
 **依赖方向**（单向，无环）：
 
@@ -47,11 +50,26 @@ index.ts ──> session.ts ──> discovery.ts, translate.ts, trust.ts, global
    │                              ├──> serve.ts ──> health.ts, values.ts, config-guard.ts
    │                              └──> values.ts, types.ts
    ├──> console-view.ts, console-bridge.ts
+   ├──> debug-bridge.ts ──> debug-executor.ts, debug-view.ts
    ├──> config-guard.ts ──> types.ts
    ├──> session-tag.ts ──> types.ts
    ├──> serve.ts（ensureServeReady / spawnDetached / splitServe）
    └──> profile-modules.ts
 ```
+
+调试台三件套的分层与其它模块一致：`debug-view.ts` 零 I/O（分组、表单投影、参数拼装），
+`debug-executor.ts` 只注入时钟（取消表与结果投影），`debug-bridge.ts` 是唯一真实 HTTP I/O。
+**不要**把 schema→表单的规则搬进 `client.js`：那会让"表单字段和真实 schema 不符"变成
+两处实现的分叉，而调试台最不该骗人的正是这一点。
+
+**调试台刻意不依赖 `console-bridge.ts`**（`docs/behavior.md` §7A.5 记了完整教训）：它用
+同源三重围栏（peer 回环 + `Host` 白名单 + `sec-fetch-site`/`Origin`）而不是 nonce。照抄
+nonce 的版本在真机上一个工具都拿不到（`tapIndex` 的 meta 注入没有生效，每个请求 403）。
+改这块之前先读那节，不要"顺手统一"成 nonce。
+
+另一条同类陷阱：`apply` 里取 `tools` 服务**不能缓存到闭包里**。Cordis 服务可能晚于本插件
+就绪，缓存下来的 `undefined` 会让秒级重试永远短路、调试路由一辈子装不上；`tryInstallDebugBridge`
+每次被调用都重新 `ctx.get('tools')`。
 
 **Client 半边（`client.js`）的槽位契约**（与 `@deepseek-ai/dsh-client-ui-slots` 的真实契约逐条对应，2026-10-19 以源码核实）：
 
@@ -262,13 +280,13 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 
 | 层 | 覆盖 | 命令 |
 | --- | --- | --- |
-| 纯函数单测 | `discovery` / `translate` / `values` / `health` / `serve` / `trust` / `global-rows` / `session` / `notice` / `config-guard` / `session-tag` | `npm test` |
-| 装配集成 | `plugin-smoke`（假 ctx，验证注册与清理可逆）、`commands`（注入 `CommandDeps`，验证命令输出）、`mount`（真实 fs + 假 agent ctx，验证挂载路径）、`mount-guard`（真实 fs + 假 mcp-client，验证非法 config 被拦在 `ctx.plugin()` 之前）、`serve-mount`（真实 fs + 假 agent ctx + **真实 spawn**，验证拉起链路） | `npm test` |
+| 纯函数单测 | `discovery` / `translate` / `values` / `health` / `serve` / `trust` / `global-rows` / `session` / `notice` / `config-guard` / `session-tag` / `debug-view` | `npm test` |
+| 装配集成 | `plugin-smoke`（假 ctx，验证注册与清理可逆）、`commands`（注入 `CommandDeps`，验证命令输出）、`mount`（真实 fs + 假 agent ctx，验证挂载路径）、`mount-guard`（真实 fs + 假 mcp-client，验证非法 config 被拦在 `ctx.plugin()` 之前）、`serve-mount`（真实 fs + 假 agent ctx + **真实 spawn**，验证拉起链路）、`debug-mount`（假 ctx，验证调试路由的装配条件与重试） | `npm test` |
 | 模块解析 | `profile-modules`（`--profile` 解析、`DSH_HOME` 落点）、`profile-config-contract`（对**已安装的 profile 模块**断言 `Config['~standard']` 契约）、`profile-export-contract`（对**已安装的 profile 模块**断言 `mcp-client` / `atomic-write` 的导出形状） | `npm test` |
 | 类型 | `tsc --noEmit` | `npm run typecheck` |
 | 打包 | tarball 内容 | `npm pack --dry-run` |
 
-### 7.2 测试文件与用例数（当前 252）
+### 7.2 测试文件与用例数（当前 294）
 
 | 文件 | 用例 | 覆盖 |
 | --- | --- | --- |
@@ -288,6 +306,10 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 | `session-tag.test.mts` | 10 | 标记追加在原有 args 之后、参数名带 `project-mcp` 前缀、不修改入参（含冻结对象）、连续标记两次结果相同（不累积）、`args` 缺失时标记成为唯一参数、`args` 非数组时按缺失处理、`args` 里的非字符串项被剔除、`streamable-http` 原样返回且不凭空多出 `args`、标记只含 SessionId 不带 env 值、保留 config 的其他字段 |
 | `serve.test.mts` | 45 | **`planServeStart`**：默认值补齐、`command` / `args` / `env` / `health` 的变量展开、缺 `command`、非字符串 `command`、展开成空串、畸形 `args` / `env`、非对象 `serve`、`health` scheme 白名单（`file:` / `data:` / `ftp:` / 无 `//` 全拒）、`url` 推导失败、非字符串 `health`、`readyTimeoutMs` 非法退回默认（九种非法值）与超上限收敛；**`deriveHealthUrl`**：用 origin 而非替换路径、非 http(s) 与非法 URL 返回 `undefined`；**`isHttpUrl`**：只放行 http(s) 且不被 `http:x` 骗过；**`checkHealth`**：2xx、非 2xx（带状态码）、`ok` 缺失时按状态码、网络错误归一 `network`（不回显消息）、abort 归一 `timeout`、非法 scheme 不发起请求；**`waitReady`**：首次成功不 sleep、轮询到就绪、超时、每轮重读时钟、非法 scheme 不轮询；**`splitServe`**：剥离且不改入参、stdio 原样返回、无 `serve` 返回 `undefined`；**`ensureServeReady`**：健康成功不 spawn、失败 + 有 `serve` spawn 一次且参数一致、失败 + 无 `serve` 不 spawn 记 warn、超时记 warn 不抛、spawn 抛错记 warn、**并发同 url 只 spawn 一次**、不同 url 各启动一次、完成后条目删除、stdio 零额外动作、**展开后的 env 值不入日志**、非法 scheme 不 spawn、推导不出 health 时完全不探测 |
 | `serve-mount.test.mts` | 11 | **真实 spawn 拉起服务且 `serve.env` 真的到了子进程**（子进程写标记文件）、**真实 HTTP 健康端点成功时不 spawn**、失败 + 无 `serve` 记 warn 仍挂载、**并发挂载同一 url 只 spawn 一次**（子进程向同一文件追加，数行数）、**`serve` 元数据被剥离绝不交给 `ctx.plugin()`**、**展开后的 `serve.env` 值不出现在任何日志**、**回归：stdio 条目零额外动作**、**回归：stdio 仍追加会话标记**、`serve` 畸形（缺 `command` / `health` scheme 非法）跳过 `serve` 仍挂载、`readyTimeoutMs` 非法退回默认并留诊断 |
+| `debug-view.test.mts` | 9 | `parseMcpToolName` 的合法与六种畸形形态（含大小写敏感）、`groupTools` 的组顺序（MCP 服务器名字典序 → 内置 → 其他）与组内排序、**同一工具面正反输入得到逐字相同的分组**（不允许顺序抖动）、`groupIdOf` 与 `groupTools` 一致、`filterTools` 的名/描述/大小写/空关键词（返回同一引用）、`formFields` 的七种 schema 投影与四种畸形 schema、`buildArguments` 的类型转换/空串省略/必填报错/非法值不写入参数 |
+| `debug-executor.test.mts` | 11 | `projectValueBlocks` 的文本/图片/mimeType 回退/未支持块/元素级畸形/超大图片截断、`contentText` 只拼文本、成功调用**优先 `.value` 原始块**（模型面 `content` 不同）、`.value` 无块时回退模型面文本、失败调用的三种错误消息来源、自动 `callId` 跳过在途序号、**同一 `callId` 在途时被拒绝且不影响在途那条**、`cancel` 中止在途调用与未知 id 返回 false、**`execute` 抛错后仍从取消表摘除** |
+| `debug-bridge.test.mts` | 19 | 路由前缀、**同源围栏放行浏览器同源请求（不带 nonce 也放行——真机修复的回归守护）** 含 `sec-fetch-site=none`/带同源 `Origin`/无 Origin/`localhost`/IPv6 回环五种合法形态、**非回环 peer / 非本机 Host / 缺 Host / 跨站 / 异源 Origin / 畸形 Origin 一律 403 且不执行工具**、拒绝理由区分 `loopback-only` 与 `same-origin-only`、`GET /api/tools` 的投影与分组形状、`GET /api/prompt-sections` 的四态（正常/服务缺席/抛错/畸形）、`POST /api/call` 的成功与三种 400、`callId` 冲突 409、**执行器抛错降级为 500 + 错误类型名且响应体不含底层 message**、`POST /api/cancel` 的三态、未知路径与方法 404、disposer 注销、`projectTools` / `projectGroups` 纯投影；**技能**：`GET /api/skills` 的正常/服务缺席/抛错/畸形四态、**摘要不下发本机 `path`**、`GET /api/skill` 的正文/未知 404/缺 name 400/服务缺席也不崩、`projectSkills` 的默认 invocation 与丢 path、**带 `session` 时把 agent 当 `scope` 传给 `skills.list`/`skills.get`**、解析不到 agent 时退回全局视角（不凭空造 scope） |
+| `debug-mount.test.mts` | 3 | `apply` 在 tools + webServer 都在场时挂上两座桥、卸载后路由与注入全部撤销、**tools 缺席时不挂调试台但 MCP 控制台照挂**、**webServer 晚到时由重试补挂且只挂一次** |
 
 ### 7.3 Review Focus 的守护位置
 
@@ -344,7 +366,7 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 
 ## 8 验证分层与未验证项
 
-**已由测试与命令覆盖**：上表 262 个用例、`npm run typecheck`、`npm pack --dry-run` 的
+**已由测试与命令覆盖**：上表 294 个用例、`npm run typecheck`、`npm pack --dry-run` 的
 tarball 内容。
 
 **未在真实 DSH 运行时验证**（需要真实 profile 与会话，无法在纯单元测试中覆盖）：
@@ -375,6 +397,13 @@ tarball 内容。
   的 "AgentLoop holds queued input until all listeners finish"）与派发点
   （`packages/core/agent/src/index.ts:550` 的 `await this.ctx.serial(...)`）都已核实，但
   "用户实际感受到的等待时长"未经真实会话测量。
+- **工具调试 Tab 在真实 GUI 会话中的渲染**：`debug-view` / `debug-executor` / `debug-bridge`
+  三层都有单测（含装配条件与重试），但"Tab 真的出现在会话视图行里、三栏布局在窄屏下折叠
+  正确、图片块真的渲染出来"只能由真实浏览器确认。本环境无浏览器控制，只做了语法与路由级
+  验证（`node --check client.js` + 路由单测）。
+- **调试台从宿主全局视角执行工具（不带 agent scope）的实际后果**：这是刻意取舍（见
+  `behavior.md` §7A.4），但"agent 作用域内的 deny 补丁确实不作用于调试台"未在真实会话中
+  实测——单测里的 `tools` 是假实现，不带 scope 语义。
 
 Host 半边换血：**官方插件页删除 → 安装**即可让新构建进入长跑进程（2026-10-18 以带标记的
 apply 日志实测，免重启）；`set_plugin` 停用→启用只修结构、复用旧模块命名空间，**不**载入
