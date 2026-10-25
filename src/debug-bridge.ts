@@ -117,11 +117,12 @@ export interface DebugBridgeDeps {
   /** `skills` 服务；缺席时「技能」返回空列表而不是报错。 */
   skills?: SkillsShape | null
   /**
-   * 把会话 id 解析成技能作用域（agent 对象）。
+   * 把会话 id 解析成作用域（agent 对象）。
    *
    * 由装配层注入（它拿得到 `agents` 服务）。返回 `undefined` 表示该会话没有活 agent，
-   * 此时技能按全局视角列举——**不要**编造一个 scope，那会让 `skills` 服务去查一条
-   * 不存在的层链。
+   * 此时技能按全局视角列举、工具面也按全局视角列出——**不要**编造一个 scope，那会让
+   * `skills` 服务去查一条不存在的层链、`tools.schemas()` 查一个空作用域（会话级
+   * MCP 工具全部消失）。
    */
   skillScopeOf?: (sessionId: string) => unknown
   /** 执行器（由装配层持有，取消表跨请求共享）。 */
@@ -365,11 +366,11 @@ async function readSkillBody(
  * 安装调试路由；返回 disposer（随 fiber 可逆清理，父工作区 AGENTS.md 第 6 条）。
  *
  * 路由清单：
- * - `GET  /project-mcp/debug/api/tools`   —— 工具面（全量，前端本地分组/搜索）
- * - `POST /project-mcp/debug/api/call`    —— 执行一次工具调用
+ * - `GET  /project-mcp/debug/api/tools?session=`   —— 工具面（会话视角；全量，前端本地分组/搜索）
+ * - `POST /project-mcp/debug/api/call`    —— 执行一次工具调用（body 带同一 `session`）
  * - `POST /project-mcp/debug/api/cancel`  —— 取消在途调用
  * - `GET  /project-mcp/debug/api/prompt-sections` —— 当前提示词 section
- * - `GET  /project-mcp/debug/api/skills`  —— 技能目录（摘要，不含本机路径）
+ * - `GET  /project-mcp/debug/api/skills?session=`  —— 技能目录（会话视角；摘要，不含本机路径）
  * - `GET  /project-mcp/debug/api/skill?name=<技能名> —— 单个技能的正文
  */
 export function installDebugBridge(webServer: DebugWebServerShape, deps: DebugBridgeDeps): () => void {
@@ -387,7 +388,11 @@ export function installDebugBridge(webServer: DebugWebServerShape, deps: DebugBr
         const pathname = url.pathname
 
         if (req.method === 'GET' && pathname === `${DEBUG_ROUTE_PREFIX}/api/tools`) {
-          const tools = projectTools(deps.tools.schemas())
+          // 与技能页同款：`session` 解析成 agent 当 scope，才能看见挂在
+          // `agent.ctx` 的会话级工具（`mcp__*`）。解析不到就退回全局视角。
+          const sessionId = asString(url.searchParams.get('session'))
+          const scope = sessionId === undefined ? undefined : deps.skillScopeOf?.(sessionId)
+          const tools = projectTools(deps.tools.schemas(scope))
           sendJson(res, 200, {
             ok: true,
             tools,
@@ -443,17 +448,21 @@ export function installDebugBridge(webServer: DebugWebServerShape, deps: DebugBr
               sendJson(res, 400, { ok: false, reason: 'bad-json' })
               return
             }
-            const body = parsed as { name?: unknown; arguments?: unknown; callId?: unknown }
+            const body = parsed as { name?: unknown; arguments?: unknown; callId?: unknown; session?: unknown }
             const name = asString(body.name)
             if (name === undefined) {
               sendJson(res, 400, { ok: false, reason: 'missing-name' })
               return
             }
             const callId = asString(body.callId)
+            // 与 `/api/tools` 同一个 scope：列出与执行必须同视角，"树里能看到的
+            // 就一定能调"才成立。前端把打开调试台的那个会话 id 原样带上。
+            const sessionId = asString(body.session)
+            const scope = sessionId === undefined ? undefined : deps.skillScopeOf?.(sessionId)
             // `arguments` 允许省略（等价于 `{}`），但给了就必须是 JSON 值——它已经是
             // JSON.parse 的产物，因此形状天然合法，不需要额外校验。
             void deps.executor
-              .call(deps.tools, name, body.arguments ?? {}, callId)
+              .call(deps.tools, name, body.arguments ?? {}, callId, scope)
               .then(
                 (outcome: DebugCallOutcome) => sendJson(res, 200, { ok: true, outcome }),
                 (error: unknown) => {

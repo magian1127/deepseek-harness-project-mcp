@@ -231,6 +231,74 @@ test('GET /api/tools：投影工具面并附分组（组只带名字）', async 
   assert.deepEqual(body.groups[0].tools, ['mcp__srv__shot'])
 })
 
+test('GET /api/tools：带 session 时把 agent 当 scope 传给 schemas（会话级 mcp__* 工具才会出现）', async () => {
+  const scope = { id: 'agent-object' }
+  const seen: unknown[] = []
+  let receivedSession: string | undefined
+  const { call } = harness({
+    tools: fakeTools({
+      schemas: (passed?: unknown) => {
+        seen.push(passed)
+        return [
+          { name: 'read' },
+          // 挂在 agent.ctx 的会话级 MCP 工具：全局视角看不到，scope 视角可见。
+          ...(passed === undefined ? [] : [{ name: 'mcp__godot__connect', description: '连接编辑器' }]),
+        ]
+      },
+    }),
+    skillScopeOf: sessionId => {
+      receivedSession = sessionId
+      return scope
+    },
+  })
+
+  const { status, body } = await call('GET', '/api/tools?session=sess-1')
+  assert.equal(status, 200)
+  assert.equal(receivedSession, 'sess-1', 'session 参数要交给解析函数')
+  assert.equal(seen[0], scope, 'agent 作为 scope 传进 tools.schemas')
+  assert.ok(body.tools.some((tool: any) => tool.name === 'mcp__godot__connect'), '会话级 MCP 工具必须出现')
+
+  // 不带 session：全局视角（schemas 不带参调用）。
+  const global = await call('GET', '/api/tools')
+  assert.equal(seen[1], undefined, '无 session 时不得凭空造 scope')
+  assert.ok(!global.body.tools.some((tool: any) => tool.name === 'mcp__godot__connect'), '全局视角不含会话级工具')
+
+  // 解析不到 agent：同样退回全局视角。
+  const gone = harness({
+    tools: fakeTools({
+      schemas: (passed?: unknown) => {
+        seen.push(passed)
+        return []
+      },
+    }),
+    skillScopeOf: () => undefined,
+  })
+  await gone.call('GET', '/api/tools?session=gone')
+  assert.equal(seen[2], undefined, '解析失败时按全局视角列出，不传 undefined 之外的值')
+})
+
+test('POST /api/call：body 带 session 时把 agent 传给 execute（与列出同视角）', async () => {
+  const scope = { id: 'agent-object' }
+  const executed: Array<Record<string, unknown>> = []
+  const { call } = harness({
+    tools: fakeTools({
+      execute: async input => {
+        executed.push(input as Record<string, unknown>)
+        return { isError: false, value: { content: [{ type: 'text', text: 'ok' }] } }
+      },
+    }),
+    skillScopeOf: () => scope,
+  })
+
+  const ok = await call('POST', '/api/call', { body: JSON.stringify({ name: 'mcp__godot__connect', arguments: {}, session: 'sess-1' }) })
+  assert.equal(ok.status, 200)
+  assert.equal(executed[0]!.agent, scope, 'agent 必须随执行传入，否则会话级工具报 UNKNOWN_TOOL')
+
+  // 不带 session：execute 不含 agent 字段。
+  await call('POST', '/api/call', { body: JSON.stringify({ name: 'read' }) })
+  assert.equal('agent' in (executed[1] ?? {}), false, '无 session 时 execute 不得带 agent')
+})
+
 test('GET /api/prompt-sections：正常返回 section；服务缺席/失败返回空数组（不报错）', async () => {
   const withService = harness({
     systemPrompt: {

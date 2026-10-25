@@ -108,6 +108,39 @@ test('DebugExecutor:.value 无块时回退模型面文本', async () => {
   assert.deepEqual(outcome.content, [{ type: 'text', text: 'plain' }])
 })
 
+test('DebugExecutor:scope 透传——有 scope 时作为 agent 传入，无 scope 时 execute 不含 agent 字段', async () => {
+  const scope = { id: 'agent-object' }
+  const executed: Array<Record<string, unknown>> = []
+  const executor = new DebugExecutor(() => 0)
+
+  await executor.call(
+    fakeTools({
+      execute: async input => {
+        executed.push(input as Record<string, unknown>)
+        return { isError: false, value: { content: [] } }
+      },
+    }),
+    'mcp__godot__connect',
+    {},
+    'call-scope',
+    scope,
+  )
+  assert.equal(executed[0]!.agent, scope, 'agent scope 必须传给 execute（会话级工具的可执行性取决于它）')
+
+  await executor.call(
+    fakeTools({
+      execute: async input => {
+        executed.push(input as Record<string, unknown>)
+        return { isError: false, value: { content: [] } }
+      },
+    }),
+    'read',
+    {},
+    'call-global',
+  )
+  assert.equal('agent' in executed[1]!, false, '无 scope 时不得给 execute 塞 agent 字段')
+})
+
 test('DebugExecutor:失败调用带错误消息，消息为空时给固定文案', async () => {
   const executor = new DebugExecutor(steppedClock())
   const explicit = await executor.call(

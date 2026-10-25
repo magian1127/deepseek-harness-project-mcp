@@ -778,8 +778,9 @@ export function apply(ctx: HostContext, config: unknown): void {
           tools,
           systemPrompt: promptService,
           skills: skillsService,
-          // 技能按 scope 分层：把会话 id 解析成 agent 当 scope，才能看见该会话专属的
-          // 技能（如 agent preset 用 customSkillDirs 声明的那些）。解析不到就退回全局视角。
+          // 技能与工具面都按 scope 分层：把会话 id 解析成 agent 当 scope，才能
+          // 看见该会话专属的技能（agent preset 的 customSkillDirs）与会话级 MCP
+          // 工具（挂在 agent.ctx 的 `mcp__*`）。解析不到就退回全局视角。
           skillScopeOf: sessionId => {
             try {
               const agent = ctx.get('agents')?.get?.(sessionId) as AgentShape | undefined

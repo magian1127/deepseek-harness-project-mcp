@@ -14,8 +14,10 @@
  *
  * ## 与 Host 的契约（`src/debug-bridge.ts`）
  *
- * - `GET  /project-mcp/debug/api/tools`            → `{ ok, tools, groups }`
+ * - `GET  /project-mcp/debug/api/tools?session=`   → `{ ok, tools, groups }`
+ *   （`session` 解析成 agent 作用域——会话级 MCP 工具 `mcp__*` 才会出现）
  * - `POST /project-mcp/debug/api/call`             → `{ ok, outcome }`
+ *   （body 带同一 `session`：列出与执行同视角，树里能看到的就一定能调）
  * - `POST /project-mcp/debug/api/cancel`           → `{ ok, cancelled }`
  * - `GET  /project-mcp/debug/api/prompt-sections`  → `{ ok, sections }`
  *
@@ -1040,7 +1042,10 @@ window.__ModuleLoader__.load({
 
       const refresh = React.useCallback(() => {
         setLoading(true)
-        debugGet('/api/tools')
+        // 带上 `session`：Host 按 agent 作用域列工具，挂在 agent.ctx 的会话级
+        // MCP 工具（mcp__*）才会出现；无会话则退回全局视角。
+        const session = sessionId ? '?session=' + encodeURIComponent(sessionId) : ''
+        debugGet('/api/tools' + session)
           .then(body => {
             setTools(body.tools || [])
             setGroups(body.groups || [])
@@ -1052,7 +1057,7 @@ window.__ModuleLoader__.load({
             setToolsError(cause && cause.message ? cause.message : String(cause))
           })
           .finally(() => setLoading(false))
-      }, [])
+      }, [sessionId])
 
       React.useEffect(() => {
         setHistory(loadHistory())
@@ -1062,7 +1067,8 @@ window.__ModuleLoader__.load({
       const runCall = (name, args) => {
         const callId = 'twb-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8)
         setRunning({ callId, name })
-        debugPost('/api/call', { name, arguments: args, callId })
+        // `session` 与工具列表同一个会话：列出与执行必须同视角（见 debug-bridge）。
+        debugPost('/api/call', { name, arguments: args, callId, ...(sessionId ? { session: sessionId } : {}) })
           .then(body => {
             const outcome = body.outcome
             setResult(outcome)

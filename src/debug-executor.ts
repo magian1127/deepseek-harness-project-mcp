@@ -5,16 +5,19 @@
  * 逐条对齐（`packages/core/tools/src/index.ts` 的 `ToolExecutionInput`）：
  * `callId` / `name` / `arguments` / `signal` 四项必填，`agent` 可选。
  *
- * ## 为什么不传 `agent`
+ * ## scope：列出与执行必须同传
  *
- * `agent` 决定的是**作用域可见性**（同一份工具面在 agent scope 内可能有
- * restrict 补丁，见 `tools.restrict`）。控制台是旁路调试面：它从宿主全局视角
- * 列出工具（`schemas()` 不带 scope），调用时也不带 scope——这样"树里能看到的
- * 就一定能调"，不会出现"列表里有、点了报 UNKNOWN_TOOL"的错位。
+ * 宿主 `tools` 服务按 **scope 分层**：`schemas()` 无参只返回全局层，挂在
+ * `agent.ctx` 的工具（会话级 MCP——如 Godot 接入层挂载的 `mcp-client`——注册的
+ * `mcp__*` 工具正是这一类）在全局视角里不可见、也不可执行。调试台是**会话视图**，
+ * 能拿到 `sessionId`，因此列出（`schemas(scope)`）与执行（`execute({ agent })`）
+ * 传**同一个** scope——"树里能看到的就一定能调"这一不变量因此保持成立，只是
+ * 视角从全局换成了该会话。
  *
- * 代价是：agent 作用域内的 deny 补丁**不**作用于调试台。这是有意取舍——调试台
- * 的全部价值就是看见并触碰真实的工具面，绕过会话级限制由用户自己承担（它是本机
- * 回环 + nonce 双闸门后的手动入口，不是模型可自主触发的路径）。
+ * 代价是：agent 作用域内的 deny 补丁**不**作用于调试台（scope 传的是 agent 本身，
+ * 不是模型的 restrict 视角）。这是有意取舍——调试台的全部价值就是看见并触碰
+ * 真实的工具面，绕过会话级限制由用户自己承担（它是本机回环 + 同源围栏后的
+ * 手动入口，不是模型可自主触发的路径）。
  *
  * ## 安全边界
  *
@@ -57,12 +60,15 @@ export class CallIdConflictError extends Error {}
 
 /** 宿主 `tools` 服务的最小鸭子类型（不 import `@deepseek-ai/*`，红线 1）。 */
 export interface DebugToolsShape {
-  schemas(): Array<{ name: string; description?: string; parameters?: unknown }>
+  /** `scope` 是查看作用域（agent 对象）；缺省 = 全局视角。 */
+  schemas(scope?: unknown): Array<{ name: string; description?: string; parameters?: unknown }>
   execute(input: {
     callId: string
     name: string
     arguments: unknown
     signal: AbortSignal
+    /** 执行作用域（agent 对象）；缺省 = 全局视角。必须与列出时的 scope 一致。 */
+    agent?: unknown
   }): Promise<{
     isError: boolean
     value?: unknown
@@ -148,6 +154,7 @@ export class DebugExecutor {
     name: string,
     args: unknown,
     clientCallId?: string,
+    scope?: unknown,
   ): Promise<DebugCallOutcome> {
     let callId: string
     if (typeof clientCallId === 'string' && clientCallId !== '') {
@@ -162,7 +169,7 @@ export class DebugExecutor {
     this.active.set(callId, controller)
     const started = this.now()
     try {
-      const result = await tools.execute({ callId, name, arguments: args, signal: controller.signal })
+      const result = await tools.execute({ callId, name, arguments: args, signal: controller.signal, ...scope === undefined ? {} : { agent: scope } })
       const durationMs = this.now() - started
       if (result.isError) {
         const text = contentText(result.content)
