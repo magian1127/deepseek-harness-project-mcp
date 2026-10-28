@@ -109,7 +109,7 @@ Host（index.ts 装配）
   └─ agent/created      同步：登记 + 对已授权服务器 fire-and-forget 挂载；**不 await 任何 I/O 结果**
 Client（client.js，plain JS）
   ├─ conversation.input.left  按钮 + 内联锚定弹层（sessionId 由注册项 inject 注入）
-  └─ fetch('/project-mcp/…')  status 轮询（1.5s）+ start/revoke（nonce 头）
+  └─ fetch('/project-mcp/…')  status 轮询（1.5s）+ start/revoke（同源 fetch，无 nonce）
 ```
 
 ### 4.1 Host 状态中心
@@ -145,6 +145,14 @@ Client（client.js，plain JS）
   warn。**不**提供无认证 HTTP 路由兜底——那会让本机任意进程触发 `.mcp.json` 里的命令。
 - 解析可行性是实现的**第一个验证点**（spike）：profile 的 node_modules 能否解析到
   typert-protocol。不可行则回到评审，改选通道（不自行发明）。
+- **路由准入**（2026-10-28 修订）：`/project-mcp/status` / `start` / `revoke` 的全部请求先过
+  同源三重围栏（`src/same-origin.ts` 的 `requestAllowed`：peer 回环 + `Host` 白名单 +
+  `sec-fetch-site`/`Origin`），拒则 `403 {ok:false, reason}`。这**不是**匿名面：围栏沿用宿主对
+  插件自注册路由既有的信任模型（loopback Host 即过），跨站请求与 DNS rebinding 都在它之外。
+  它与「工具调试」Tab 是**同一套**准入，**不是** boot 级 nonce：nonce 依赖 `webServer.tapIndex`
+  把 `<meta>` 注入页面，而桌面版（Electron）的页面文档由 shell 的 `serveWebDocument()` 直读
+  打包 dist、不经 Host 的 `renderIndex()`，`tapIndex` 在那里**永不执行**——桌面版会因此每个
+  请求 403、按钮静默消失（Web 版正常）。判据与教训见 [`behavior.md` §7A.5](behavior.md)。
 
 ### 4.4 Client 半边
 
@@ -234,7 +242,7 @@ unauthorized ──start──> starting ──ok──> connected
 | env 值不入日志/错误/会话 | 诊断口径不变；UI 同口径 |
 | 指纹绑定防 git-pull | 升级为 per-server configHash，语义更强 |
 | 挂载不 await 连接、失败不抛 | 红线 4/5 原样保留 |
-| Remote 通道认证 | 继承宿主连接既有认证（peer principal）；不新增匿名面 |
+| 控制台路由的准入 | 全部 `/project-mcp/*` 请求（按钮的 status/start/revoke + 调试台）过同源三重围栏：peer 回环 + `Host` 白名单 + `sec-fetch-site`/`Origin`；**不用 nonce**（桌面版 `tapIndex` 永不执行）。`start`/`revoke` 会写信任记录并 spawn 进程，因此围栏不设例外 |
 
 ## 8 测试策略
 

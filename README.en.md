@@ -245,13 +245,18 @@ Behavior notes:
   `dsh-project-mcp-tool-debug-history`, at most 50 entries). It is never reported anywhere and never
   written to the host; tool results travel only in that HTTP response to the current page, and the
   host keeps no call log.
-- **Admission to the debug console**: every `/project-mcp/debug/*` request passes the same-origin
-  fence — the peer must be a loopback address, `Host` must be a local authority, `sec-fetch-site`
-  may only be `same-origin` / `none`, and an `Origin` (when present) must match `Host`. It can
-  execute any registered tool, so it is meant for the loopback GUI only.
-  > This route does **not** use a nonce: nonces depend on `tapIndex` injecting a meta tag into the
-  > page, and that injection does not take effect in the real composition (measured 2026-10-24:
-  > copying the nonce scheme made every request 403 and the tool surface always empty).
+- **Admission to the console routes**: the MCP console's `/project-mcp/status` / `start` / `revoke`
+  and the Tool Debug tab's `/project-mcp/debug/*` use the **same** same-origin fence — the peer must
+  be a loopback address, `Host` must be a local authority, `sec-fetch-site` may only be
+  `same-origin` / `none`, and an `Origin` (when present) must match `Host`. **Desktop and Web behave
+  identically**, and neither depends on injecting anything into the page.
+  > These routes do **not** use a nonce: nonces depend on `tapIndex` injecting a meta tag into the
+  > page. That made the debug console return 403 for every request on 2026-10-24 (its tool surface
+  > was always empty), and it made the console button disappear entirely on the 2026-10-28 desktop
+  > build (the desktop page is served straight from the packaged bundle by the Electron shell, never
+  > through the host renderer, so `tapIndex` never runs there). The fence already blocks cross-site
+  > requests and DNS rebinding; a nonce would not keep anyone extra out.
+  > The debug console can execute any registered tool, so it is meant for the loopback GUI only.
 
 ## Known limitations
 
@@ -280,7 +285,7 @@ dsh plugin --profile web remove deepseek-harness-project-mcp
 ```
 
 Uninstalling reclaims the project-level MCP mounts and every console registration it created in
-live sessions (routes, page injection, listeners), and never deletes DSH session data. `${DSH_HOME:-~/.dsh}/project-mcp-trust.json` is kept, so
+live sessions (routes, listeners), and never deletes DSH session data. `${DSH_HOME:-~/.dsh}/project-mcp-trust.json` is kept, so
 approvals survive a reinstall. To remove it too, delete that file yourself once no other project
 still needs the record.
 

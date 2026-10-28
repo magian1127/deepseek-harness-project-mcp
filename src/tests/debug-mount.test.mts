@@ -95,14 +95,14 @@ test('apply：tools 与 webServer 都在场时挂上 MCP 控制台与调试台�
   const paths = mock.paths()
   assert.ok(paths.includes('/project-mcp'), `缺 MCP 控制台路由，实际：${paths.join(', ')}`)
   assert.ok(paths.includes('/project-mcp/debug'), `缺调试台路由，实际：${paths.join(', ')}`)
-  // nonce 经 tapIndex 注入页面：两座桥共用同一个 meta，只注入一次。
-  assert.equal(mock.taps.length, 1, 'nonce meta 应只注入一次（两座桥共用）')
-  const html = mock.taps[0]!('<head></head>')
-  assert.match(html, /name="dsh-project-mcp-nonce"/)
+  // 两座桥都不做页面注入：准入是同源围栏，客户端不需要任何 meta/凭据头。
+  // 这是桌面版（Electron 直读打包 dist，tapIndex 永不执行）修复后的回归守护：
+  // 一旦有人把 tapIndex 注入加回来，这里立刻变红。
+  assert.equal(mock.taps.length, 0, '两座桥都不得注册 tapIndex 注入')
 
   mock.runDisposers()
   assert.deepEqual(mock.paths(), [], '插件卸载后路由必须全部注销')
-  assert.equal(mock.taps.length, 0, '插件卸载后 nonce 注入必须撤销')
+  assert.equal(mock.taps.length, 0, '卸载后仍不得有任何注入残留')
 })
 
 test('apply：tools 服务缺席时不挂调试台（没有工具面可调试）', () => {

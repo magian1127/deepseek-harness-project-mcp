@@ -33,6 +33,7 @@
 | 已批准，但工具列表里没有 `mcp__<名称>__*` | 本会话没挂上：别的会话批准后本会话才打开，或插件在会话存活期间被换血。弹层把它显示为 `本会话未挂载` 并计入徽标——点 [启动] 即在本会话挂上 |
 | 服务器已挂载但工具报连接失败 | MCP 服务器自身的启动或握手失败。挂载刻意不等待连接（会话秒开），失败只记日志，不影响会话。**该服务器会立即从挂载记账移除**，控制台把它显示为 `失败` 并计入徽标。查 DSH 日志与该服务器的 `command` / `url` 是否可手动执行 |
 | 输入区没有控制台按钮 | 工作区没有 `.mcp.json`（正常），或 Client 半边未供应（**首次**供应需要重启一次 DSH——宿主模块表按进程缓存"非 client 包"），或该 profile 没有 `webServer`（headless / SDK，无控制台） |
+| **桌面版**看不到输入区 MCP 按钮，**Web 版正常** | 旧构建的控制台路由用 boot 级 nonce，而桌面版页面文档由 Electron shell 直读打包 dist、`tapIndex` 永不执行 → `GET /project-mcp/status` 403 → 按钮静默隐藏。判据与修复见下"桌面版看不到按钮" |
 | 按钮在但弹层打不开 / 状态一直是转圈 | 桥接路由未装上（`webServer` 晚于插件出现时有秒级重试，理论上自愈）；或 Client 半边是旧构建。查 DSH 日志，必要时删除 → 安装本插件换血 |
 | 控制台弹层里出现"无法解析" | `.mcp.json` 不是合法 JSON、顶层不是对象，或 `mcpServers` 不是对象。修文件后弹层会在下次轮询自动更新 |
 | 控制台弹层里出现"过大" | `.mcp.json` 超过 1 MiB，被**拒读**（没读进内存，也没挂载）。诊断给出实测大小与上限。这是有意的尺寸闸门：读盘在会话创建的同步路径上，无上限会让陌生仓库里的异常大文件拖住会话创建。精简该文件（真实的 `.mcp.json` 只需声明服务器列表，远小于 100 KiB）后重新批准 |
@@ -54,6 +55,44 @@
 | 明明写了 `serve`，日志却说"没有 serve 配置" | 该 `serve` 被丢弃了（畸形）。同一次会话创建里应有一条 `serve 配置已被忽略` 日志说明是哪个字段 |
 
 ## 按症状诊断
+
+### 桌面版看不到按钮（Web 版正常）
+
+**症状**：同一份 `.mcp.json`、同一个项目，Web 版（`dsh web`）的输入区有「项目 MCP」按钮，
+桌面版（Electron）里没有；而同一插件的「工具调试」Tab 两边都在。看起来像"这个项目没有
+项目级 MCP"。
+
+**根因（旧构建）**：控制台路由当时用 boot 级 nonce 鉴权——`webServer.tapIndex()` 把
+`<meta name="dsh-project-mcp-nonce">` 注入页面，路由校验 `x-project-mcp-nonce` 头。但桌面版的
+**应用页面不经过 Host 渲染**：`apps/desktop/src/main.ts` 的 `protocol.handle` 用
+`serveWebDocument()` 直接读打包 dist 的 `/`、`/index.html`、`/assets/*`，只额外注入 boot
+脚本；结构化注入行走 IPC（desktop-host 在 ready 消息里发 `collectIndexInjections(peer)`）。
+而 `packages/host/webserver` 的 `renderIndex()`（含 `applyIndexTaps`）**只有 Web 版的
+frontend-static 走这条路**，`collectIndexInjections()` 又只收结构化 rows、不含 `tapIndex` 的
+原始变换。于是 `tapIndex` 在桌面版**永不执行** → 页面里没有那个 meta → Client 读到空串 →
+`GET /project-mcp/status` 一律 403 → `view=null` → 按钮直接不渲染。调试台不用 nonce，
+所以它照常可用——这就是"只有按钮不见"的原因。
+
+**判据**：`GET /project-mcp/status` 返回 **403** 即命中本问题（浏览器 DevTools 的 Network 里
+能直接看到；或在本机用下面的命令探测）。**端口按实际值替换**：Web 版默认 `3080`；桌面版
+端口由系统分配（`--port 0`，旧版曾固定 `19387`），从桌面进程的 `DSH_WEB_URL` 环境变量或
+它的监听端口取，不要写死。`<会话 id>` 换成页面地址里的会话 id。
+
+```powershell
+curl.exe -s -o NUL -w "%{http_code}" "http://127.0.0.1:<端口>/project-mcp/status?session=<会话 id>"
+```
+
+这条只打印状态码（`403` / `400` / `200`）。
+
+判读：**403** → 命中本问题；**400**（`missing-session`）→ 围栏已经通过，只是没带会话参数；
+**200** → 路由与准入都正常，问题在别处（会话不可寻址时 `view` 为空，见
+[`behavior.md`](behavior.md) §7.3）。
+
+**修复**：控制台路由已改为**同源三重围栏**（与本插件「工具调试」Tab 完全同一套，唯一实现是
+`src/same-origin.ts` 的 `requestAllowed`），不再读 nonce、也不再注册 `tapIndex`（2026-10-28）。
+带该修复的构建上桌面版与 Web 版行为一致：按钮正常渲染，`/project-mcp/status` 不再因缺少
+页面注入而 403。修复要真正生效，运行进程必须加载新构建（Host 半边换血走官方插件页
+删除 → 安装，见上文快速分流第 3 条）；磁盘上的 `lib/` 不是运行时生效的证据。
 
 ### 工具没出现
 
@@ -217,7 +256,7 @@ JSON 损坏、`version` 不是 `2`（含 v1 旧文件，**不迁移**）、`proj
 | 项目级 MCP 行 | **不出现**在 Loader 里——项目服务器按会话挂在 agent 作用域，不在 profile 树里 |
 | 工具面 | 已批准的项目服务器提供 `mcp__<规范名>__<工具名>` |
 | 全局行 | 若 profile 里仍有 MCP 行，它们与项目服务器是两套；它们挂载得比任何会话都早 |
-| 控制台面 | 输入区按钮渲染（Client 半边已供应）、`/project-mcp/status` 路由可达（nonce 头来自页面 meta） |
+| 控制台面 | 输入区按钮渲染（Client 半边已供应）、`/project-mcp/status?session=…` 对同源请求返回 200。准入是**同源三重围栏**（与调试台共用 `src/same-origin.ts`），**不依赖任何页面注入**；403 说明围栏拒绝，400 说明围栏已过但缺会话参数 |
 | 信任文件 | `${DSH_HOME:-~/.dsh}/project-mcp-trust.json`，权限 `0600`，**version 2**，不含 `.mcp.json` 内容 |
 | `serve` 拉起的服务进程 | 命令行 = `serve.command` + `serve.args`（**没有** `--project-mcp-session` 标记——那是 stdio 条目的子进程才有的），父进程已退出或与 DSH 无关 |
 | DSH 进程自身 | 不在 Windows Job 对象里（脱离能生效的前提）；若被放进 Job（如由 IDE 或计划任务启动），服务可能随 DSH 退出。脱离手段按平台与命令不同：POSIX 用 `detached`；Windows 上对 PowerShell **不用**（用了会让它静默空转），其余命令仍用，见 [`design-http-serve.md` §4.3](design-http-serve.md) |

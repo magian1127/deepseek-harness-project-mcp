@@ -126,7 +126,7 @@ export default class FakeMcpClient {
 const { apply, inject } = await import('../index.js')
 const { approve, configHashOf, trustStorePath } = await import('../trust.js')
 const { normalizeServerName } = await import('../translate.js')
-const { CONSOLE_ROUTE_PREFIX, NONCE_HEADER, NONCE_META_NAME } = await import('../console-bridge.js')
+const { CONSOLE_ROUTE_PREFIX } = await import('../console-bridge.js')
 
 interface Project {
   root: string
@@ -182,7 +182,7 @@ interface ConsoleViewLike {
 }
 
 function createHarness(
-  options: { loader?: unknown; withWebServer?: boolean; nonceHeader?: string } = {},
+  options: { loader?: unknown; withWebServer?: boolean; consolePeer?: string } = {},
 ) {
   const withWebServer = options.withWebServer ?? true
   const listeners = new Map<string, Set<(payload: unknown) => void>>()
@@ -202,9 +202,10 @@ function createHarness(
   const sections: SectionRecord[] = []
   /** 活 agent 注册表：桥接的 `viewFor` / `start` 经 `ctx.get('agents').get(id)` 取会话。 */
   const agentsById = new Map<string, unknown>()
-  /** 假 webServer 捕获的路由与 index 变换（控制台桥接的安装面）。 */
+  /** 假 webServer 捕获的路由（控制台桥接的安装面）。 */
   const routes: Array<{ path: string; handler: (req: never, res: never) => void }> = []
-  let indexTransform: ((html: string) => string) | null = null
+  /** `tapIndex` 注册次数：两座桥都**不得**再注册（桌面版 tapIndex 永不执行）。 */
+  let tapRegistrations = 0
 
   const webServerFake = {
     register(route: { kind: string; path: string; handler: (req: never, res: never) => void }) {
@@ -214,9 +215,9 @@ function createHarness(
         if (at >= 0) routes.splice(at, 1)
       }
     },
-    tapIndex(transform: (html: string) => string) {
-      indexTransform = transform
-      return () => { indexTransform = null }
+    tapIndex(_transform: (html: string) => string) {
+      tapRegistrations += 1
+      return () => { tapRegistrations -= 1 }
     },
   }
 
@@ -297,22 +298,24 @@ function createHarness(
 
   return {
     host, logs, pluginCalls, fibers, sections, makeAgent,
+    /** `tapIndex` 当前注册数（两座桥都应为 0）。 */
+    tapRegistrations: () => tapRegistrations,
     /**
      * 控制台桥接的调用面：命令面删除后，批准 / 撤销 / 查询的唯一入口。
      *
      * 刻意走**真实路由**（假 req/res 打到捕获的 handler），而不是直接调内部函数：
-     * nonce 校验、路由分派、视图序列化因此都在观测范围内——把路由名或头名改错，
-     * 这些用例立刻变红。
+     * 围栏判定、路由分派、视图序列化因此都在观测范围内——把路由名改错、或把准入
+     * 从同源围栏改回别的机制，这些用例立刻变红。
+     *
+     * 假请求默认构造"浏览器同源"形态（回环 peer + 本机 `Host`），与真实页面一致。
      */
     consoleApi: () => {
-      const html = indexTransform !== null ? indexTransform('<html><head></head></html>') : ''
-      const nonce =
-        new RegExp(`name="${NONCE_META_NAME}" content="([^"]+)"`).exec(html)?.[1] ?? ''
       const call = (
         method: 'GET' | 'POST',
         path: string,
         body?: Record<string, unknown>,
-        headers: Record<string, string> = { [NONCE_HEADER]: nonce },
+        headers: Record<string, string> = { host: '127.0.0.1:3080' },
+        remoteAddress: string = options.consolePeer ?? '127.0.0.1',
       ): Promise<{ status: number; body: { ok: boolean; view?: unknown; reason?: string } | null }> =>
         new Promise((resolve, reject) => {
           const route = routes.find(item => item.path === CONSOLE_ROUTE_PREFIX)
@@ -321,6 +324,7 @@ function createHarness(
           req.method = method
           req.url = path
           req.headers = headers
+          req.socket = { remoteAddress }
           req.destroy = () => {}
           let statusCode = 0
           const res = {
@@ -335,7 +339,6 @@ function createHarness(
           req.emit('end')
         })
       return {
-        nonce,
         status: (session: string) =>
           call('GET', `${CONSOLE_ROUTE_PREFIX}/status?session=${encodeURIComponent(session)}`),
         start: (session: string, server: string) =>
@@ -429,6 +432,58 @@ test('ctx.get(loader) 传的是 Loader 本体：全局撞名项被跳过', async
     ['free'],
     '与全局行同名的项必须被跳过；传 root 会让这份名单变成空集',
   )
+})
+
+test('控制台路由准入：同源浏览器形态放行，非回环/跨站/异源一律 403（且不注册 tapIndex）', async () => {
+  const project = makeProject({ alpha: { command: 'node' } })
+  const harness = createHarness()
+  apply(harness.host as never, {})
+  const agent = harness.makeAgent(project)
+  await harness.fire('agent/created', { agent })
+  const api = harness.consoleApi()
+
+  // 真实页面的形态：同源 fetch 不带任何凭据头。这条断言守护 2026-10-28 的桌面版修复
+  // ——桌面（Electron）文档不经 Host 渲染，`tapIndex` 永不执行，任何"页面注入凭据"
+  // 都会让请求 403、输入区按钮静默消失。把 nonce 机制加回来这里立刻变红。
+  const ok = await api.status(agent.id)
+  assert.equal(ok.status, 200, '同源请求必须放行')
+  assert.equal(harness.tapRegistrations(), 0, '两座桥都不得注册 tapIndex 注入')
+
+  const remote = await api.raw(
+    'GET',
+    `${CONSOLE_ROUTE_PREFIX}/status?session=${encodeURIComponent(agent.id)}`,
+    undefined,
+    { host: '127.0.0.1:3080' },
+    '10.0.0.7',
+  )
+  assert.equal(remote.status, 403, '非回环 peer 必须拒绝')
+  assert.equal(remote.body?.reason, 'loopback-only')
+
+  const rebound = await api.raw(
+    'GET',
+    `${CONSOLE_ROUTE_PREFIX}/status?session=${encodeURIComponent(agent.id)}`,
+    undefined,
+    { host: 'evil.example:3080' },
+  )
+  assert.equal(rebound.status, 403, 'DNS rebinding（非本机 Host）必须拒绝')
+  assert.equal(rebound.body?.reason, 'loopback-only')
+
+  const crossSite = await api.raw(
+    'GET',
+    `${CONSOLE_ROUTE_PREFIX}/status?session=${encodeURIComponent(agent.id)}`,
+    undefined,
+    { host: '127.0.0.1:3080', 'sec-fetch-site': 'cross-site' },
+  )
+  assert.equal(crossSite.status, 403, '跨站浏览器请求必须拒绝')
+  assert.equal(crossSite.body?.reason, 'same-origin-only')
+
+  const otherOrigin = await api.raw(
+    'GET',
+    `${CONSOLE_ROUTE_PREFIX}/status?session=${encodeURIComponent(agent.id)}`,
+    undefined,
+    { host: '127.0.0.1:3080', origin: 'http://evil.example' },
+  )
+  assert.equal(otherOrigin.status, 403, '异源 Origin 必须拒绝')
 })
 
 test('重复启动只挂载一次（幂等）：批准走控制台，挂载层自己保证幂等', async () => {

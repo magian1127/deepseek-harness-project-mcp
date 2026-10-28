@@ -21,10 +21,13 @@
  * - `POST /project-mcp/debug/api/cancel`           → `{ ok, cancelled }`
  * - `GET  /project-mcp/debug/api/prompt-sections`  → `{ ok, sections }`
  *
- * 所有请求都走**同源 fetch**；鉴权靠 Host / Origin / sec-fetch-site 三重同源围栏
- * （详见 `src/debug-bridge.ts` 模块头）。调试台**刻意不读 nonce meta**：那套
- * `tapIndex` 页面注入在真实组合里不生效，照抄会让每个请求都 403（2026-10-24 真机
- * 踩到过——Tab 能打开但工具面永远是 0）。MCP 控制台按钮那条链路仍用 nonce。
+ * 所有请求都走**同源 fetch**；两座桥的准入都是 `same-origin.ts` 的同源三重围栏
+ * （peer 回环 + Host 白名单 + `sec-fetch-site`/`Origin`），**客户端不需要任何凭据头**。
+ *
+ * **不要再引入 nonce / meta 注入**：那套 `tapIndex` 页面注入只在 Web 版成立。桌面版
+ * （Electron）的文档由 shell 直读打包 dist（`serveWebDocument`），`tapIndex` 的原始变换
+ * 永不执行，于是 meta 恒缺席、每个请求 403——2026-10-24 让调试台工具面变成 0，
+ * 2026-10-28 又让输入区「项目 MCP」按钮在桌面上静默消失（`view` 永远为 null）。
  *
  * ## 契约要点（不要在这里折叠业务语义）
  *
@@ -44,18 +47,18 @@ window.__ModuleLoader__.load({
     const h = React.createElement
 
     const NS = 'deepseek-harness-project-mcp'
-    const NONCE_META = 'dsh-project-mcp-nonce'
-    const NONCE_HEADER = 'x-project-mcp-nonce'
     const ROUTE = '/project-mcp'
     const DEBUG = '/project-mcp/debug'
 
-    let cachedNonce
-    function nonce() {
-      if (cachedNonce === undefined) {
-        const meta = document.querySelector('meta[name="' + NONCE_META + '"]')
-        cachedNonce = meta ? meta.getAttribute('content') || '' : ''
-      }
-      return cachedNonce
+    /**
+     * 请求被围栏拒掉时只告警一次：把它和"本项目没有项目级 MCP"区分开，
+     * 否则一次 403 会让按钮和真·无 MCP 一样静默消失（2026-10-28 桌面版踩过）。
+     */
+    let warnedStatusFailure = false
+    function warnStatusFailure(status) {
+      if (warnedStatusFailure) return
+      warnedStatusFailure = true
+      console.warn('[project-mcp] /status 请求被拒（HTTP ' + status + '），输入区按钮将不显示')
     }
 
     const token = name => 'var(--dsw-alias-' + name + ')'
@@ -138,9 +141,13 @@ window.__ModuleLoader__.load({
             return
           }
           try {
-            const res = await fetch(ROUTE + '/status?session=' + encodeURIComponent(sessionId), {
-              headers: { [NONCE_HEADER]: nonce() },
-            })
+            const res = await fetch(ROUTE + '/status?session=' + encodeURIComponent(sessionId))
+            if (!res.ok) {
+              // 围栏/网络层失败 ≠ 本项目没有 MCP：保留既有视图（无视图仍隐藏），但留下告警。
+              warnStatusFailure(res.status)
+              if (!stopped) setState(s => ({ view: s.view, loading: false }))
+              return
+            }
             const data = await res.json()
             if (!stopped) setState({ view: data && data.ok ? data.view ?? null : null, loading: false })
           } catch {
@@ -160,7 +167,7 @@ window.__ModuleLoader__.load({
     async function post(path, sessionId, serverName) {
       const res = await fetch(ROUTE + path, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', [NONCE_HEADER]: nonce() },
+        headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ session: sessionId, server: serverName }),
       })
       return res.json()

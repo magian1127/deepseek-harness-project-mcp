@@ -9,12 +9,16 @@
  * 要走 generator 的静态分析管线（"Remote methods require TypertRemoteService or
  * bindTypertRemote"），对第三方插件的可行性未证实，不为它冒险。
  *
- * ## 认证：boot 级 nonce（比 zcode 的裸路由严一档）
+ * ## 认证：同源三重围栏（与 `debug-bridge.ts` 共用 `same-origin.ts`）
  *
- * `start` / `revoke` 会**写信任记录并 spawn 进程**，不能让本机任意进程调用。nonce 在 apply
- * 时生成，经 `webServer.tapIndex` 以 `<meta>` 注入 GUI 页面；只有真正拿到页面（即已通过
- * 宿主连接认证）的 Client 才读得到它。所有路由（含只读的 status）都校验
- * `x-project-mcp-nonce` 头，不匹配一律 403。nonce 随进程生命周期，重启即换。
+ * `start` / `revoke` 会**写信任记录并 spawn 进程**，不能让浏览器跨站调用。准入判据是
+ * peer 回环 + `Host` 白名单 + `sec-fetch-site`/`Origin`（详见 `same-origin.ts` 模块头），
+ * 与被挡住的调试面完全同一套。
+ *
+ * **不要**换回 boot 级 nonce（`webServer.tapIndex` 注入 `<meta>` + 校验自定义头）。那条
+ * 通道只在 Web 版成立：桌面版（Electron）的页面文档由 `protocol.handle` 直接读打包 dist，
+ * `tapIndex` 的原始变换**永不执行**（桌面只消费结构化注入行），于是 nonce 恒缺席、
+ * 每个请求 403、输入区按钮按"本项目没有项目级 MCP"静默隐藏（2026-10-28 桌面版实测）。
  *
  * ## 红线
  *
@@ -26,6 +30,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 
 import type { ConsoleView } from './console-view.js'
+import { requestAllowed } from './same-origin.js'
 
 /** `webServer` 服务的最小鸭子类型（不 import `@deepseek-ai/*`，红线 1）。 */
 export interface WebServerShape {
@@ -34,7 +39,6 @@ export interface WebServerShape {
     path: string
     handler: (req: IncomingMessage, res: ServerResponse) => void
   }): () => void
-  tapIndex(transform: (html: string) => string): () => void
 }
 
 /** 动作结果：`reason` 只含固定文案或错误类型名。 */
@@ -49,12 +53,6 @@ export interface ConsoleBridgeDeps {
 
 /** 路由前缀。选这个名字避免与宿主及其他插件的路由相撞。 */
 export const CONSOLE_ROUTE_PREFIX = '/project-mcp'
-
-/** meta 标签名：Client 从这里读 nonce。 */
-export const NONCE_META_NAME = 'dsh-project-mcp-nonce'
-
-/** 请求头上送 nonce。 */
-export const NONCE_HEADER = 'x-project-mcp-nonce'
 
 const MAX_BODY_BYTES = 64 * 1024
 
@@ -92,20 +90,20 @@ function asString(value: unknown): string | undefined {
 }
 
 /**
- * 安装路由与 nonce meta；返回 disposer（随 fiber 可逆清理，父工作区 AGENTS.md 第 6 条）。
+ * 安装控制台路由；返回 disposer（随 fiber 可逆清理，父工作区 AGENTS.md 第 6 条）。
  */
 export function installConsoleBridge(
   webServer: WebServerShape,
   deps: ConsoleBridgeDeps,
-  nonce: string,
 ): () => void {
   const unregisterRoute = webServer.register({
     kind: 'prefix',
     path: CONSOLE_ROUTE_PREFIX,
     handler: (req, res) => {
       try {
-        if (req.headers[NONCE_HEADER] !== nonce) {
-          sendJson(res, 403, { ok: false, reason: 'forbidden' })
+        const guard = requestAllowed(req)
+        if (!guard.ok) {
+          sendJson(res, 403, { ok: false, reason: guard.reason })
           return
         }
         const url = new URL(req.url ?? '/', 'http://dsh.internal')
@@ -158,14 +156,8 @@ export function installConsoleBridge(
     },
   })
 
-  const unregisterTap = webServer.tapIndex(html => {
-    const meta = `<meta name="${NONCE_META_NAME}" content="${nonce}">`
-    return html.includes('</head>') ? html.replace('</head>', `${meta}</head>`) : meta + html
-  })
-
   return () => {
     unregisterRoute()
-    unregisterTap()
   }
 }
 

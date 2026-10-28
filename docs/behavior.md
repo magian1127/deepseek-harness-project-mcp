@@ -393,6 +393,8 @@ GUI 的输入区，两个面：
 - **两条挂载入口共用同一守卫**：`agent/created` 的自动挂载与控制台的启动都走 `mountInto`
   的 Config 自校验，非法配置都拦在 `ctx.plugin()` 之前（§10）。
 - **会话不可寻址时如实回空**：桥接查不到该会话就回"无视图"，绝不编造一个状态。
+- **路由准入**：`status` / `start` / `revoke` 与「工具调试」Tab 共用**同一套**同源三重围栏
+  （见 §7A.5）；不依赖往页面注入任何东西，因此桌面版与 Web 版行为一致。
 
 ### 7.4 无 Web UI 的环境
 
@@ -495,27 +497,54 @@ headless / SDK 等没有 `webServer` 或没有 Client 的 profile 上不存在�
 - **没有 `tools` 服务的部署不装配调试路由**：那里没有工具面可调试，挂上只会永远显示空列表。
 - **没有 `webServer` 的部署**（headless / SDK）没有调试台，与 §7.4 同一条非目标。
 
-### 7A.5 准入围栏（为什么不用 nonce）
+### 7A.5 准入围栏（两座桥同一套，为什么不用 nonce）
 
-`/project-mcp/debug/*` 的每个请求都过**同源三重围栏**：
+**MCP 控制台**的 `/project-mcp/status` / `start` / `revoke` 与**工具调试台**的
+`/project-mcp/debug/*` 的每个请求都过**同一套同源三重围栏**，实现只有一份
+（`src/same-origin.ts` 的 `requestAllowed`，两座桥各自调用它）：
 
 1. peer 必须是回环地址（`127/8`、`::1`、v4-mapped）；
 2. `Host` 头必须是本机 authority（`127.0.0.1` / `localhost` / `[::1]`）；
 3. `sec-fetch-site` 只允许 `same-origin` / `none`（跨站一律拒）；
 4. 浏览器带 `Origin` 时，其 authority 必须与 `Host` 逐字相同。
 
-不满足时返回 `403`，`reason` 区分 `loopback-only` 与 `same-origin-only`，便于诊断。
+不满足时返回 `403`（body 为 `{ok:false, reason}`），`reason` 区分 `loopback-only` 与
+`same-origin-only`，便于诊断。两座桥**都不读页面里的任何 nonce**，也**都不注册**
+`webServer.tapIndex`。
 
-**为什么不用 nonce（2026-10-24 真机教训）**：调试台最初照抄了 MCP 控制台的 nonce 方案
-（`webServer.tapIndex` 把 `<meta>` 注入页面，路由校验 `x-project-mcp-nonce` 头）。结果
-Tab 能打开、但工具面**永远是 0**——页面里没有那个 meta，Client 读到空串，每个请求都被
-判 403。`tapIndex` 在真实组合里没有生效（DSH 仓库内该 API 只有测试使用者，没有任何
-shipped 插件依赖它做鉴权）。同源围栏是与会话视图本身同级的保护：能打开这个页面的人本来
-就能在页面里驱动整个会话，nonce 不会额外挡住谁，却会在注入失效时把唯一合法入口也挡掉。
+**为什么不用 nonce（两段真机教训）**：
 
-> 注意：**MCP 控制台按钮**（`console-bridge.ts`）仍用 nonce。它的问题面不同（会写信任记录
-> 并 spawn 进程），且它的失败是可见的（按钮显示为「检测中」）。若将来确认 `tapIndex` 也
-> 挡掉了按钮，应按同样思路改用同源围栏，而不是让按钮静默失效。
+- **2026-10-24，调试台**：调试台最初照抄了控制台的 nonce 方案（`tapIndex` 把 `<meta>` 注入
+  页面，路由校验 `x-project-mcp-nonce` 头）。Tab 能打开、但工具面**永远是 0**——页面里没有
+  那个 meta，Client 读到空串，每个请求都被判 403。
+- **2026-10-28，控制台按钮（桌面版首现，Web 版正常）**：桌面版（Electron）的**应用页面
+  不经过 Host 渲染**。`apps/desktop/src/main.ts` 的 `protocol.handle` 用
+  `serveWebDocument()` 直接读打包目录里 `dsh-web-frontend/dist` 的 `/`、`/index.html`、
+  `/assets/*`，只额外注入 boot 脚本；结构化注入行走 IPC（desktop-host 在 ready 消息里发
+  `webServer.collectIndexInjections(peer)`，页面侧 `applyIndexInjections()` 解释）。而
+  `packages/host/webserver` 的 `renderIndex()` = `applyIndexTaps(renderIndexInjections(...))`
+  **只有 Web 版（frontend-static）走这条路**，且 `collectIndexInjections()` 只收集结构化
+  rows、**不含** `tapIndex` 的原始变换。因此 `tapIndex` 在桌面版**永不执行**：nonce 恒缺席
+  → `GET /project-mcp/status` 403 → 页面拿到 `view=null` → 输入区按钮直接 `return null`
+  （看起来像"本项目没有 MCP"），而同一插件的「工具调试」Tab 因为不用 nonce 照常可用——
+  这正是当时用户看到的现象。
+
+同源围栏是与会话视图本身同级的保护：能打开这个页面的人本来就能在页面里驱动整个会话
+（调试台甚至能执行任意工具），nonce 不会额外挡住谁，却会在注入通道缺席时把唯一合法入口
+也挡掉。DNS rebinding 由 `Host` 白名单挡住，跨站请求由 `sec-fetch-site` + `Origin` 挡住，
+非浏览器本机进程是与页面同级的信任假设。
+
+**代价与禁忌**：`start` / `revoke` 会写信任记录并 spawn 进程，因此围栏必须始终生效——不要
+为了"本机调试方便"放宽任何一条判据（本机 curl 默认就不带 `sec-fetch-site` / `Origin`，
+本来就过）。也**不要**把 nonce 加回来：它在 Web 版能跑通，但在桌面版恒缺席。
+
+**强度差异（必须知道，别误读成"四层都在"）**：桌面版的页面请求由 Electron shell 的
+`forwardWebRequest` 转发，它在转发前**删掉** `origin`、`cookie`、`sec-fetch-site` 三个头
+（cookie 换成 shell 自己持有的 Host 凭据）。所以**桌面侧实际只剩两层**：peer 回环 +
+`Host` 白名单；`sec-fetch-site` / `Origin` 两层只在 Web 版真正生效。结论：桌面版上
+**任何本机进程**都能调 `status` / `start` / `revoke`（与「工具调试」Tab 可执行任意工具
+同一信任级别）。要收紧这条只能接入宿主自身的连接认证（cookie 或已认证 RPC），本插件
+自己拿不到那种凭据——不要用 nonce/自定义头去模拟，它们挡不住本机进程。
 
 ## 8. 与全局 MCP 行的关系
 
@@ -622,8 +651,9 @@ profile 里仍有 MCP 行时，它们在 DSH 启动时就会连接并 spawn 子�
   `agent/created` 报告两次（哪怕每次传的是不同的 agent 对象）也只挂一次。会话身份是
   id 而不是对象引用——按对象引用记账会让第二次报告建出空记账、绕过幂等判定，从而多挂
   一个实例、**多 spawn 一个命令行相同的子进程**。
-- **可逆**：挂载与桥接注册（路由、index 注入、监听器）都随会话销毁、插件卸载（含换血重载）
-  回收，两条路径各自独立且可任意顺序重复执行。会话销毁的清理同样按会话 id 定位记账。
+- **可逆**：挂载与桥接注册（路由、监听器）都随会话销毁、插件卸载（含换血重载）
+  回收，两条路径各自独立且可任意顺序重复执行；桥接**不做任何页面注入**，因此没有第二类
+  需要撤销的副作用。会话销毁的清理同样按会话 id 定位记账。
 - **控制台的"启动"立即挂载**：批准之后服务器挂进当前 agent 作用域，无需重开会话。
 - **执行不受 agent 沙箱约束**：MCP 服务器是项目提供的代码，批准后以子进程形式运行；
   这与 profile 里的全局行同性质。

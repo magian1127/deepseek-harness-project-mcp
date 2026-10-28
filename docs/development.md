@@ -36,7 +36,8 @@
 | `session.ts` | `planSessionMount`：会话 → 挂载决策（纯函数，零 I/O） | 纯函数 |
 | `session-tag.ts` | `withSessionTag`：给 stdio config 追加 `--project-mcp-session <SessionId>` 标记（返回新对象） | 纯函数 |
 | `console-view.ts` | `composeConsoleView`：计划 + 挂载记账 + serve 进行中表 → 控制台视图 | 纯函数 |
-| `console-bridge.ts` | `installConsoleBridge`：`webServer` 前缀路由（status/start/revoke）+ nonce 注入 | 注入 I/O；真实 HTTP I/O |
+| `same-origin.ts` | `requestAllowed`：两座 HTTP 桥**共用**的同源三重围栏（peer 回环 + `Host` 白名单 + `sec-fetch-site`/`Origin`），拒绝理由 `loopback-only` / `same-origin-only` | 纯函数 |
+| `console-bridge.ts` | `installConsoleBridge`：`webServer` 前缀路由（status/start/revoke），每个请求先过 `same-origin.ts` 的 `requestAllowed`（**不接收 nonce、不注册 `tapIndex`**） | 注入 I/O；真实 HTTP I/O |
 | `debug-view.ts` | 调试台纯函数投影：`parseMcpToolName` / `groupTools` / `groupIdOf` / `filterTools` / `formFields` / `buildArguments` | 纯函数 |
 | `debug-executor.ts` | `DebugExecutor`：`callId` 序列、取消表、结果块投影（`.value` 优先、图片 4 MiB 截断）、`CallIdConflictError` | 纯函数 + 注入时钟 |
 | `debug-bridge.ts` | `installDebugBridge`：`webServer` 前缀路由（tools / call / cancel / prompt-sections）+ `projectTools` / `projectGroups` 投影 | 注入 I/O；真实 HTTP I/O |
@@ -49,8 +50,8 @@ index.ts ──> session.ts ──> discovery.ts, translate.ts, trust.ts, global
    │                              │
    │                              ├──> serve.ts ──> health.ts, values.ts, config-guard.ts
    │                              └──> values.ts, types.ts
-   ├──> console-view.ts, console-bridge.ts
-   ├──> debug-bridge.ts ──> debug-executor.ts, debug-view.ts
+   ├──> console-view.ts, console-bridge.ts ──> same-origin.ts
+   ├──> debug-bridge.ts ──> debug-executor.ts, debug-view.ts, same-origin.ts
    ├──> config-guard.ts ──> types.ts
    ├──> session-tag.ts ──> types.ts
    ├──> serve.ts（ensureServeReady / spawnDetached / splitServe）
@@ -68,10 +69,13 @@ index.ts ──> session.ts ──> discovery.ts, translate.ts, trust.ts, global
 改动任何一边时保持两边同视角，否则会退回"列表里有、点了报 UNKNOWN_TOOL"或"会话级工具
 整体隐形"这两个失败形态。
 
-**调试台刻意不依赖 `console-bridge.ts`**（`docs/behavior.md` §7A.5 记了完整教训）：它用
-同源三重围栏（peer 回环 + `Host` 白名单 + `sec-fetch-site`/`Origin`）而不是 nonce。照抄
-nonce 的版本在真机上一个工具都拿不到（`tapIndex` 的 meta 注入没有生效，每个请求 403）。
-改这块之前先读那节，不要"顺手统一"成 nonce。
+**两座桥现已统一为同一围栏**（`docs/behavior.md` §7A.5 记了完整教训）：`src/same-origin.ts` 的
+`requestAllowed` 是**唯一实现**，`console-bridge.ts` 与 `debug-bridge.ts` 都调它，谁都不再自带一份
+准入逻辑。历史是两段：2026-10-24 调试台照抄 nonce 方案（`tapIndex` 注 `<meta>` + 校验自定义头），
+真机上一个工具都拿不到——`tapIndex` 在真实组合里没有生效，每个请求 403；2026-10-28 控制台按钮在
+**桌面版**（Electron）上踩同一个坑——桌面页文档由 shell 直读打包 dist、不经 Host 的 `renderIndex()`，
+`tapIndex` **永不执行**，nonce 恒缺席，按钮按"本项目没有 MCP"静默隐藏（Web 版正常）。
+改这块之前先读那节：**不要**把 nonce 加回来，也**不要**在任何一座桥里复制一份围栏逻辑。
 
 另一条同类陷阱：`apply` 里取 `tools` 服务**不能缓存到闭包里**。Cordis 服务可能晚于本插件
 就绪，缓存下来的 `undefined` 会让秒级重试永远短路、调试路由一辈子装不上；`tryInstallDebugBridge`
@@ -286,13 +290,13 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 
 | 层 | 覆盖 | 命令 |
 | --- | --- | --- |
-| 纯函数单测 | `discovery` / `translate` / `values` / `health` / `serve` / `trust` / `global-rows` / `session` / `notice` / `config-guard` / `session-tag` / `debug-view` | `npm test` |
-| 装配集成 | `plugin-smoke`（假 ctx，验证注册与清理可逆）、`commands`（注入 `CommandDeps`，验证命令输出）、`mount`（真实 fs + 假 agent ctx，验证挂载路径）、`mount-guard`（真实 fs + 假 mcp-client，验证非法 config 被拦在 `ctx.plugin()` 之前）、`serve-mount`（真实 fs + 假 agent ctx + **真实 spawn**，验证拉起链路）、`debug-mount`（假 ctx，验证调试路由的装配条件与重试） | `npm test` |
+| 纯函数单测 | `discovery` / `translate` / `values` / `health` / `serve` / `trust` / `global-rows` / `session` / `config-guard` / `session-tag` / `console-view` / `debug-view` / `debug-executor` / `same-origin`（经两座桥的路由用例覆盖） | `npm test` |
+| 装配集成 | `plugin-smoke`（假 ctx，验证注册与清理可逆）、`mount`（真实 fs + 假 agent ctx，验证挂载路径与控制台路由围栏）、`mount-guard`（真实 fs + 假 mcp-client，验证非法 config 被拦在 `ctx.plugin()` 之前）、`serve-mount`（真实 fs + 假 agent ctx + **真实 spawn**，验证拉起链路）、`debug-mount`（假 ctx，验证两座桥的装配条件与重试） | `npm test` |
 | 模块解析 | `profile-modules`（`--profile` 解析、`DSH_HOME` 落点）、`profile-config-contract`（对**已安装的 profile 模块**断言 `Config['~standard']` 契约）、`profile-export-contract`（对**已安装的 profile 模块**断言 `mcp-client` / `atomic-write` 的导出形状） | `npm test` |
 | 类型 | `tsc --noEmit` | `npm run typecheck` |
 | 打包 | tarball 内容 | `npm pack --dry-run` |
 
-### 7.2 测试文件与用例数（当前 294）
+### 7.2 测试文件与用例数（当前 298）
 
 | 文件 | 用例 | 覆盖 |
 | --- | --- | --- |
@@ -303,19 +307,19 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 | `profile-config-contract.test.mts` | 6 | 对**已安装的 profile 模块**断言：`Config` 是带 `~standard` 的 schemastery union、`validate` 同步、合法返回补齐默认值的 `value`、**非法时 `issue.message` 回显整个 config（泄密源）**、`validateMountConfig` 在真实 schema 上放行合法/拦下非法且不泄漏 |
 | `discovery.test.mts` | 12 | 向上找最近的 `.git`、无 `.git` 回退 cwd、`absent` / 非法 JSON / 顶层非对象 / `mcpServers` 非对象、缺 `mcpServers` 按空、原文透传用于指纹、**尺寸超限归一为 `invalid`（带尺寸与上限）而不是 `absent`**、**非哨兵异常仍返回 `absent`** |
 | `translate.test.mts` | 29 | `normalizeServerName` 六态、`expandVariables` 六态（含原型链）、`translateServer` 的 stdio / http / 别名 / sse / ws / 无 type 有 url / 非对象 / 缺 command / 变量缺失 / env 展开 / 规范名、**`env` 与 `headers` 的 `__proto__` 键保留三态（含展开后落在该键上）**、**`command` / `url` 展开为空串时跳过** |
-| `trust.test.mts` | 25 | 指纹稳定性与敏感性（空白、键序、新增条目、`__proto__`、超深嵌套）、读写往返、失败关闭四态、`isApproved` 四态、`approve` / `revoke` 不改入参 |
+| `trust.test.mts` | 32 | 指纹稳定性与敏感性（空白、键序、新增条目、`__proto__`、超深嵌套）、读写往返、失败关闭四态、`isApproved` 四态、`approve` / `revoke` 不改入参 |
 | `global-rows.test.mts` | 9 | 收集 `mcp-client` 行、忽略非 mcp-client / 缺 `serverName` / 非字符串、`loader` 缺失或形状不符或 `entries()` 抛错时降级空集、嵌套子树 |
-| `session.test.mts` | 16 | 无 cwd、子代理判据（`origin` 单条）、**分叉会话（有 `parentSession`、无 `origin`）应当挂载 / 未批准时进入 untrusted**、**两者同时存在时仍跳过**、无文件静默跳过、未信任、已信任、指纹失配、撞名跳过、损坏文件、结构错误、全候选被跳过时不要求批准、规范化去重、未知传输、变量缺失诊断 |
-| `plugin-smoke.test.mts` | 6 | `apply` 注册与注销、`agent/created` 监听可逆、`renderNotice` 四态 |
-| `commands.test.mts` | 17 | 未批准仍显示诊断、部分批准同时可见、空 `configs` 说明、**"已挂载"取自真实记账（计划要挂但没挂上时不谎报）**、**挂载后文件改动仍按记账呈现**、trust 用计划键、幂等（含回报去重）、未知名字报错、untrust 卸载、**untrust 刷新提示段**、**trust 刷新顺序（落盘→挂载→刷新）**、**写盘失败不刷新**、**无项目根不刷新**、未知子命令、无 agent、**命令声明 `input.hint`（缺它则带参数的行被当成对话发给模型）**、**命令名与描述齐备且符合宿主正则**、**未批准时输出可照抄的下一步命令** |
-| `mount.test.mts` | 31 | 未批准不挂载（安全断言）、挂载带 `failOnStartupError: false`、loader 传本体、重复 trust 幂等、插件卸载回收、agent 销毁清理、loader 缺失诊断、commands 缺失诊断、`inject` 声明、**批准后提示段被撤下**、**撤销后提示段刷新为待批准**、**文件消失后提示段撤下**、**会话 B 不谎报已挂载**、**trust 回报实际挂载结果**、**挂载失败日志只记错误类型、不回显展开后的 env 值**、**fiber 启动失败后该名不再出现在"已挂载"里（并留下"已从挂载记账移除"诊断）**、**迟到的 fiber 拒绝不摘掉同名新条目（按身份摘除）**、**过大的 `.mcp.json` 报"过大"而非"没有 `.mcp.json"`，且不进入挂载路径**、**端到端：`env` 的 `__proto__` 键穿过守卫到达 `ctx.plugin()`**、**端到端：`headers` 的 `__proto__` 键穿过守卫到达 `ctx.plugin()`**、**同一 sessionId 的第二个 agent 对象不重复挂载**、**第二个对象发起的 untrust 能卸载第一个对象挂的 fiber**、**第二个对象销毁时回收第一个对象的 fiber**、**第二个对象不重复注入提示段**、**不同 sessionId 各自挂载**、**`agent.id` 缺失或非字符串时不挂载且有诊断（六种非法值）**、**id 不可用时"已挂载"如实为空**、**stdio 命令行带 `--project-mcp-session <sessionId>` 且追加在原有 args 之后**、**两个会话的标记不同**、**http 不追加标记**、**标记只含 SessionId，不带展开后的 env 值** |
+| `session.test.mts` | 18 | 无 cwd、子代理判据（`origin` 单条）、**分叉会话（有 `parentSession`、无 `origin`）应当挂载 / 未批准时进入 untrusted**、**两者同时存在时仍跳过**、无文件静默跳过、未信任、已信任、指纹失配、撞名跳过、损坏文件、结构错误、全候选被跳过时不要求批准、规范化去重、未知传输、变量缺失诊断 |
+| `plugin-smoke.test.mts` | 2 | `apply` 注册与注销、`agent/created` 监听可逆 |
+| `console-view.test.mts` | 6 | `composeConsoleView` 的 `skip` → `null`、`invalid` 只有 `fileNote`、`untrusted` 逐条 `unauthorized`、`mount` 的 `failed` > `mounted` > `starting` > `not-mounted` 优先级、部分批准时未批准条目单独成行、`actionCount` 口径（未授权 + 失败 + 未挂载） |
+| `mount.test.mts` | 32 | **控制台路由准入：同源浏览器形态放行、非回环 peer / 非本机 `Host` / 跨站 `sec-fetch-site` / 异源 `Origin` 一律 403**、**两座桥都不注册 `tapIndex`（桌面版修复的回归守护：桌面文档由 Electron shell 直读打包 dist，`tapIndex` 永不执行）**、未批准不挂载（安全断言）、挂载带 `failOnStartupError: false`、loader 传本体、重复 trust 幂等、插件卸载回收、agent 销毁清理、loader 缺失诊断、`inject` 声明、**批准后提示段被撤下**、**撤销后提示段刷新为待批准**、**文件消失后提示段撤下**、**会话 B 不谎报已挂载**、**trust 回报实际挂载结果**、**挂载失败日志只记错误类型、不回显展开后的 env 值**、**fiber 启动失败后该名不再出现在"已挂载"里（并留下"已从挂载记账移除"诊断）**、**迟到的 fiber 拒绝不摘掉同名新条目（按身份摘除）**、**过大的 `.mcp.json` 报"过大"而非"没有 `.mcp.json"`，且不进入挂载路径**、**端到端：`env` 的 `__proto__` 键穿过守卫到达 `ctx.plugin()`**、**端到端：`headers` 的 `__proto__` 键穿过守卫到达 `ctx.plugin()`**、**同一 sessionId 的第二个 agent 对象不重复挂载**、**第二个对象发起的 untrust 能卸载第一个对象挂的 fiber**、**第二个对象销毁时回收第一个对象的 fiber**、**第二个对象不重复注入提示段**、**不同 sessionId 各自挂载**、**`agent.id` 缺失或非字符串时不挂载且有诊断（六种非法值）**、**id 不可用时"已挂载"如实为空**、**stdio 命令行带 `--project-mcp-session <sessionId>` 且追加在原有 args 之后**、**两个会话的标记不同**、**http 不追加标记**、**标记只含 SessionId，不带展开后的 env 值** |
 | `session-tag.test.mts` | 10 | 标记追加在原有 args 之后、参数名带 `project-mcp` 前缀、不修改入参（含冻结对象）、连续标记两次结果相同（不累积）、`args` 缺失时标记成为唯一参数、`args` 非数组时按缺失处理、`args` 里的非字符串项被剔除、`streamable-http` 原样返回且不凭空多出 `args`、标记只含 SessionId 不带 env 值、保留 config 的其他字段 |
-| `serve.test.mts` | 45 | **`planServeStart`**：默认值补齐、`command` / `args` / `env` / `health` 的变量展开、缺 `command`、非字符串 `command`、展开成空串、畸形 `args` / `env`、非对象 `serve`、`health` scheme 白名单（`file:` / `data:` / `ftp:` / 无 `//` 全拒）、`url` 推导失败、非字符串 `health`、`readyTimeoutMs` 非法退回默认（九种非法值）与超上限收敛；**`deriveHealthUrl`**：用 origin 而非替换路径、非 http(s) 与非法 URL 返回 `undefined`；**`isHttpUrl`**：只放行 http(s) 且不被 `http:x` 骗过；**`checkHealth`**：2xx、非 2xx（带状态码）、`ok` 缺失时按状态码、网络错误归一 `network`（不回显消息）、abort 归一 `timeout`、非法 scheme 不发起请求；**`waitReady`**：首次成功不 sleep、轮询到就绪、超时、每轮重读时钟、非法 scheme 不轮询；**`splitServe`**：剥离且不改入参、stdio 原样返回、无 `serve` 返回 `undefined`；**`ensureServeReady`**：健康成功不 spawn、失败 + 有 `serve` spawn 一次且参数一致、失败 + 无 `serve` 不 spawn 记 warn、超时记 warn 不抛、spawn 抛错记 warn、**并发同 url 只 spawn 一次**、不同 url 各启动一次、完成后条目删除、stdio 零额外动作、**展开后的 env 值不入日志**、非法 scheme 不 spawn、推导不出 health 时完全不探测 |
+| `serve.test.mts` | 55 | **`planServeStart`**：默认值补齐、`command` / `args` / `env` / `health` 的变量展开、缺 `command`、非字符串 `command`、展开成空串、畸形 `args` / `env`、非对象 `serve`、`health` scheme 白名单（`file:` / `data:` / `ftp:` / 无 `//` 全拒）、`url` 推导失败、非字符串 `health`、`readyTimeoutMs` 非法退回默认（九种非法值）与超上限收敛；**`deriveHealthUrl`**：用 origin 而非替换路径、非 http(s) 与非法 URL 返回 `undefined`；**`isHttpUrl`**：只放行 http(s) 且不被 `http:x` 骗过；**`checkHealth`**：2xx、非 2xx（带状态码）、`ok` 缺失时按状态码、网络错误归一 `network`（不回显消息）、abort 归一 `timeout`、非法 scheme 不发起请求；**`waitReady`**：首次成功不 sleep、轮询到就绪、超时、每轮重读时钟、非法 scheme 不轮询；**`splitServe`**：剥离且不改入参、stdio 原样返回、无 `serve` 返回 `undefined`；**`ensureServeReady`**：健康成功不 spawn、失败 + 有 `serve` spawn 一次且参数一致、失败 + 无 `serve` 不 spawn 记 warn、超时记 warn 不抛、spawn 抛错记 warn、**并发同 url 只 spawn 一次**、不同 url 各启动一次、完成后条目删除、stdio 零额外动作、**展开后的 env 值不入日志**、非法 scheme 不 spawn、推导不出 health 时完全不探测 |
 | `serve-mount.test.mts` | 11 | **真实 spawn 拉起服务且 `serve.env` 真的到了子进程**（子进程写标记文件）、**真实 HTTP 健康端点成功时不 spawn**、失败 + 无 `serve` 记 warn 仍挂载、**并发挂载同一 url 只 spawn 一次**（子进程向同一文件追加，数行数）、**`serve` 元数据被剥离绝不交给 `ctx.plugin()`**、**展开后的 `serve.env` 值不出现在任何日志**、**回归：stdio 条目零额外动作**、**回归：stdio 仍追加会话标记**、`serve` 畸形（缺 `command` / `health` scheme 非法）跳过 `serve` 仍挂载、`readyTimeoutMs` 非法退回默认并留诊断 |
 | `debug-view.test.mts` | 9 | `parseMcpToolName` 的合法与六种畸形形态（含大小写敏感）、`groupTools` 的组顺序（MCP 服务器名字典序 → 内置 → 其他）与组内排序、**同一工具面正反输入得到逐字相同的分组**（不允许顺序抖动）、`groupIdOf` 与 `groupTools` 一致、`filterTools` 的名/描述/大小写/空关键词（返回同一引用）、`formFields` 的七种 schema 投影与四种畸形 schema、`buildArguments` 的类型转换/空串省略/必填报错/非法值不写入参数 |
 | `debug-executor.test.mts` | 12 | `projectValueBlocks` 的文本/图片/mimeType 回退/未支持块/元素级畸形/超大图片截断、`contentText` 只拼文本、成功调用**优先 `.value` 原始块**（模型面 `content` 不同）、`.value` 无块时回退模型面文本、失败调用的三种错误消息来源、自动 `callId` 跳过在途序号、**同一 `callId` 在途时被拒绝且不影响在途那条**、`cancel` 中止在途调用与未知 id 返回 false、**`execute` 抛错后仍从取消表摘除**、**scope 透传（有 scope 传 `agent`、无 scope 不塞该字段）** |
 | `debug-bridge.test.mts` | 21 | 路由前缀、**同源围栏放行浏览器同源请求（不带 nonce 也放行——真机修复的回归守护）** 含 `sec-fetch-site=none`/带同源 `Origin`/无 Origin/`localhost`/IPv6 回环五种合法形态、**非回环 peer / 非本机 Host / 缺 Host / 跨站 / 异源 Origin / 畸形 Origin 一律 403 且不执行工具**、拒绝理由区分 `loopback-only` 与 `same-origin-only`、`GET /api/tools` 的投影与分组形状、**`GET /api/tools` 带 `session` 时把 agent 当 scope 传给 `schemas`（会话级 `mcp__*` 出现；无 session / 解析不到时不造 scope）**、**`POST /api/call` 的 body 带 `session` 时把 agent 传给 `execute`（与列出同视角）**、`GET /api/prompt-sections` 的四态（正常/服务缺席/抛错/畸形）、`POST /api/call` 的成功与三种 400、`callId` 冲突 409、**执行器抛错降级为 500 + 错误类型名且响应体不含底层 message**、`POST /api/cancel` 的三态、未知路径与方法 404、disposer 注销、`projectTools` / `projectGroups` 纯投影；**技能**：`GET /api/skills` 的正常/服务缺席/抛错/畸形四态、**摘要不下发本机 `path`**、`GET /api/skill` 的正文/未知 404/缺 name 400/服务缺席也不崩、`projectSkills` 的默认 invocation 与丢 path、**带 `session` 时把 agent 当 `scope` 传给 `skills.list`/`skills.get`**、解析不到 agent 时退回全局视角（不凭空造 scope） |
-| `debug-mount.test.mts` | 3 | `apply` 在 tools + webServer 都在场时挂上两座桥、卸载后路由与注入全部撤销、**tools 缺席时不挂调试台但 MCP 控制台照挂**、**webServer 晚到时由重试补挂且只挂一次** |
+| `debug-mount.test.mts` | 3 | `apply` 在 tools + webServer 都在场时挂上两座桥、**两座桥都不注册 `tapIndex` 页面注入**（桌面版回归守护：桌面文档由 Electron shell 直读打包 dist，注入永不执行，一旦有人加回来立刻变红）、卸载后路由全部撤销且无注入残留、**tools 缺席时不挂调试台但 MCP 控制台照挂**、**webServer 晚到时由重试补挂且只挂一次** |
 
 ### 7.3 Review Focus 的守护位置
 
@@ -355,7 +359,7 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
   注入，单测不碰真实文件系统。`health.ts` 把 `fetch` / `sleep` / `now` / `timeoutSignal` 全部
   注入（真实实现见 `index.ts` 的 `serveIo`），因此超时、非法 scheme、轮询这些分支都能确定性
   复现且**不花真实时间**——否则"等满 120 秒"这类用例要么慢到不可接受，要么根本无法构造。
-- **假 ctx**：`plugin-smoke.test.mts` 与 `commands.test.mts` 用记录式的假宿主服务，断言
+- **假 ctx**：`plugin-smoke.test.mts` / `debug-mount.test.mts` / `debug-bridge.test.mts` 用记录式的假宿主服务，断言
   注册、注销与输出文本。
 - **真实 fs + 假 agent ctx**：`mount.test.mts` 用 `mkdtempSync` 建临时项目与临时
   `DSH_HOME`，只把宿主服务与 agent ctx 换成可观测的假实现；`DSH_HOME` 必须在 **import
@@ -372,7 +376,7 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 
 ## 8 验证分层与未验证项
 
-**已由测试与命令覆盖**：上表 294 个用例、`npm run typecheck`、`npm pack --dry-run` 的
+**已由测试与命令覆盖**：上表 298 个用例、`npm run typecheck`、`npm pack --dry-run` 的
 tarball 内容。
 
 **未在真实 DSH 运行时验证**（需要真实 profile 与会话，无法在纯单元测试中覆盖）：
@@ -421,25 +425,25 @@ apply 日志实测，免重启）；`set_plugin` 停用→启用只修结构、�
 本文件与 [`behavior.md`](behavior.md) 描述的是 **HEAD 中实际存在的代码**，不是计划或评审
 记录里声称的行为。
 
-历史上这里记录过两处"评审记录声称已修复、代码里并不存在"的失配（评审者 A 提出、因分发
-失误未落地），**现已补修并有测试守护**：
+历史上这里记录过两处"评审记录声称已修复、代码里并不存在"的失配。**它们现在的状态是
+"承载机制已整体删除"，不是"修好了"**：
 
-- 批准后刷新会话提示段：`CommandDeps.refreshNotice` 在 `runTrust` / `runUntrust` 写盘之后
-  调用，内部"先撤下、再按 `renderNotice(当前计划)` 重注入或留空"（`index.ts`）；
-- "已挂载"一列改读真实挂载记账：`ProjectInspection.mounted` 由 `index.ts` 的
-  `AgentRegistrations.servers` 提供，`renderList` 不再取 `plan.configs`。
+- 提示段（`renderNotice` / `CommandDeps.refreshNotice`）随命令面一起删除：现在的"需要动作"
+  信号只由输入区按钮与弹层承载（见 [`behavior.md`](behavior.md) 控制台一节）。
+- "已挂载"当年改为读真实挂载记账；命令面删除后该列由控制台视图承担，但口径不变：
+  `ProjectInspection.mounted` 仍由 `index.ts` 的 `AgentRegistrations.servers` 提供，
+  **不得**退回读计划。
 
 核对方法：
 
 ```powershell
-# 刷新必须由命令层调用，而不是只有 agent/created 一处
-Select-String -Path src\*.ts -Pattern 'refreshNotice'
-# "已挂载"不得退回读计划
-Select-String -Path src\commands.ts -Pattern 'plan\.configs'
+# 提示段机制已删除：应无命中
+Select-String -Path src\*.ts -Pattern 'renderNotice|refreshNotice'
+# "已挂载"不得退回读计划：命中只应出现在挂载决策处，不得用于渲染
+Select-String -Path src\*.ts -Pattern 'plan\.configs'
 ```
 
-第一条应命中 `commands.ts`（接口 + 两处调用）与 `index.ts`（定义 + 注入）；第二条应**无**
-命中。守护用例见 §7.2 的 `commands.test.mts` 与 `mount.test.mts` 行。
+守护用例见 §7.2 的 `mount.test.mts` 行（「会话 B 不谎报已挂载」）。
 
 ### 8.2 诊断：分辨一个 MCP 子进程属于哪个会话
 

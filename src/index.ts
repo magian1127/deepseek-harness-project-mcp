@@ -45,7 +45,6 @@ import { installDebugBridge } from './debug-bridge.js'
 import type { DebugWebServerShape, PromptSectionsShape, SkillsShape } from './debug-bridge.js'
 import { DebugExecutor } from './debug-executor.js'
 import type { DebugToolsShape } from './debug-executor.js'
-import { randomBytes } from 'node:crypto'
 import { planSessionMount } from './session.js'
 import type { SessionMountInput, SessionMountPlan } from './session.js'
 import { withSessionTag } from './session-tag.js'
@@ -650,9 +649,10 @@ export function apply(ctx: HostContext, config: unknown): void {
 
   // —— 控制台桥接（design-mcp-console.md §4.3/§4.4）：输入区按钮与弹层的 Host 半边 ——
   //
-  // nonce 随进程生命周期：经 tapIndex 注入 GUI 页面，路由校验它，于是只有真正拿到页面
-  // （即已通过宿主连接认证）的 Client 才能读状态、触发动作（详见 console-bridge.ts 模块头）。
-  const consoleNonce = randomBytes(16).toString('base64url')
+  // 准入走同源三重围栏（`same-origin.ts`），与调试台完全一致：peer 回环 + Host 白名单 +
+  // sec-fetch-site/Origin。**刻意不用 boot 级 nonce**——那条通道依赖 `webServer.tapIndex`
+  // 注入页面，而桌面版（Electron）的文档由 shell 直读打包 dist，tapIndex 永不执行，
+  // 于是 nonce 恒缺席、按钮在桌面上静默消失（2026-10-28 实测，见 console-bridge.ts 模块头）。
   const consoleDeps: ConsoleBridgeDeps = {
     viewFor: sessionId => {
       const agent = ctx.get('agents')?.get?.(sessionId) as AgentShape | undefined
@@ -728,14 +728,13 @@ export function apply(ctx: HostContext, config: unknown): void {
     if (
       webServer === undefined ||
       webServer === null ||
-      typeof webServer.register !== 'function' ||
-      typeof webServer.tapIndex !== 'function'
+      typeof webServer.register !== 'function'
     ) {
       return
     }
     consoleInstalled = true
     ctx.effect(
-      () => installConsoleBridge(webServer, consoleDeps, consoleNonce),
+      () => installConsoleBridge(webServer, consoleDeps),
       'project-mcp:console-bridge',
     )
   }
@@ -747,10 +746,10 @@ export function apply(ctx: HostContext, config: unknown): void {
   // 插件只是"恰好住在同一进程里"的宿主：把调试台放在这里是因为它需要一个已经
   // 长期存活的 Host 半边，而不是因为它跟 `.mcp.json` 有关。
   //
-  // **刻意不复用 console-bridge 的 nonce**（2026-10-24 真机教训）：那套机制靠
-  // `tapIndex` 把 meta 注入页面，而 `tapIndex` 在真实组合里没有生效——调试台最初
-  // 照抄后整个工具面拿不到任何工具（请求全 403）。调试台改用与它所在的会话视图同级
-  // 的同源三重围栏（见 debug-bridge.ts 模块头），不依赖任何页面注入。
+  // 两座桥现在共用 `same-origin.ts` 的同源三重围栏，**都不依赖任何页面注入**。
+  // 历史教训：nonce 方案靠 `tapIndex` 注 meta，而 `tapIndex` 在桌面版（Electron 直读
+  // 打包 dist 的文档）永不执行——调试台 2026-10-24 因此整个工具面为 0，控制台按钮
+  // 2026-10-28 因此在桌面上静默消失。
   //
   // tools 服务缺席时**不装配**调试路由：没有工具面可调试，路由只会返回空列表，
   // 而空列表会让用户以为"工具全都消失了"。

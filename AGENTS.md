@@ -78,10 +78,11 @@
 | `src/session.ts` | `planSessionMount`：会话 → 挂载决策（纯函数，零 I/O） |
 | `src/session-tag.ts` | `withSessionTag`：给 stdio config 追加 `--project-mcp-session <SessionId>` 会话标记（纯函数，返回新对象） |
 | `src/console-view.ts` | `composeConsoleView`：计划 + 挂载记账 + serve 进行中表 → 控制台视图（纯函数，需动作数口径在此钉死） |
-| `src/console-bridge.ts` | `installConsoleBridge`：`webServer` 前缀路由（status / start / revoke）+ boot 级 nonce 注入（**真实 HTTP I/O**） |
+| `src/same-origin.ts` | `requestAllowed`：两座 HTTP 桥**共用**的同源三重围栏（peer 回环 + `Host` 白名单 + `sec-fetch-site`/`Origin`），拒绝理由 `loopback-only` / `same-origin-only`（纯函数，零 I/O） |
+| `src/console-bridge.ts` | `installConsoleBridge`：`webServer` 前缀路由（status / start / revoke）。准入调 `same-origin.ts` 的 `requestAllowed`（同源三重围栏），**不用 nonce、不注册 `tapIndex`**（**真实 HTTP I/O**） |
 | `src/debug-view.ts` | 工具调试台的纯函数投影：MCP 名解析、分组、关键词过滤、schema → 表单、表单 → 参数（**零 I/O**） |
 | `src/debug-executor.ts` | `DebugExecutor`：`callId` 序列 + 取消表 + 结果块投影（`.value` 优先、图片 4 MiB 截断） |
-| `src/debug-bridge.ts` | `installDebugBridge`：`webServer` 前缀路由（tools / call / cancel / prompt-sections / skills / skill）。准入用**同源三重围栏**（peer 回环 + `Host` 白名单 + `sec-fetch-site`/`Origin`），**刻意不用 nonce**；技能按**会话作用域**列举（`session` 解析成 agent 当 `scope`，否则 preset 的 `customSkillDirs` 技能看不到）（**真实 HTTP I/O**） |
+| `src/debug-bridge.ts` | `installDebugBridge`：`webServer` 前缀路由（tools / call / cancel / prompt-sections / skills / skill）。准入与 `console-bridge` **共用** `same-origin.ts` 的同源三重围栏（peer 回环 + `Host` 白名单 + `sec-fetch-site`/`Origin`），两座桥都**刻意不用 nonce**；技能按**会话作用域**列举（`session` 解析成 agent 当 `scope`，否则 preset 的 `customSkillDirs` 技能看不到）（**真实 HTTP I/O**） |
 | `client.js` | Client 半边（plain-JS bundle）：输入区按钮 + 内联锚定弹层（点外部/Esc 关闭）；`conversation.view` 的「工具调试」Tab（工具树 / 调用 / 结果 / 技能 / 提示词面）；会话 id 经注册项 `inject` 注入（不做任何会话数据折叠） |
 
 依赖方向单向无环：
@@ -91,8 +92,8 @@ index.ts ──> session.ts ──> discovery.ts, translate.ts, trust.ts, global
    │                              │
    │                              ├──> serve.ts ──> health.ts, values.ts, config-guard.ts
    │                              └──> values.ts, types.ts
-   ├──> console-view.ts, console-bridge.ts
-   ├──> debug-bridge.ts ──> debug-executor.ts, debug-view.ts
+   ├──> console-view.ts, console-bridge.ts ──> same-origin.ts
+   ├──> debug-bridge.ts ──> debug-executor.ts, debug-view.ts, same-origin.ts
    ├──> config-guard.ts ──> types.ts
    ├──> session-tag.ts ──> types.ts
    ├──> serve.ts（ensureServeReady / spawnDetached / spawnOptionsFor / splitServe）
@@ -105,8 +106,8 @@ index.ts ──> session.ts ──> discovery.ts, translate.ts, trust.ts, global
 最不该骗人的地方。`tools` 服务缺席时不装配调试路由。
 
 `session.ts` / `translate.ts` / `discovery.ts` / `trust.ts` / `global-rows.ts` /
-`config-guard.ts` / `session-tag.ts` / `values.ts` / `health.ts` / `serve.ts` 各自只承担
-一件事、互不依赖（除上面标出的单向依赖），全部通过注入 I/O（或干脆无 I/O）保持可彻底单测。
+`config-guard.ts` / `session-tag.ts` / `values.ts` / `health.ts` / `serve.ts` / `same-origin.ts`
+各自只承担一件事、互不依赖（除上面标出的单向依赖），全部通过注入 I/O（或干脆无 I/O）保持可彻底单测。
 
 **"唯一做 I/O"的准确范围**：`index.ts` 是唯一做**会话数据** I/O（`.mcp.json` 与信任
 存储的读写）与 Cordis 交互的模块。两个**显式例外**：`profile-modules.ts` 做真实 I/O
@@ -121,7 +122,7 @@ index.ts ──> session.ts ──> discovery.ts, translate.ts, trust.ts, global
 ```powershell
 npm install
 npm run typecheck                        # tsc -p tsconfig.json --noEmit
-npm test                                 # 294 个用例，19 个测试文件
+npm test                                 # 298 个用例，20 个测试文件
 npm pack --dry-run                       # 核对 tarball 内容（files 字段）
 (Get-Content AGENTS.md).Count            # 必须 ≤ 200
 ```

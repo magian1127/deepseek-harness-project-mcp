@@ -113,7 +113,7 @@ export default { Config, apply() {} }
 const { apply } = await import('../index.js')
 const { approve, configHashOf, trustStorePath } = await import('../trust.js')
 const { normalizeServerName } = await import('../translate.js')
-const { CONSOLE_ROUTE_PREFIX, NONCE_HEADER, NONCE_META_NAME } = await import('../console-bridge.js')
+const { CONSOLE_ROUTE_PREFIX } = await import('../console-bridge.js')
 
 interface Project {
   root: string
@@ -161,7 +161,6 @@ function createHarness() {
   /** 活会话表：桥接按 `ctx.get('agents').get(id)` 取会话。 */
   const agentsById = new Map<string, unknown>()
   const routes: Array<{ path: string; handler: (req: never, res: never) => void }> = []
-  let indexTransform: ((html: string) => string) | null = null
 
   const webServerFake = {
     register(route: { kind: string; path: string; handler: (req: never, res: never) => void }) {
@@ -171,9 +170,10 @@ function createHarness() {
         if (at >= 0) routes.splice(at, 1)
       }
     },
-    tapIndex(transform: (html: string) => string) {
-      indexTransform = transform
-      return () => { indexTransform = null }
+    tapIndex(_transform: (html: string) => string) {
+      // 两座桥都不做 `tapIndex` 注入（桌面版永不执行该变换）：fake 只接受调用，
+      // 让"仍用旧机制"的实现不会因缺 API 而崩，但也不参与任何断言。
+      return () => {}
     },
   }
 
@@ -233,8 +233,6 @@ function createHarness() {
      * `mount.test.mts` 的同名辅助。
      */
     consoleApi: () => {
-      const html = indexTransform !== null ? indexTransform('<html><head></head></html>') : ''
-      const nonce = new RegExp(`name="${NONCE_META_NAME}" content="([^"]+)"`).exec(html)?.[1] ?? ''
       const call = (
         method: 'GET' | 'POST',
         path: string,
@@ -246,7 +244,9 @@ function createHarness() {
           const req = new EventEmitter() as EventEmitter & Record<string, unknown>
           req.method = method
           req.url = path
-          req.headers = { [NONCE_HEADER]: nonce }
+          // 同源浏览器形态：回环 peer + 本机 Host 即可过围栏（无需任何凭据头）。
+          req.headers = { host: '127.0.0.1:3080' }
+          req.socket = { remoteAddress: '127.0.0.1' }
           req.destroy = () => {}
           let statusCode = 0
           const res = {

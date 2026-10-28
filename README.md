@@ -217,11 +217,15 @@ HTTP 模式下 DSH **不启动任何子进程**——它只向 `url` 发请求�
 - **工具调试台的数据**：调用历史只存在你浏览器的 `localStorage`（键
   `dsh-project-mcp-tool-debug-history`，上限 50 条），不上报、不落盘到 host。执行工具产生的
   结果只在那个 HTTP 响应里回给当前页面；Host 侧不保存调用记录。
-- **调试台的准入**：所有 `/project-mcp/debug/*` 请求都过同源三重围栏——peer 必须是回环地址、
-  `Host` 必须是本机 authority、`sec-fetch-site` 只允许 `same-origin`/`none`，带 `Origin` 时
-  还必须与 `Host` 一致。它能执行任意已注册工具，因此只应在本机回环的 GUI 里使用。
-  > 这条路由**不用** nonce：nonce 依赖 `tapIndex` 把 meta 注入页面，而该注入在真实组合里
-  > 没有生效（2026-10-24 实测：照抄 nonce 方案会让每个请求都 403、工具面永远是 0）。
+- **控制台路由的准入**：MCP 控制台的 `/project-mcp/status` / `start` / `revoke` 与「工具调试」
+  Tab 的 `/project-mcp/debug/*` 走**同一套同源三重围栏**——peer 必须是回环地址、`Host` 必须是
+  本机 authority、`sec-fetch-site` 只允许 `same-origin`/`none`，带 `Origin` 时还必须与 `Host`
+  一致。**桌面版与 Web 版行为一致**，两者都**不依赖往页面注入任何东西**。
+  > 这些路由**不用** nonce：nonce 依赖 `tapIndex` 把 meta 注入页面。调试台因此在 2026-10-24
+  > 每个请求都被判 403、工具面永远是 0；控制台按钮在 2026-10-28 的桌面版上同理整个不渲染
+  > （桌面版页面由 Electron shell 直接读打包产物、不经 Host 渲染，`tapIndex` 在那里永不执行）。
+  > 同一套围栏已经挡住了跨站与 DNS rebinding，nonce 不会额外挡住谁。
+  > 调试台能执行任意已注册工具，因此只应在本机回环的 GUI 里使用。
 
 ## 已知限制
 
@@ -249,7 +253,7 @@ HTTP 模式下 DSH **不启动任何子进程**——它只向 `url` 发请求�
 dsh plugin --profile web remove deepseek-harness-project-mcp
 ```
 
-卸载会回收本插件在活会话里挂载的项目级 MCP 与全部控制台注册（路由、页面注入、监听器），
+卸载会回收本插件在活会话里挂载的项目级 MCP 与全部控制台注册（路由、监听器），
 不会删除 DSH 会话数据。
 `${DSH_HOME:-~/.dsh}/project-mcp-trust.json` 会保留——重新安装后此前的批准仍有效。
 若要一并清除，请在确认没有其他项目仍需该记录后自行删除该文件。
