@@ -8,6 +8,8 @@
 
 > 实现要点见 §9；实现与设计的两处**有意偏差**（`serve` 不可用时跳过整个 `serve` 而不只是
 > 跳过检查、`readyTimeoutMs` 的硬上限）记在 §9 末尾。
+> **2026-10-29 修订**：就绪等待已移出会话创建路径（挂载在后台任务里进行），§4.1/§4.2 的
+> "在 `agent/created` 里等待"论证已作废，正文保留作历史对照。
 
 ## 1 要解决的问题
 
@@ -100,22 +102,37 @@ HTTP 模式下 DSH **不 spawn 子进程**（`packages/mcp/mcp-client/src/transp
    └─ 超时 → 记 warn，仍交给 mcp-client（让它自己重试）
 ```
 
-**关键**：第 4 步的等待发生在 `agent/created` 里。`agent/created` 是 **serial 且被 await**（`packages/core/agent/src/index.ts:550`），且契约明确 *"AgentLoop holds queued input until all listeners finish"*（`runtime-types.ts:257`）——**所以用户的第一条消息会等到服务就绪**，工具在首次请求前就注册好。
+**关键**：第 4 步的等待发生在**后台挂载任务**里（2026-10-29 起的实现）。这四步**不在**
+会话创建路径上——`agent/created` 只发起后台挂载就返回，因此打开/恢复会话、派生一批子代理
+都不会等某个外部服务就绪。详见 §4.2 与 [`development.md` §10.1](development.md#101-为什么不在-agentcreated-里-await)。
 
-**这是"等服务就绪再连"的实现方式**（用户决策 ②）。
 
-### 4.2 为什么可以先等待（不违反"不 await 连接"红线）
+### 4.2 为什么当初认为可以先等待，以及为什么它错了
 
-红线 5 说"挂载必须不 await 连接"，指的是**不 await `mcp-client` 的握手**（那会卡住会话创建，且 MCP 服务器可能永远起不来）。
+红线 5 说"挂载必须不 await 连接"，指的是**不 await `mcp-client` 的握手**（那会卡住会话创建，
+且 MCP 服务器可能永远起不来）。本设计当初据此认为"等健康检查"是另一回事：
 
-本设计 await 的是**健康检查**，它：
-- 有**明确超时**（默认 120 秒，可配）
-- 失败**不抛异常**，只是记 warn 后照常挂载
-- 目的是让"拉起服务"这件事有确定的结果
+- 它有**明确超时**（默认 120 秒，可配）；
+- 失败**不抛异常**，只是记 warn 后照常挂载；
+- 等的是"我自己启动的服务就绪，且我知道它的健康端点"。
 
-两者不同：前者是"等一个不受控的握手"，后者是"等一个我自己启动的服务就绪，且我知道它的健康端点"。
+**这个论证只看了"等的是什么"，漏看了"谁在等"。** 选择 await 的判据不该是"这次等待是否
+有上限"，而是**这段等待落在哪条路径上**：
 
-**但仍需在文档中明示**：`serve` 模式下，首次打开会话可能等待最多 `readyTimeoutMs`。
+| 判据 | 旧论证 | 实际情况 |
+| --- | --- | --- |
+| 有没有上限 | 有（`readyTimeoutMs`） | 与结论无关：120 秒对"打开会话"而言已经是不可接受 |
+| 失败是否抛出 | 不抛 | 与结论无关：await 的代价是**时长**，不是异常 |
+| 谁在等 | 没问 | 宿主在等（`agent/created` 的返回值被 serial 派发 await）——于是**会话创建**被按在外部服务的启动上 |
+
+2026-10-29 的现场缺陷就是这个漏项：一个带 `serve` 的项目（服务没起）在开了一批子代理后
+表现为"整段对话卡住、子代理会话显示不出来、输入框按钮永远检测中"。修复后**等待仍在，
+但只在后台任务里**；代价从"会话创建卡住"变成"该条目的工具晚出现"。见
+[`behavior.md` §3.2](behavior.md#32-servehttp-条目的按需拉起可选) 与
+[`development.md` §10.1](development.md#101-为什么不在-agentcreated-里-await)。
+
+**文档口径也变了**：不再有"首次打开会话可能等待最多 `readyTimeoutMs`"这条用户可见代价。
+
 
 ### 4.3 spawn 方式：必须脱离 DSH 存活（硬要求）
 
@@ -210,7 +227,7 @@ PowerShell 静默空转；带后缀的变体（如 `pwsh-preview`）行为未实
 
 #### 参考实现：AIVC 的三层策略
 
-`D:\Projects\My\AIVirtualCompany` 的 `DaemonLaunchers.cs` 用了更完整的三层（本插件**不需要**这么复杂，但值得记录）：
+AIVC 仓库（与本插件同工作区的相邻项目）的 `DaemonLaunchers.cs` 用了更完整的三层（本插件**不需要**这么复杂，但值得记录）：
 
 | 层 | 方式 | 位置 |
 | --- | --- | --- |
@@ -292,7 +309,7 @@ PowerShell 静默空转；带后缀的变体（如 `pwsh-preview`）行为未实
 | 新模块 `src/serve.ts` | ✅ `planServeStart`（纯函数）、`deriveHealthUrl`、`splitServe`（剥离 `serve`）、`ensureServeReady`（编排 + 并发去重）、`spawnDetached`（真实进程 I/O） |
 | 新模块 `src/health.ts` | ✅ `checkHealth` / `waitReady` / `isHttpUrl`；`fetch`、`sleep`、`now`、`timeoutSignal` 全部注入 |
 | `src/translate.ts` 解析 `serve` | ✅ `translateServe`（畸形时**只丢弃 `serve`**，条目仍挂载；诊断经 `diagnostics` 出参交给装配层） |
-| `src/index.ts` 在 `mountInto` 前插入"确保服务就绪" | ✅ `mountInto` 转 async，逐条目先 `ensureServeReady` 再挂载；`agent/created` 的监听器返回该 promise（Cordis 的 serial 派发会 await 它） |
+| `src/index.ts` 在 `mountInto` 前插入"确保服务就绪" | ✅ `mountInto` 转 async，逐条目先 `ensureServeReady` 再挂载。**2026-10-29 修正**：`agent/created` 的监听器**不再**返回该 promise——挂载改由后台任务发起（`startMountInBackground`），因为返回 promise 等于让宿主 await 它，把**会话创建**按在 `readyTimeoutMs` 上（见 §4.2） |
 | `src/types.ts` 加 `serve` 元数据 | ✅ `ServeMetadata` + HTTP 变体的可选 `serve` |
 | — | ➕ 新模块 `src/values.ts`：展开语义与形状守卫从 `translate.ts` 抽出，供 `serve.ts` 复用（否则两套展开语义迟早分叉） |
 
@@ -309,7 +326,12 @@ PowerShell 静默空转；带后缀的变体（如 `pwsh-preview`）行为未实
   `spawn('不存在的命令')` 会在约一个 tick 后抛未捕获异常并**带崩宿主进程**（Node 22，
   `detached + stdio: 'ignore'` 下实测，退出码 1）。也就是说一个写错的 `serve.command`
   足以打挂 DSH。这是实现期发现的最严重的一处，已写进 `AGENTS.md` 红线 12。
-- **测试夹具的 `fire` 必须 await**：`mountInto` 转 async 后，同步遍历监听器会让断言跑在
-  挂载之前——"未挂载"的断言假性通过、"已挂载"的断言必然失败，两种都是错误的观测。
+- **测试夹具的 `fire` 必须 await，但监听器必须同步返回**：`agent/created` 的监听器不再返回
+  挂载 promise（2026-10-29），夹具的 `fire` 照旧 `await cb(...)`——它因此也是红线的回归位：
+  一旦有人把 promise 交回宿主，`fire` 会等满 `readyTimeoutMs`，用例超时变红。断言"已挂载"
+  时要主动等后台任务落定。
+- **"有上限的等待"也可能落在错误路径上**：本设计最初把 `agent/created` 的 serial-await 当成
+  "可以等服务就绪"的依据。真正该问的不是"这次等待是否有上限"，而是"谁在等"——宿主在等，
+  就等于会话创建在等（见 §4.2）。这条教训已写进 `AGENTS.md` 红线 4。
 - **并发去重的实测**：`serve-mount.test.mts` 让子进程往同一个文件追加一行，两个会话并发
   挂载同一 `url` 时**行的数量是 1**——这是"只 spawn 一次"的直接证据。

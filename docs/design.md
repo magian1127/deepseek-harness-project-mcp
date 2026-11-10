@@ -4,6 +4,12 @@
 **日期**：2026-10-06（2026-10-18 适配 DSH 0.2.1-rc.2）
 **目标 DSH 版本**：`>=0.2.0-rc.2 <0.3.0-0`（`engines.dsh`）；源码核对基线 0.2.1-rc.2
 
+> **历史文档**：本文是 2026-10-06 的原始设计快照，其中的斜杠命令（`/mcp-project`）、系统提示
+> 注入与"`agent/created` 可 await 服务就绪"等结论**已被后续实现推翻**。当前行为以
+> [`behavior.md`](behavior.md) 为准，实现约束以 [`development.md`](development.md) 为准；
+> 控制台化（按钮 + 弹层 + 后台挂载）的设计见 [`design-mcp-console.md`](design-mcp-console.md)
+> 与 [`design-http-serve.md`](design-http-serve.md)。本文只保留"当初为什么这样想"。
+
 ## 1. 目标
 
 让项目根目录的 `.mcp.json` 决定**该项目下的会话启用哪些 MCP 服务器**，并且**不启用的服务器完全不建立连接、不启动子进程**。

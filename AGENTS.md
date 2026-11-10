@@ -30,6 +30,10 @@
 3. **展开后的环境变量值永不进入**日志、错误消息、会话记录或任何持久化产物；诊断只记
    **变量名**与服务器名，绝不回显 `.mcp.json` 内容。
 4. 会话创建路径上的任何函数**都不抛异常**（抛异常会中断会话创建）；失败一律降级并记日志。
+   **并且不得把可能长期挂起的 promise 返回给宿主**：`agent/created` 的监听器必须同步
+   `return undefined`。Cordis 的 serial 派发会 `await` 监听器返回值，宿主又在会话创建流程里
+   await 它——把挂载 promise 交回去等于把会话创建按在 `serve` 的就绪等待上（最长
+   `readyTimeoutMs`），多开子代理时会整段对话卡住（2026-10-29 实测）。挂载一律转后台任务。
 5. 挂载必须**不 await 连接**且设 `failOnStartupError: false`：会话秒开优先于工具必定就位。
 6. 挂载与提示段的 disposer 必须**双份登记**：注册落在 `agent.ctx`，disposer 同时按
    **`agent.id`（会话 id）**键控地留在插件自己的 `ctx.effect` 里（`agent.ctx` 上的注册有
@@ -54,21 +58,25 @@
    归服务自己。**Windows 上不得写 `detached: true`**：Node 在 Windows 把它实现成
    `DETACHED_PROCESS`（子进程没有控制台），而 PowerShell 在那种情形下**立刻以退出码 0 结束、
    一行都不执行**（已实测），于是 `serve.command: pwsh` 静默空转、插件白等满
-   `readyTimeoutMs`（默认 120 秒），而会话创建正卡在这段等待上。**Windows + 其他命令又必须 `detached: true`**：
+   `readyTimeoutMs`（默认 120 秒），该条目的工具迟迟不出现。**Windows + 其他命令又必须 `detached: true`**：
    不 detached 的子进程挂在宿主控制台上，控制台拆除时被 `CTRL_CLOSE_EVENT` 带走（已实测），
    服务会随 DSH 一起消失；而 Node 无法表达两全的 `CREATE_NO_WINDOW`，因此只能按命令分流。
 13. 健康检查 URL 只允许 `http://` / `https://`；`fetch` 还支持 `file:` / `data:`，放行它们
    等于让不受信的 `.mcp.json` 指挥本插件读本机文件。
+14. 控制台的 HTTP 面必须**有界**：客户端轮询单飞 + 单次超时 + 指数退避（有上限）+ 页面隐藏
+   时暂停；服务端视图用短 TTL 缓存并在状态变化时主动失效；`/project-mcp/start` 只保证授权
+   写入完成即返回 `accepted`，**不**等挂载。悬着一条请求就会占住页面的同源连接，连带堵住
+   会话数据与子代理会话（2026-10-29 实测）。
 
 ## 源码地图摘要
 
 | 模块 | 职责 |
 | --- | --- |
-| `src/index.ts` | 插件入口 `apply`：装配命令、订阅 `agent/created` / `agent/disposed`、挂载与卸载、写信任存储。**唯一做会话数据 I/O 与 Cordis 交互的模块** |
+| `src/index.ts` | 插件入口 `apply`：装配命令、订阅 `agent/created` / `agent/disposed`、后台挂载与卸载、写信任存储、控制台视图缓存（TTL + 主动失效）、后台挂载去重表。**唯一做会话数据 I/O 与 Cordis 交互的模块** |
 | `src/config-guard.ts` | 挂载前的 Config 自校验（非法配置拦在 `ctx.plugin()` 之前）与只记类型名的 `errorName` |
 | `src/types.ts` | 宿主服务的最小鸭子类型（不 import `@deepseek-ai/*`） |
 | `src/profile-modules.ts` | 从当前 profile 解析并预载 DSH 运行时模块 |
-| `src/discovery.ts` | 项目根发现（向上找 `.git`）、`.mcp.json` 读取与解析 |
+| `src/discovery.ts` | 项目根发现（向上找 `.git`）、`.mcp.json` 读取与解析；顶层无 `mcpServers` 时的兼容解析（只收含 `command` / `url` / `type` 的对象值） |
 | `src/values.ts` | `${VAR}` 展开与不受信 JSON 的形状守卫（`translate.ts` 与 `serve.ts` 共用） |
 | `src/translate.ts` | 条目 → `McpClientConfig`、`serverName` 规范化、解析 `serve` 字段 |
 | `src/health.ts` | `checkHealth` / `waitReady` / `isHttpUrl`：就绪探测与轮询（I/O 全部注入） |
@@ -79,11 +87,11 @@
 | `src/session-tag.ts` | `withSessionTag`：给 stdio config 追加 `--project-mcp-session <SessionId>` 会话标记（纯函数，返回新对象） |
 | `src/console-view.ts` | `composeConsoleView`：计划 + 挂载记账 + serve 进行中表 → 控制台视图（纯函数，需动作数口径在此钉死） |
 | `src/same-origin.ts` | `requestAllowed`：两座 HTTP 桥**共用**的同源三重围栏（peer 回环 + `Host` 白名单 + `sec-fetch-site`/`Origin`），拒绝理由 `loopback-only` / `same-origin-only`（纯函数，零 I/O） |
-| `src/console-bridge.ts` | `installConsoleBridge`：`webServer` 前缀路由（status / start / revoke）。准入调 `same-origin.ts` 的 `requestAllowed`（同源三重围栏），**不用 nonce、不注册 `tapIndex`**（**真实 HTTP I/O**） |
+| `src/console-bridge.ts` | `installConsoleBridge`：`webServer` 前缀路由（status / start / revoke）。准入调 `same-origin.ts` 的 `requestAllowed`（同源三重围栏），**不用 nonce、不注册 `tapIndex`**；同 (动作, 会话, 服务器) 的在途请求只跑一次、重复立刻回 `accepted`，每个动作另有等待上限（**真实 HTTP I/O**） |
 | `src/debug-view.ts` | 工具调试台的纯函数投影：MCP 名解析、分组、关键词过滤、schema → 表单、表单 → 参数（**零 I/O**） |
 | `src/debug-executor.ts` | `DebugExecutor`：`callId` 序列 + 取消表 + 结果块投影（`.value` 优先、图片 4 MiB 截断） |
 | `src/debug-bridge.ts` | `installDebugBridge`：`webServer` 前缀路由（tools / call / cancel / prompt-sections / skills / skill）。准入与 `console-bridge` **共用** `same-origin.ts` 的同源三重围栏（peer 回环 + `Host` 白名单 + `sec-fetch-site`/`Origin`），两座桥都**刻意不用 nonce**；技能按**会话作用域**列举（`session` 解析成 agent 当 `scope`，否则 preset 的 `customSkillDirs` 技能看不到）（**真实 HTTP I/O**） |
-| `client.js` | Client 半边（plain-JS bundle）：输入区按钮 + 内联锚定弹层（点外部/Esc 关闭）；`conversation.view` 的「工具调试」Tab（工具树 / 调用 / 结果 / 技能 / 提示词面）；会话 id 经注册项 `inject` 注入（不做任何会话数据折叠） |
+| `client.js` | Client 半边（plain-JS bundle）：输入区按钮 + 内联锚定弹层（点外部/Esc 关闭）；`conversation.view` 的「工具调试」Tab（工具树 / 调用 / 结果 / 技能 / 提示词面）；会话 id 经注册项 `inject` 注入（不做任何会话数据折叠）；状态取数走**有界轮询**（单飞 + 超时 + 退避 + 可见性暂停，见红线 14） |
 
 依赖方向单向无环：
 
@@ -122,7 +130,7 @@ index.ts ──> session.ts ──> discovery.ts, translate.ts, trust.ts, global
 ```powershell
 npm install
 npm run typecheck                        # tsc -p tsconfig.json --noEmit
-npm test                                 # 298 个用例，20 个测试文件
+npm test                                 # 323 个用例，22 个测试文件
 npm pack --dry-run                       # 核对 tarball 内容（files 字段）
 (Get-Content AGENTS.md).Count            # 必须 ≤ 200
 ```

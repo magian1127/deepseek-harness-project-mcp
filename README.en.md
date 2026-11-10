@@ -18,9 +18,9 @@ approve it per project.
 | No approval, no connection | Unapproved servers spawn no process and open no connection; cloning an unknown repository and opening it executes nothing from it |
 | Config-hash binding | Approval is bound to **each server's current configuration**, so a `git pull` only forces re-approval for the servers it changed |
 | A repository cannot approve itself | Approval records live only in `${DSH_HOME:-~/.dsh}`; the project has no writable approval channel |
-| Approve from the UI | A composer button plus a popup: pressing [Start] approves and mounts into the current session immediately, with no restart |
+| Approve from the UI | A composer button plus a popup: pressing [Start] approves and hands the mount to a background task (asynchronous), with no restart |
 | Two transports | `stdio` and `streamable-http` (`http` is an alias) |
-| On-demand HTTP server startup | An HTTP entry can declare `serve`: how to start the server when it is not running. If the health check fails, the plugin starts it and waits for readiness before connecting |
+| On-demand HTTP server startup | An HTTP entry can declare `serve`: how to start the server when it is not running. If the health check fails, the plugin starts it and waits for readiness before connecting (the wait runs in the background and never blocks opening a session) |
 | Variable expansion | `command` / `args` / `env` / `url` / `headers` / `serve.*` support `${VAR}` and `${VAR:-default}` |
 | Global name-collision guard | A project server sharing a name with a global profile MCP row is not mounted twice |
 | No double mount for subagents | A subagent session (`origin === 'subagent'`) shares its parent's workspace, so no extra connection or child process is created; a forked session is an independent conversation and is mounted normally |
@@ -98,6 +98,12 @@ A server's tools appear as `mcp__<serverName>__<toolName>`; for a renamed server
 the normalized name. Full semantics, skip reasons, and boundaries live in the
 [behavior contract](docs/behavior.md).
 
+**Omitting the top-level `mcpServers` wrapper is tolerated, but write the wrapper as shown above**:
+without it, the plugin treats every top-level object whose value contains `command`, `url`, or
+`type` as a server and logs one line reminding you to add the wrapper; when nothing looks like a
+server, the file still counts as declaring no servers. The wrapper form is the safer one — the
+top-level key space is reserved for future metadata (`$schema`, `version`, …).
+
 ### On-demand HTTP server startup (`serve`)
 
 In HTTP mode DSH **spawns no child process** — it only sends requests to `url`, so the server must
@@ -136,10 +142,11 @@ Behavior:
   entry is handed straight to DSH with no extra action.
 - **The server is started only when that check fails**, then `health` is polled every 250 ms and the
   entry is handed over once ready.
-- **Your first message waits for readiness** (at most `readyTimeoutMs`). This is the only
-  user-visible cost: the wait happens on the session-creation path, so the tools are registered
-  before the first request. The wait affects **only that entry** — other servers in the same
-  session are mounted immediately.
+- **Your first message never waits for readiness** (since 2026-10-29): the session is created
+  immediately and `serve`'s readiness wait runs inside a **background mount task**. The entry shows
+  as `starting` in the popup and is mounted once ready — the cost is that its tools may appear one
+  turn later instead of stalling the whole conversation. The wait affects **only that entry**; other
+  servers in the same session are mounted immediately.
 - **A timeout still connects**: one log line is written and DSH retries on its own (tools register
   but stay unavailable for a while).
 - **A started server outlives DSH**: it inherits no pipes and the reference is dropped immediately.
@@ -165,9 +172,13 @@ Diagnosing "the server was not started" and "why is it taking so long":
 
 | Action | Behavior |
 | --- | --- |
-| [Start] | Approves **that server's current configuration** and mounts it into the current session immediately |
+| [Start] | Approves **that server's current configuration** and hands it to a background mount immediately |
 | [Retry] | Mounts a failed server again (without rewriting the approval when the config is unchanged) |
 | [Revoke] | Deletes that server's approval record and unmounts it from the current session |
+
+[Start] is an **asynchronous action**: once the approval write completes the request returns
+`accepted` and the mount continues in the background. The popup row goes from `starting` to
+`mounted` (or `failed`) without reopening the session.
 
 Approving needs no session restart. Changing a server's configuration invalidates **its** hash and
 forces re-approval — that is exactly the protection when a `git pull` brings in a new server, and
@@ -258,12 +269,24 @@ Behavior notes:
   > requests and DNS rebinding; a nonce would not keep anyone extra out.
   > The debug console can execute any registered tool, so it is meant for the loopback GUI only.
 
+## Known behavior changes (2026-10-29)
+
+| Change | Before | Now |
+| --- | --- | --- |
+| Opening a session no longer waits for an HTTP server | An entry with `serve` could block **session creation** for up to `readyTimeoutMs` (120 s default) while its server started; opening several subagents stalled the whole conversation | The session is created immediately; `serve`'s readiness wait runs in the background, the entry shows `starting`, and it is mounted once ready |
+| [Start] is an asynchronous action | Clicking waited for the mount to finish (up to two minutes for an HTTP entry), holding one browser connection per click | The request returns `accepted` right after the approval write; the mount continues in the background and the poll reports `starting` → `mounted` / `failed` |
+| Console polling is bounded | One request every 1.5 s, with no single-flight, no timeout, no backoff, and polling in background tabs | Single-flight + per-request timeout + exponential backoff (capped) + paused while the page is hidden; the server side caches its view for a short TTL |
+
+All three are the same problem: the old implementation put "wait for an external service" on the
+**session-creation** and **HTTP-response** paths that everyone shares. Moving it to the background
+leaves only one cost — that entry's tools show up a little later.
+
 ## Known limitations
 
 | Limitation | Detail |
 | --- | --- |
 | Per-session connections | A project server under N sessions means N connections and child processes (a global profile row has one). A stdio server gets `--project-mcp-session <session id>` appended after the `args` from `.mcp.json`, so you can tell which session owns a process — the rest of the command line is byte-identical across sessions for the same `.mcp.json`. The marker carries the session id only, never any configuration content, and servers ignore unknown arguments, so it does not affect runtime |
-| First message may miss the tools | Mounting does not wait for the MCP connection; instant sessions cost the first message's tool visibility, which returns on the next turn. **Exception**: an HTTP entry with `serve` waits for the health check first (bounded, never throws) — see above |
+| First message may miss the tools | Mounting does not wait for the MCP connection; instant sessions cost the first message's tool visibility, which returns on the next turn. An HTTP entry with `serve` may take one more turn (its background mount is still waiting for readiness) and shows as `starting` in the popup |
 | Unsupported transports | `sse` / `ws` / `sdk` are always skipped; SSE is deprecated in the MCP spec and mainstream servers offer `streamable-http` |
 | Disabled global rows still claim the name | The collision check looks only at a row's module name and `serverName`, not at `disabled: true`; a disabled row therefore makes a same-named project server skip as "already provided globally" while the global side never connects |
 | Global rows are out of scope | MCP rows in profile patches still connect at DSH startup; this plugin detects them (the name list feeds the collision check only) but **does not warn**, and cannot prevent them. Editing the profile patch is the only remedy and lies outside this plugin's scope, so it does not interrupt startup over something you cannot act on |
@@ -274,7 +297,8 @@ Behavior notes:
 | `serve` does not manage the server's lifetime | A started server outlives DSH: the plugin never kills, monitors, or restarts it. That is what lets several instances share one server; the cost is that a mistyped `serve` leaves a resident process you must end yourself |
 | On Windows, "outlives DSH" also depends on how the server is launched | When `serve.command` is PowerShell the plugin does not use `detached` (with it, PowerShell would not run a single line). Whether the server then outlives DSH depends on how that script creates it: a process created by `Start-Process -WindowStyle Hidden` has no console and survives, while one running in the script's foreground dies with the host console. Any other command keeps `detached` and survives independently |
 | `serve` does not check port ownership | If the port is taken by something else, one log line is written; nothing is preempted or retried, and the entry is handed to DSH as usual (it may connect to that other instance) |
-| `serve`'s wait is bounded | Default 120 s (configurable, hard-capped at 30 min). After a timeout the entry is still mounted, the tools stay unavailable for a while, and DSH retries on its own |
+| `serve`'s wait is bounded | Default 120 s (configurable, hard-capped at 30 min). After a timeout the entry is still mounted, the tools stay unavailable for a while, and DSH retries on its own. The cap only bounds the **background** wait — it never affects session creation |
+| Console state lags at most one poll | State is polled and the server-side view is cached for a short TTL; approving, revoking, and a settled mount invalidate it immediately, so it lags by at most one poll interval |
 | The debug console ignores session scope | It lists and executes tools from the global host view (`schemas()` / `execute()` carry no agent scope), so session-level tool deny patches do **not** apply to it. This is deliberate: the console's whole value is seeing the real tool surface, and only someone holding the page can trigger it |
 | The debug form does not validate against the schema | It generates controls from the top level of the JSON Schema and does not validate before submitting; the tool decides whether the arguments are valid (the same path a model call takes). For deeply nested schemas, use raw JSON mode |
 

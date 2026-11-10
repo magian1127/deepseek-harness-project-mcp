@@ -275,6 +275,24 @@ async function until(check: () => boolean, timeoutMs = 5000): Promise<boolean> {
   return check()
 }
 
+/**
+ * 等到 `check()` 为真，否则以明确的标签失败。
+ *
+ * **为什么必须有它**：2026-10-29 起 `agent/created` 的监听器**同步**返回 `undefined`
+ * （红线 4：不得把可能长期挂起的 promise 返回给宿主），挂载因此落在后台。所以 `fire`
+ * 返回只代表**会话创建**完成——"`ctx.plugin()` 被调用了"是"serve 那一步已经跑完"的
+ * 可观测信号，断言（含**负向**的"不 spawn"）必须排在它之后。
+ *
+ * 不用固定 sleep 代替：那在慢机器上会偶发失败，也把真实完成信号藏起来。
+ */
+async function waitFor(check: () => boolean, label: string, timeoutMs = 10_000): Promise<void> {
+  const started = Date.now()
+  while (!check()) {
+    if (Date.now() - started > timeoutMs) throw new Error(`waitFor 超时：${label}`)
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+}
+
 // —— 端到端：健康检查失败 → 真的把服务拉起来 → 挂载继续 ——
 
 test('端到端：健康检查失败 + 有 serve → 真实 spawn 拉起服务，并把 serve.env 传给子进程', async () => {
@@ -311,6 +329,8 @@ test('端到端：健康检查失败 + 有 serve → 真实 spawn 拉起服务�
     'placeholder-token-not-real',
     'serve.env 必须真的被传给子进程（而不是只存在于本进程内存里）',
   )
+  // 挂载在后台：`ctx.plugin()` 被调用 = serve 那一步（spawn + 等就绪）已经跑完。
+  await waitFor(() => harness.pluginCalls.length === 1, '超时后仍然挂载')
 
   // 2. 超时后**仍然挂载**（设计 §8 决策 2：交给 mcp-client 自己重试）。
   assert.equal(harness.pluginCalls.length, 1, '超时不得阻止挂载')
@@ -355,6 +375,9 @@ test('端到端：健康检查成功 → 不 spawn（serve 完全不被触碰）
     apply(harness.host as never, {})
 
     await harness.fire('agent/created', { agent: harness.makeAgent(project) })
+    // **先**等挂载完成（= serve 步骤跑完），再断言"没有 spawn"：顺序反了就成了
+    // "还没跑到那一步所以没 spawn"的假阳性。
+    await waitFor(() => harness.pluginCalls.length === 1, '健康检查成功后照常挂载')
 
     // 服务已在跑（健康端点 200）→ 零额外动作：不 spawn，也没有超时诊断。
     assert.equal(existsSync(marker), false, '健康检查成功时不得 spawn 服务')
@@ -375,6 +398,7 @@ test('端到端：健康检查失败 + 无 serve → 不 spawn、记 warn、仍�
   apply(harness.host as never, {})
 
   await harness.fire('agent/created', { agent: harness.makeAgent(project) })
+  await waitFor(() => harness.pluginCalls.length === 1, '没有 serve 也必须照常挂载')
 
   assert.equal(harness.pluginCalls.length, 1, '没有 serve 也必须照常挂载')
   const logs = harness.joined()
@@ -413,6 +437,7 @@ test('端到端：两个会话同时挂载同一 url → 只 spawn 一次（并�
   ])
 
   // 两个会话各自挂载了自己的 mcp-client 实例（每个会话一份连接，规格 §10）。
+  await waitFor(() => harness.pluginCalls.length === 2, '两个会话各挂一次')
   assert.equal(harness.pluginCalls.length, 2, '两个会话各挂一次')
 
   const logPath = join(dir, 'spawns.log')
@@ -442,6 +467,7 @@ test('端到端：serve 元数据被剥离，绝不交给 ctx.plugin()（它不�
   apply(harness.host as never, {})
 
   await harness.fire('agent/created', { agent: harness.makeAgent(project) })
+  await waitFor(() => harness.pluginCalls.length === 1, 'serve 元数据被剥离后仍挂载')
 
   assert.equal(harness.pluginCalls.length, 1)
   const config = harness.pluginCalls[0]!.config
@@ -478,6 +504,8 @@ test('端到端：展开后的 serve.env 值不出现在任何日志（红线 3�
   apply(harness.host as never, {})
 
   await harness.fire('agent/created', { agent: harness.makeAgent(project) })
+  // 超时诊断是"serve 步骤真的跑完了"的信号（挂载在后台，fire 不再等它）。
+  await waitFor(() => /等待就绪/.test(harness.joined()), '等待就绪超时的诊断')
 
   const logs = harness.joined()
   assert.match(logs, /等待就绪/, `前置条件：确实走到了超时诊断：${logs}`)
@@ -503,6 +531,7 @@ test('回归：stdio 条目零额外动作——不探测、不 spawn、不记 s
   apply(harness.host as never, {})
 
   await harness.fire('agent/created', { agent: harness.makeAgent(project) })
+  await waitFor(() => harness.pluginCalls.length === 1, 'stdio 条目照常挂载')
 
   assert.equal(harness.pluginCalls.length, 1, 'stdio 条目照常挂载')
   assert.equal(harness.pluginCalls[0]!.config.transport, 'stdio')
@@ -518,6 +547,7 @@ test('回归：stdio 条目仍然追加会话标记，且不受 serve 解析影�
   apply(harness.host as never, {})
 
   await harness.fire('agent/created', { agent: harness.makeAgent(project, { id: 'session-1' }) })
+  await waitFor(() => harness.pluginCalls.length === 1, 'stdio 条目挂载')
 
   assert.deepEqual(harness.pluginCalls[0]!.config.args, [
     '--stdio',
@@ -541,6 +571,7 @@ test('serve 畸形（缺 command）→ 跳过 serve + 记 warn，条目仍挂载
   apply(harness.host as never, {})
 
   await harness.fire('agent/created', { agent: harness.makeAgent(project) })
+  await waitFor(() => harness.pluginCalls.length === 1, 'serve 畸形仍挂载')
 
   assert.equal(harness.pluginCalls.length, 1, 'serve 畸形不得让整条条目消失')
   assert.equal(Object.hasOwn(harness.pluginCalls[0]!.config, 'serve'), false)
@@ -562,6 +593,7 @@ test('serve 畸形（health scheme 非法）→ 跳过 serve + 记 warn，不抛
   apply(harness.host as never, {})
 
   await harness.fire('agent/created', { agent: harness.makeAgent(project) })
+  await waitFor(() => harness.pluginCalls.length === 1, 'serve 畸形也不抛、仍挂载')
 
   assert.equal(harness.pluginCalls.length, 1, '仍挂载')
   assert.match(harness.joined(), /serve 配置已被忽略/, `应留下可查诊断：${harness.joined()}`)
@@ -597,6 +629,10 @@ test('readyTimeoutMs 非法 → 退回默认并留下可查诊断（不是静默
     apply(harness.host as never, {})
 
     await harness.fire('agent/created', { agent: harness.makeAgent(project) })
+    // **必须在关掉健康端点之前**等挂载落定：健康检查在后台进行，若先 close 服务器，
+    // 探测就会失败，于是退回默认 `readyTimeoutMs` 的 120 秒等待会在后台真的跑起来
+    // （把整个测试进程吊住两分钟）——那正是修复后首次全量实测到的现象。
+    await waitFor(() => harness.pluginCalls.length === 1, 'readyTimeoutMs 非法仍照常挂载')
 
     const logs = harness.joined()
     assert.match(logs, /serve 配置已被修正/, `非法值必须留下可查诊断：${logs}`)

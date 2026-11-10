@@ -5,6 +5,9 @@
 > `mounted` → MCP 连接可用）。**待办**：Client 半边首次供应需一次 `dsh web` 重启（宿主
 > `clientModules` 的进程级负缓存）；重启后的按钮渲染与弹层交互仍需肉眼验收（§9）。
 > 用户可见语义的权威位置仍是 [`behavior.md`](behavior.md)；本文只写"为什么这样设计"。
+> **2026-10-29 修订**：会话创建路径不再等 `serve` 就绪（挂载转后台任务），客户端轮询加上
+> 单飞/超时/退避/可见性边界，`start` 改为立即返回 `accepted`。详见
+> [`development.md` §10](development.md#10-实现约束会话创建路径后台挂载与控制台轮询)。
 > 关联缺陷背景：[`design-http-serve.md` §4.3](design-http-serve.md)（Windows `DETACHED_PROCESS`
 > 让 PowerShell 静默空转，会话创建白等 120 秒）。
 
@@ -109,7 +112,7 @@ Host（index.ts 装配）
   └─ agent/created      同步：登记 + 对已授权服务器 fire-and-forget 挂载；**不 await 任何 I/O 结果**
 Client（client.js，plain JS）
   ├─ conversation.input.left  按钮 + 内联锚定弹层（sessionId 由注册项 inject 注入）
-  └─ fetch('/project-mcp/…')  status 轮询（1.5s）+ start/revoke（同源 fetch，无 nonce）
+  └─ fetch('/project-mcp/…')  status 有界轮询（单飞 + 超时 + 退避 + 隐藏暂停）+ start/revoke（同源 fetch，无 nonce；start 立即回 accepted）
 ```
 
 ### 4.1 Host 状态中心
@@ -160,8 +163,13 @@ Client（client.js，plain JS）
   弹层由按钮组件**内联渲染**（fixed 锚定按钮上方），不再使用 `shell.overlay`（root 作用域
   拿不到会话；跨组件共享开关状态曾导致弹层无法关闭）。
 - 会话 id 由注册项 `inject: sessionId => ({ sessionId })` 注入（slot standardProps 无
-  `sessionId`）；状态经同源 fetch 轮询 `/project-mcp/status`（1.5s），**最小切片**渲染。
-  运行时权威描述见 [`behavior.md`](behavior.md) §7（本文件的 `@Remote follow` 设想未采用，
+  `sessionId`）；状态经同源 fetch 轮询 `/project-mcp/status`，**最小切片**渲染。
+  **2026-10-29 修订**：轮询是有界的——单飞（有在途请求就不发新的）+ 单次超时 + 指数退避
+  （有上限）+ 页面隐藏时暂停；`start` 改为"授权写入完成即返回 `accepted`"，挂载在后台，
+  客户端不能把 `ok` 当成"已挂载"。实现常量与契约见
+  [`development.md` §10.3–§10.4](development.md#103-客户端轮询边界)，
+  语义见 [`behavior.md` §7.6–§7.7](behavior.md#76-轮询节奏与请求边界)。
+  运行时权威描述仍是 [`behavior.md`](behavior.md) §7（本文件的 `@Remote follow` 设想未采用，
   实现走 `webServer` 前缀路由 + 轮询）。
 - 文案走 `ctx.locale.register`（zh + en）；样式只用 `--dsw-alias-*` 主题令牌；控件自写
   （不 import 宿主 UI 包，practices 明令禁止）。
@@ -218,7 +226,8 @@ unauthorized ──start──> starting ──ok──> connected
   补挂——顺带让"换血后活会话拿不到工具"从"必须重开会话"变成"点一下"。
 - `starting` 只是瞬态：挂载 fiber 拒绝即转 `failed`；serve 超时不转 failed，条目保持
   `mounted`/`starting` 并由 `mcp-client` 自连（与现状语义一致，只是从"日志里一条 warn"变成
-  按钮上的一个数）。
+  按钮上的一个数）。**唯一的合法长 `starting`** 是 HTTP 条目的后台挂载在等自己的服务就绪
+  （上限 `readyTimeoutMs`）——它不再阻塞会话创建，只是该条目的工具晚出现。
 
 ## 6 失败模式与诊断归属
 

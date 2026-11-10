@@ -115,6 +115,15 @@ export function planSessionMount(input: SessionMountInput): SessionMountPlan {
   const candidates: Candidate[] = []
   const skipped: SkipNote[] = []
   const diagnostics: string[] = []
+  // 兼容分支的线索：文件缺 `mcpServers` 包裹、顶层键被当成服务器解析了。诊断只在
+  // `mount` 计划里带出（见本函数末尾），装配层会把它写进日志——兼容成功不等于文件合规，
+  // 否则用户会一直不知道自己的 `.mcp.json` 与约定不一致。
+  if (parsed.implicitServers === true) {
+    diagnostics.push(
+      `${projectRoot} 的 .mcp.json 缺少顶层 "mcpServers" 包裹，已按顶层键解析服务器；` +
+        '建议改成 { "mcpServers": { … } }，以免与将来的其它顶层字段混淆',
+    )
+  }
   for (const [name, entry] of Object.entries(parsed.servers)) {
     const result = translateServer(name, entry, { cwd, env: input.env, diagnostics })
     if (result.kind === 'ok') {

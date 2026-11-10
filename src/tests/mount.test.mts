@@ -181,6 +181,38 @@ interface ConsoleViewLike {
   fileNote?: string
 }
 
+/**
+ * 等到 `check()` 为真，或超时。
+ *
+ * **为什么必须有它**：2026-10-29 起 `agent/created` 的监听器**同步**返回 `undefined`
+ * （红线 4：不得把可能长期挂起的 promise 返回给宿主），挂载因此落在后台。于是"`fire`
+ * 返回了"只说明**会话创建**完成，**不**说明挂载完成——断言前必须显式等它推进到某个
+ * 可观测点（`ctx.plugin()` 被调用 / 诊断日志出现）。
+ *
+ * 刻意不用固定 `setTimeout(50)`：那在慢机器上会偶发失败，而且把真实的完成信号藏起来。
+ */
+async function waitFor(check: () => boolean, label: string, timeoutMs = 5000): Promise<void> {
+  const started = Date.now()
+  while (!check()) {
+    if (Date.now() - started > timeoutMs) throw new Error(`waitFor 超时：${label}`)
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+}
+
+/**
+ * 断言"在 `durationMs` 内始终不成立"。
+ *
+ * 用于**负向**守护（不得重复挂载等）：负向行为没有"完成"信号可言，只能在有界窗口里
+ * 反复确认它确实没发生——这不是拿固定 sleep 冒充条件等待。
+ */
+async function expectStays(check: () => boolean, label: string, durationMs = 300): Promise<void> {
+  const deadline = Date.now() + durationMs
+  while (Date.now() < deadline) {
+    if (check()) throw new Error(`expectStays 违例：${label}`)
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+}
+
 function createHarness(
   options: { loader?: unknown; withWebServer?: boolean; consolePeer?: string } = {},
 ) {
@@ -298,6 +330,9 @@ function createHarness(
 
   return {
     host, logs, pluginCalls, fibers, sections, makeAgent,
+    // 新契约下挂载在后台发生：断言前用它们等真实完成信号（见 `waitFor` 的说明）。
+    waitFor,
+    expectStays,
     /** `tapIndex` 当前注册数（两座桥都应为 0）。 */
     tapRegistrations: () => tapRegistrations,
     /**
@@ -397,6 +432,7 @@ test('已批准时挂载进 agent scope，配置带 failOnStartupError: false', 
   apply(harness.host as never, {})
 
   await harness.fire('agent/created', { agent: harness.makeAgent(project) })
+  await harness.waitFor(() => harness.pluginCalls.length === 1, '已批准的项目服务器应挂载一次')
 
   assert.equal(harness.pluginCalls.length, 1, '已批准的项目服务器应挂载一次')
   assert.equal(harness.pluginCalls[0]!.config.serverName, 'alpha')
@@ -426,6 +462,7 @@ test('ctx.get(loader) 传的是 Loader 本体：全局撞名项被跳过', async
   apply(harness.host as never, {})
 
   await harness.fire('agent/created', { agent: harness.makeAgent(project) })
+  await harness.waitFor(() => harness.pluginCalls.length === 1, 'free 应被挂载')
 
   assert.deepEqual(
     harness.pluginCalls.map(call => call.config.serverName),
@@ -498,10 +535,15 @@ test('重复启动只挂载一次（幂等）：批准走控制台，挂载层�
   const api = harness.consoleApi()
   const first = await api.start(agent.id, 'alpha')
   assert.equal(first.body?.ok, true, first.body?.reason)
-  assert.equal(harness.pluginCalls.length, 1, '批准后应立即挂载')
+  // start 现在只回 accepted，挂载落在后台：先等它真的发生，再谈幂等。
+  await harness.waitFor(() => harness.pluginCalls.length === 1, '批准后应在后台挂载一次')
 
   const second = await api.start(agent.id, 'alpha')
   assert.equal(second.body?.ok, true, second.body?.reason)
+  await harness.expectStays(
+    () => harness.pluginCalls.length > 1,
+    '重复批准不得重复挂载同一 serverName',
+  )
   assert.equal(harness.pluginCalls.length, 1, '重复批准不得重复挂载同一 serverName')
 })
 
@@ -515,6 +557,7 @@ test('插件卸载回收 agent 维度注册：挂载 fiber 被拆除', async () 
   // 两个**不同**会话（默认 id 各自唯一）：一个已批准、一个待批准，两条注册都必须能回收。
   await harness.fire('agent/created', { agent: harness.makeAgent(mounted) })
   await harness.fire('agent/created', { agent: harness.makeAgent(pending) })
+  await harness.waitFor(() => harness.pluginCalls.length === 1, '已批准会话的后台挂载')
 
   assert.equal(harness.pluginCalls.length, 1)
   assert.equal(harness.sections.length, 0, 'G4：不再注入提示段')
@@ -534,6 +577,7 @@ test('agent 销毁清理插件侧登记项，且与插件卸载可任意顺序�
 
   const agent = harness.makeAgent(project)
   await harness.fire('agent/created', { agent })
+  await harness.waitFor(() => harness.fibers.length === 1, '后台挂载应建立 fiber')
   assert.equal(harness.fibers[0]!.disposed, 0)
 
   await harness.fire('agent/disposed', { agent })
@@ -567,6 +611,7 @@ test('webServer 缺席时降级为无控制台：挂载路径照常工作，不�
 
   const agent = harness.makeAgent(project)
   await harness.fire('agent/created', { agent })
+  await harness.waitFor(() => harness.pluginCalls.length === 1, '没有 webServer 也必须照常挂载')
   assert.equal(harness.pluginCalls.length, 1, '没有 webServer 也必须照常挂载')
 })
 
@@ -591,7 +636,8 @@ test('G4：批准全流程不注入任何提示段（模型上下文零污染）
 
   const out = await harness.consoleApi().start(agent.id, 'alpha')
   assert.equal(out.body?.ok, true, out.body?.reason)
-  assert.equal(harness.pluginCalls.length, 1, '批准后应立即挂载')
+  await harness.waitFor(() => harness.pluginCalls.length === 1, '批准后应在后台挂载')
+  assert.equal(harness.pluginCalls.length, 1, '批准后应在后台挂载')
   assert.equal(harness.sections.length, 0, '批准后同样不得注入提示段')
 })
 
@@ -604,6 +650,7 @@ test('G4：撤销后也不注入提示段（状态只走控制台）', async () 
 
   // 已批准：挂载、无提示段。
   await harness.fire('agent/created', { agent })
+  await harness.waitFor(() => harness.pluginCalls.length === 1, '已批准项目的后台挂载')
   assert.equal(harness.pluginCalls.length, 1)
   assert.equal(harness.sections.length, 0)
 
@@ -657,6 +704,7 @@ test('控制台状态取自真实挂载记账：会话 B 不谎报计划要挂�
   const api = harness.consoleApi()
   const trust = await api.start(agentA.id, 'alpha')
   assert.equal(trust.body?.ok, true, trust.body?.reason)
+  await harness.waitFor(() => harness.pluginCalls.length === 1, '只有 A 挂了')
   assert.equal(harness.pluginCalls.length, 1, '只有 A 挂了')
 
   const viewA = (await api.status(agentA.id)).body?.view as ConsoleViewLike
@@ -689,6 +737,11 @@ test('trust 回报的是实际挂载结果，不是请求挂载的 configs', asy
   // 批准本身成功了；失败的是挂载——两件事必须能分开回答，否则用户以为"没批准"。
   assert.equal(out.body?.ok, true, out.body?.reason)
   assert.equal(harness.pluginCalls.length, 0, 'agent scope 拒绝了注册')
+  // 挂载失败发生在后台：先等诊断落地，再看视图（否则读到的是挂载前的状态）。
+  await harness.waitFor(
+    () => harness.logs.some(entry => entry.message.includes('挂载项目级 MCP 服务器')),
+    '挂载失败的诊断',
+  )
   const view = (await api.status(agent.id)).body?.view as ConsoleViewLike
   assert.equal(
     view.rows.find(row => row.serverName === 'alpha')?.state,
@@ -735,7 +788,11 @@ test('挂载失败的日志只记错误类型，不回显展开后的 env 值', 
   }
 
   await harness.fire('agent/created', { agent })
-  await new Promise(resolve => setTimeout(resolve, 0))
+  // 后台挂载：等拒绝处理器真的跑过（日志是它的可观测落点）。
+  await harness.waitFor(
+    () => harness.logs.some(entry => entry.message.includes('启动失败')),
+    'fiber 拒绝的诊断',
+  )
 
   const joined = harness.logs.map(entry => entry.message).join('\n')
   assert.match(joined, /启动失败/, `应留下可查诊断：${joined}`)
@@ -775,7 +832,10 @@ test('fiber 启动失败后该名不再出现在"已挂载"里，并留下"已�
   }
 
   await harness.fire('agent/created', { agent })
-  await new Promise(resolve => setTimeout(resolve, 0))
+  await harness.waitFor(
+    () => harness.logs.some(entry => entry.message.includes('已从挂载记账移除')),
+    'fiber 拒绝后的"已从挂载记账移除"诊断',
+  )
 
   assert.equal(harness.pluginCalls.length, 1, '已批准的项目服务器应尝试挂载一次')
   assert.ok(
@@ -822,12 +882,14 @@ test('迟到的 fiber 拒绝不得摘掉同名的新条目（按身份摘除）'
   }
 
   await harness.fire('agent/created', { agent })
+  await harness.waitFor(() => calls === 1, '首次挂载应走被扣住拒绝的第一条 fiber')
   assert.equal(calls, 1, '首次挂载应走被扣住拒绝的第一条 fiber')
 
   const api = harness.consoleApi()
   // revoke 清空记账（旧 fiber 被 dispose）→ start 挂上同名的**新**条目。
   assert.equal((await api.revoke(agent.id, 'alpha')).body?.ok, true)
   assert.equal((await api.start(agent.id, 'alpha')).body?.ok, true)
+  await harness.waitFor(() => calls === 2, 'revoke 之后应能重新挂载同名服务器')
   assert.equal(calls, 2, 'revoke 之后应能重新挂载同名服务器')
 
   // 旧 fiber 的拒绝现在才到：它不属于记账里的当前条目。
@@ -904,6 +966,7 @@ test('端到端：.mcp.json 的 env 含 __proto__ 键，交给 ctx.plugin 的 co
   apply(harness.host as never, {})
 
   await harness.fire('agent/created', { agent: harness.makeAgent(project) })
+  await harness.waitFor(() => harness.pluginCalls.length === 1, '已批准的项目服务器应挂载一次')
 
   assert.equal(harness.pluginCalls.length, 1, '已批准的项目服务器应挂载一次')
   const env = (harness.pluginCalls[0]!.config as { env?: Record<string, string> }).env
@@ -925,6 +988,7 @@ test('端到端：.mcp.json 的 headers 含 __proto__ 键，交给 ctx.plugin �
   apply(harness.host as never, {})
 
   await harness.fire('agent/created', { agent: harness.makeAgent(project) })
+  await harness.waitFor(() => harness.pluginCalls.length === 1, '已批准的项目服务器应挂载一次')
 
   assert.equal(harness.pluginCalls.length, 1, '已批准的项目服务器应挂载一次')
   const headers = (harness.pluginCalls[0]!.config as { headers?: Record<string, string> }).headers
@@ -975,9 +1039,12 @@ test('同一 sessionId 的第二个 agent 对象不再重复挂载（缺陷 1 �
 
   const { first, second } = duplicateAgents(harness, project, 'session-dup')
   await harness.fire('agent/created', { agent: first })
+  await harness.waitFor(() => harness.pluginCalls.length === 1, '首次创建应挂载一次')
   assert.equal(harness.pluginCalls.length, 1, '首次创建应挂载一次')
 
   await harness.fire('agent/created', { agent: second })
+  // 第二个对象也会把挂载丢进后台：等一个"它本可以重复挂载"的窗口，再断言没有发生。
+  await harness.expectStays(() => harness.pluginCalls.length > 1, '第二个 agent 对象不得重复挂载')
   assert.equal(
     harness.pluginCalls.length,
     1,
@@ -995,6 +1062,7 @@ test('同一 sessionId 的第二个 agent 对象复用同一份记账：revoke �
 
   const { first, second } = duplicateAgents(harness, project, 'session-dup')
   await harness.fire('agent/created', { agent: first })
+  await harness.waitFor(() => harness.pluginCalls.length === 1, '首次挂载')
   assert.equal(harness.fibers[0]!.disposed, 0)
 
   // 用**第二个**对象发起撤销：登记项必须落在同一个键（会话 id）上。按对象引用记账时这里
@@ -1019,6 +1087,7 @@ test('同一 sessionId 的第二个 agent 对象销毁时清理插件侧登记�
 
   const { first, second } = duplicateAgents(harness, project, 'session-dup')
   await harness.fire('agent/created', { agent: first })
+  await harness.waitFor(() => harness.pluginCalls.length === 1, '首次挂载')
   assert.equal(harness.fibers[0]!.disposed, 0)
 
   await harness.fire('agent/disposed', { agent: second })
@@ -1056,6 +1125,7 @@ test('不同 sessionId 各自挂载，不误拦', async () => {
   const b = harness.makeAgent(project, { id: 'session-b' })
   await harness.fire('agent/created', { agent: a })
   await harness.fire('agent/created', { agent: b })
+  await harness.waitFor(() => harness.pluginCalls.length === 2, '两个不同会话各挂一次')
 
   assert.equal(harness.pluginCalls.length, 2, '两个不同会话各挂一次')
   assert.equal(harness.fibers.length, 2, '每个会话有自己的 fiber')
@@ -1073,6 +1143,9 @@ test('agent.id 缺失或非字符串时不挂载，并留下可查诊断', async
     const harness = createHarness()
     apply(harness.host as never, {})
     await harness.fire('agent/created', { agent: harness.makeAgent(project, { id: badId }) })
+    // `id` 不可用时挂载在**同步段**就被跳过（`mountInto` 的键检查在第一个 await 之前），
+    // 因此这里等的是"日志已落"而不是挂载——负向断言也不该靠固定 sleep。
+    await harness.waitFor(() => harness.logs.length > 0, 'id 不可用时应有诊断')
 
     const shown = JSON.stringify(badId)
     assert.equal(harness.pluginCalls.length, 0, `id=${shown} 时不得挂载`)
@@ -1120,6 +1193,7 @@ test('stdio 挂载的命令行带 --project-mcp-session <sessionId>，追加在�
   apply(harness.host as never, {})
 
   await harness.fire('agent/created', { agent: harness.makeAgent(project, { id: 'session-1f4830f2' }) })
+  await harness.waitFor(() => harness.pluginCalls.length === 1, 'stdio 条目挂载')
 
   assert.deepEqual(
     harness.pluginCalls[0]!.config.args,
@@ -1138,6 +1212,7 @@ test('两个会话的标记不同：多进程可据此分辨归属', async () =>
 
   await harness.fire('agent/created', { agent: harness.makeAgent(project, { id: 'session-a' }) })
   await harness.fire('agent/created', { agent: harness.makeAgent(project, { id: 'session-b' }) })
+  await harness.waitFor(() => harness.pluginCalls.length === 2, '两个会话各挂一次')
 
   const tail = (index: number) => harness.pluginCalls[index]!.config.args!.slice(-2)
   assert.deepEqual(tail(0), ['--project-mcp-session', 'session-a'])
@@ -1152,6 +1227,7 @@ test('streamable-http 挂载不追加标记（没有子进程命令行可标记�
   apply(harness.host as never, {})
 
   await harness.fire('agent/created', { agent: harness.makeAgent(project, { id: 'session-1' }) })
+  await harness.waitFor(() => harness.pluginCalls.length === 1, 'http 条目挂载')
 
   const config = harness.pluginCalls[0]!.config as { transport?: string; args?: unknown; url?: string }
   assert.equal(config.transport, 'streamable-http')
@@ -1171,6 +1247,7 @@ test('标记只含 SessionId：不得把展开后的 env 值带进命令行', as
   apply(harness.host as never, {})
 
   await harness.fire('agent/created', { agent: harness.makeAgent(project, { id: 'session-1' }) })
+  await harness.waitFor(() => harness.pluginCalls.length === 1, 'stdio 条目挂载')
 
   const args = JSON.stringify(harness.pluginCalls[0]!.config.args)
   assert.equal(args.includes(secret), false, `命令行不得携带展开后的环境变量值：${args}`)

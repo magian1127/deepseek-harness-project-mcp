@@ -41,8 +41,14 @@ export interface WebServerShape {
   }): () => void
 }
 
-/** 动作结果：`reason` 只含固定文案或错误类型名。 */
-export type ConsoleActionResult = { ok: true } | { ok: false; reason: string }
+/**
+ * 动作结果：`reason` 只含固定文案或错误类型名。
+ *
+ * `accepted` 表示"已受理、但工作还没做完"：`start` **不再**等待 MCP 挂载（对 HTTP
+ * 条目那最多可能是 `readyTimeoutMs`），批准写入完成即返回。前端拿到 `ok` 就刷新，
+ * 随后的轮询会看到 `starting` / `mounted` / `failed`。
+ */
+export type ConsoleActionResult = { ok: true; accepted?: boolean } | { ok: false; reason: string }
 
 /** 路由背后的全部能力，由装配层注入（本模块不碰信任存储与挂载记账）。 */
 export interface ConsoleBridgeDeps {
@@ -56,9 +62,31 @@ export const CONSOLE_ROUTE_PREFIX = '/project-mcp'
 
 const MAX_BODY_BYTES = 64 * 1024
 
+/**
+ * 单个动作请求的等待上限。
+ *
+ * 动作本身**不再**等待 MCP 挂载（挂载已移到 Host 侧的后台路径），所以这里的上限只兜
+ * "信任写入卡在文件锁上"这类异常。绝不能让一个 HTTP 请求无限占住浏览器的同源连接
+ * ——那会连带堵住整个页面（含会话数据与子代理会话内容），正是 2026-10-29 那次
+ * "整段对话卡住"的一半成因。
+ */
+const ACTION_TIMEOUT_MS = 15_000
+
+/**
+ * 回写 JSON。
+ *
+ * 客户端可能已经断开（用户关标签、页面卸载、请求超时被 abort）：对已结束/已销毁的
+ * `res` 再写会抛 `ERR_STREAM_WRITE_AFTER_END`，而**异步回调里**的抛出会变成未处理
+ * 拒绝——辅助面绝不能因此影响宿主。写不出去就丢弃。
+ */
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
-  res.end(JSON.stringify(body))
+  if (res.writableEnded || res.destroyed) return
+  try {
+    res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
+    res.end(JSON.stringify(body))
+  } catch {
+    // 响应无处可去：页面侧关闭连接的正常后果，不需要诊断。
+  }
 }
 
 function readBody(req: IncomingMessage): Promise<string | null> {
@@ -96,6 +124,47 @@ export function installConsoleBridge(
   webServer: WebServerShape,
   deps: ConsoleBridgeDeps,
 ): () => void {
+  /**
+   * 在途动作表：键 = `动作类型\0会话\0服务器`。
+   *
+   * 同一动作并发到达时，后到的请求**立刻**拿到 `accepted`，不排在同一条连接上等前一个
+   * 跑完。多开会话/连点两次因此不会把浏览器的同源连接池占满。
+   */
+  const inFlight = new Map<string, Promise<ConsoleActionResult>>()
+
+  /** 给动作套一层上限：到点按失败结算，绝不让 `res` 一直悬着。 */
+  const settleWithin = (promise: Promise<ConsoleActionResult>): Promise<ConsoleActionResult> =>
+    new Promise<ConsoleActionResult>(resolve => {
+      let settled = false
+      const finish = (result: ConsoleActionResult): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve(result)
+      }
+      const timer = setTimeout(() => finish({ ok: false, reason: 'timeout' }), ACTION_TIMEOUT_MS)
+      // 与 `bridge-retry` 定时器同理：未 unref 的定时器会把测试进程吊到超时。
+      timer.unref?.()
+      promise.then(finish, (error: unknown) => finish({ ok: false, reason: errorNameOf(error) }))
+    })
+
+  const runAction = (
+    kind: 'start' | 'revoke',
+    sessionId: string,
+    serverName: string,
+  ): Promise<ConsoleActionResult> => {
+    const key = `${kind}\u0000${sessionId}\u0000${serverName}`
+    if (inFlight.has(key)) return Promise.resolve({ ok: true, accepted: true })
+    const action = kind === 'start' ? deps.start : deps.revoke
+    // `Promise.resolve().then(...)` 让动作里的**同步**抛出也变成拒绝，统一走 settleWithin。
+    const promise = settleWithin(Promise.resolve().then(() => action(sessionId, serverName)))
+      .finally(() => {
+        inFlight.delete(key)
+      })
+    inFlight.set(key, promise)
+    return promise
+  }
+
   const unregisterRoute = webServer.register({
     kind: 'prefix',
     path: CONSOLE_ROUTE_PREFIX,
@@ -139,10 +208,10 @@ export function installConsoleBridge(
               sendJson(res, 400, { ok: false, reason: 'missing-fields' })
               return
             }
-            const action = pathname.endsWith('/start') ? deps.start : deps.revoke
-            void action(sessionId, serverName).then(
-              result => sendJson(res, 200, result),
-              error => sendJson(res, 500, { ok: false, reason: errorNameOf(error) }),
+            const kind = pathname.endsWith('/start') ? 'start' : 'revoke'
+            // `runAction` 自带去重与等待上限：去重命中时立刻回 `accepted`，不排队。
+            void runAction(kind, sessionId, serverName).then(result =>
+              sendJson(res, 200, result),
             )
           })
           return

@@ -39,6 +39,7 @@ import { loadAtomicWrite, loadMcpClient } from './profile-modules.js'
 import { ensureServeReady, spawnDetached, splitServe } from './serve.js'
 import type { ServeIo } from './serve.js'
 import { composeConsoleView } from './console-view.js'
+import type { ConsoleView } from './console-view.js'
 import { installConsoleBridge } from './console-bridge.js'
 import type { ConsoleActionResult, ConsoleBridgeDeps, WebServerShape } from './console-bridge.js'
 import { installDebugBridge } from './debug-bridge.js'
@@ -324,8 +325,14 @@ async function mountInto(
   agent: AgentShape,
   configs: McpClientConfig[],
   serve: { inflight: Map<string, Promise<void>>; io: ServeIo },
+  /**
+   * 放弃判据（见 `abandonedSessions`）。每个 await 点之后都要重问一次：会话可能在
+   * "确保服务就绪"那两分钟里被销毁，插件也可能刚被卸载。
+   */
+  isAbandoned?: () => boolean,
 ): Promise<void> {
   if (configs.length === 0) return
+  if (isAbandoned?.() === true) return
   if (McpClient === null || McpClient === undefined) {
     ctx.logger?.warn?.('project-mcp：未能从 profile 解析到 mcp-client，跳过项目级 MCP 挂载')
     return
@@ -350,6 +357,8 @@ async function mountInto(
 
   for (const config of configs) {
     if (servers.has(config.serverName)) continue
+    // 每进一条都重问：上一条的 serve 等待期间会话可能已经被销毁。
+    if (isAbandoned?.() === true) return
 
     // `serve` 是本插件自己的元数据，**不在** `mcp-client` 的 Config schema 里，必须在
     // 任何消费点之前剥离（见 `splitServe`：它还兼着"防止展开后的 env 值经 schema 校验
@@ -393,6 +402,8 @@ async function mountInto(
     // 与本函数交叉）。重名守卫只按 scope 对象隔离，挡不住同一 scope 的第二次注册——
     // 会多出一个实例与一次子进程 spawn。因此这里**复查**一次。
     if (servers.has(bare.serverName)) continue
+    // 等待期间会话可能已被销毁、插件可能已被卸载：此时绝不能往 scope 里注册。
+    if (isAbandoned?.() === true) return
 
     try {
       // 标记在守卫**之后**追加：守卫只作准入闸，标记是挂载期的修饰，且必须在交给
@@ -619,6 +630,111 @@ export function apply(ctx: HostContext, config: unknown): void {
   const agents = new Map<AgentKey, AgentRegistrations>()
 
   /**
+   * 控制台视图缓存：`agent.id` → 最近一次合成结果（含 `null`＝该会话没有项目级 MCP）。
+   *
+   * ## 为什么必须有这层缓存
+   *
+   * 输入区按钮每 1.5 秒 GET 一次 `/project-mcp/status`，而 `viewFor` 的每次调用都要
+   * **同步**做这些事：`findProjectRoot`（逐级 `existsSync`）、读 `.mcp.json`（
+   * `inspectAgent` 一次、`collectMountable` 的探针又读一次）、读信任文件、遍历整棵
+   * Loader 树收集全局名单、再跑两遍 `planSessionMount`。单会话时这点开销看不出来，
+   * 但它在宿主主线程上是**同步**的：多开几个会话（并发子代理、侧边聊天、多标签）就把
+   * 它乘上会话数，页面所有请求一起变慢——这正是"整个 GUI 卡住"的燃料之一。
+   *
+   * ## 为什么 TTL 是 1000 毫秒
+   *
+   * 略小于客户端的轮询间隔（1500 毫秒）：正常的 1.5 秒轮询永远命中缓存后的第一次读取，
+   * 又不会让用户看到过期状态——所有会改变视图的动作（批准、撤销、后台挂载落定、
+   * 会话销毁）都会**主动失效**缓存，不依赖 TTL 过期。
+   */
+  const VIEW_CACHE_TTL_MS = 1000
+  /** 缓存条目上限：防止长期运行下按会话无限增长（真实并发会话远小于这个值）。 */
+  const VIEW_CACHE_MAX = 256
+  const viewCache = new Map<AgentKey, { at: number; view: ConsoleView | null }>()
+
+  /**
+   * 失效控制台视图缓存。
+   *
+   * 不带 `sessionId` 时清空：状态变化通常只影响一个会话，但清空是 O(条目数) 且不会
+   * 漏掉跨会话的影响（例如同一 url 的 serve 启动状态变化会改变多个会话的 `starting`）。
+   */
+  const invalidateConsoleView = (sessionId?: AgentKey): void => {
+    if (sessionId === undefined) {
+      viewCache.clear()
+      return
+    }
+    viewCache.delete(sessionId)
+  }
+
+  /**
+   * 进行中的「启动」动作键（`agent.id` + 服务器名）。
+   *
+   * 只用于**去重**：用户在弹层里连点两下、或换台设备再点一次，不该把同一个服务器
+   * 挂两遍（`ctx.plugin()` 的第二次注册会撞上 `mcp-client` 的同作用域重名守卫）。
+   * 视图状态不读它——挂载记账与 `failed` 账已经能表达 `mounted`/`failed`。
+   */
+  const startInFlight = new Set<string>()
+
+  /**
+   * 后台挂载的**取消闸门**：会话已销毁或插件已卸载时，后台任务必须立刻停手。
+   *
+   * 转后台之后，`mountInto` 的 await 点（`ensureServeReady`，HTTP 条目可能长达
+   * `readyTimeoutMs`）不再被销毁/卸载天然打断。没有这道闸门就有两个真实后果：
+   * 挂载会在**已经销毁**的会话 scope 上继续注册 fiber（泄漏连接与子进程），或者在
+   * **插件卸载之后**重新出现（"禁用插件"失效）。`abandonedSessions` 按 `agent.id`
+   * 记账，与挂载记账同一个键。
+   */
+  const abandonedSessions = new Set<AgentKey>()
+  let pluginUnloaded = false
+  /** 该会话的后台挂载是否应当放弃（插件已卸载、或会话已销毁）。 */
+  const mountAbandoned = (sessionId: AgentKey): boolean =>
+    pluginUnloaded || abandonedSessions.has(sessionId)
+
+  /**
+   * 后台执行挂载：**不**让 HTTP 响应或会话创建等它。
+   *
+   * 这是本次修复的核心：`mountInto` 对 HTTP 条目会 `await ensureServeReady`（最多等满
+   * `readyTimeoutMs`，默认 120 秒）。谁 await 它，谁就被一个外部服务的启动阻塞——
+   * 之前是 `agent/created` 的返回值（宿主 serial 派发会 await，等于卡住**会话创建**），
+   * 再之前是 `POST /start` 的响应（等于卡住**浏览器连接**最多两分钟）。
+   *
+   * 失败一律降级为日志：调用点在辅助面与后台路径上，任何结果都不能冒泡成未处理拒绝。
+   */
+  const startMountInBackground = (
+    sessionId: AgentKey | undefined,
+    agent: AgentShape,
+    configs: McpClientConfig[],
+  ): void => {
+    if (configs.length === 0) return
+    // 键不可用就**不挂载**（见 `agentKeyOf`）：退回对象引用正是重复挂载那条缺陷的成因。
+    // 但"少挂一次"必须**可查**——用户只会看到"没挂上"，没有这条诊断就永远查不出原因。
+    if (sessionId === undefined) {
+      ctx.logger?.warn?.(
+        'project-mcp：会话 agent 的 id 缺失或不是非空字符串，无法按会话记账，已跳过项目级 MCP 挂载',
+      )
+      return
+    }
+    const keys = configs.map(config => `${sessionId}\u0000${config.serverName}`)
+    if (keys.some(key => startInFlight.has(key))) return
+    for (const key of keys) startInFlight.add(key)
+    void mountInto(ctx, agents, McpClient, agent, configs, {
+      inflight: serveInflight,
+      io: serveIo,
+    }, () => mountAbandoned(sessionId))
+      .catch((error: unknown) => {
+        ctx.logger?.warn?.(
+          `project-mcp：后台挂载项目级 MCP 服务器失败（错误类型：${errorName(error)}）`,
+        )
+      })
+      .finally(() => {
+        for (const key of keys) startInFlight.delete(key)
+        // 挂载落定（成功或失败）后必须让视图重新读一遍：否则按钮会把"正在启动"
+        // 一直显示到 TTL 过期之后的那次轮询。
+        invalidateConsoleView(sessionId)
+      })
+  }
+
+  /**
    * **进行中**的服务启动表，键是条目的 `url`（见 `EnsureServeInput.inflight`）。
    *
    * 必须由 `apply` 持有并跨会话共享：两个会话同时挂载同一个 url 时会同时发现服务不可达，
@@ -655,11 +771,19 @@ export function apply(ctx: HostContext, config: unknown): void {
   // 于是 nonce 恒缺席、按钮在桌面上静默消失（2026-10-28 实测，见 console-bridge.ts 模块头）。
   const consoleDeps: ConsoleBridgeDeps = {
     viewFor: sessionId => {
+      // 先查缓存（见 `VIEW_CACHE_TTL_MS`）：命中时不碰磁盘、不遍历 Loader 树。
+      const cached = viewCache.get(sessionId)
+      const now = Date.now()
+      if (cached !== undefined && now - cached.at < VIEW_CACHE_TTL_MS) return cached.view
+
       const agent = ctx.get('agents')?.get?.(sessionId) as AgentShape | undefined
+      // 会话不可寻址时**不缓存**：这多半是"会话还在创建中"，缓存会让按钮晚一个 TTL
+      // 才出现；而这条路径本身没有任何 I/O，重算的代价可以忽略。
       if (agent === undefined || agent.session === undefined) return null
+
       const record = agents.get(sessionId)
       const view = inspectAgent(ctx, agents, agent)
-      return composeConsoleView({
+      const composed = composeConsoleView({
         plan: view.plan,
         renamed: view.renamed,
         mounted: new Set(view.mounted),
@@ -667,6 +791,13 @@ export function apply(ctx: HostContext, config: unknown): void {
         sessionKnown: record !== undefined,
         startingUrls: new Set(serveInflight.keys()),
       })
+      if (viewCache.size >= VIEW_CACHE_MAX) {
+        // Map 保持插入顺序：淘汰最早的条目即可。这里的目标是防泄漏，不是提高命中率。
+        const oldest = viewCache.keys().next()
+        if (!oldest.done) viewCache.delete(oldest.value)
+      }
+      viewCache.set(sessionId, { at: now, view: composed })
+      return composed
     },
     start: async (sessionId, serverName): Promise<ConsoleActionResult> => {
       const agent = ctx.get('agents')?.get?.(sessionId) as AgentShape | undefined
@@ -692,14 +823,22 @@ export function apply(ctx: HostContext, config: unknown): void {
             new Date().toISOString(),
           ),
         )
+        // 批准就是状态变化：立刻失效缓存，否则响应后的那次轮询可能还看到"未授权"。
+        invalidateConsoleView(sessionId)
       }
       // 批准后**重算**计划再挂：`untrusted` 的计划不带 configs，必须重算一次。
       const after = inspectAgent(ctx, agents, agent)
       if (after.plan.kind !== 'mount') return { ok: false, reason: 'not-mountable' }
       const configs = after.plan.configs.filter(config => config.serverName === serverName)
       if (configs.length === 0) return { ok: false, reason: 'unknown-server' }
-      await mountInto(ctx, agents, McpClient, agent, configs, { inflight: serveInflight, io: serveIo })
-      return { ok: true }
+      // **不 await 挂载**：HTTP 响应在挂载开始前就返回（`accepted`）。`mountInto` 对
+      // HTTP 条目可能等满 `readyTimeoutMs`（默认 120 秒），此前把它放在响应路径上，
+      // 一次点击就占住浏览器一条连接两分钟——多点几次就会把页面的同源连接占满，
+      // 表现为"整个 GUI 卡住、按钮永远转圈"。挂载落定后由后台回调失效缓存，
+      // 下一次轮询就能看到 `mounted` / `failed` / `starting` 的真实状态。
+      invalidateConsoleView(sessionId)
+      startMountInBackground(sessionId, agent, configs)
+      return { ok: true, accepted: true }
     },
     revoke: async (sessionId, serverName): Promise<ConsoleActionResult> => {
       const agent = ctx.get('agents')?.get?.(sessionId) as AgentShape | undefined
@@ -710,6 +849,7 @@ export function apply(ctx: HostContext, config: unknown): void {
       const store = readTrustStore(readFileUtf8)
       if (store.projects[root] === undefined) return { ok: false, reason: 'not-approved' }
       await writeStoreAtomic(revoke(store, root, serverName))
+      invalidateConsoleView(sessionId)
       const record = agents.get(sessionId)
       const fiber = record?.servers.get(serverName)
       if (record !== undefined && fiber !== undefined) {
@@ -816,19 +956,30 @@ export function apply(ctx: HostContext, config: unknown): void {
           const agent = (payload as { agent?: AgentShape } | undefined)?.agent
           if (agent === undefined || agent.session === undefined) return
 
+          // 同一 sessionId 可能被重新创建（clear / resume）：清掉上一轮留下的放弃标记。
+          const revivedKey = agentKeyOf(agent)
+          if (revivedKey !== undefined) abandonedSessions.delete(revivedKey)
+
           const view = inspectAgent(ctx, agents, agent)
           if (view.plan.kind === 'mount') {
-            // `mountInto` 现在是 async（HTTP 条目要先确保服务就绪），而 Cordis 的 serial
-            // 派发**会 await 监听器返回的 promise**（`vendor/cordis/src/events.ts` 的
-            // `serial`：`await cb(...args)`）——因此这里返回它即可让"用户的第一条消息等到
-            // 服务就绪"成立（`packages/core/agent/src/index.ts:550`）。
+            // **绝不**把挂载 promise 交给宿主。
             //
-            // 返回 promise 也意味着**失败路径必须自己吞掉**：本函数里 `mountInto` 内部
-            // 每个条目各有 try/catch，不会向外抛（红线 4）。
-            return mountInto(ctx, agents, McpClient, agent, view.plan.configs, {
-              inflight: serveInflight,
-              io: serveIo,
-            })
+            // Cordis 的 serial 派发会 `await` 监听器的返回值（`vendor/cordis/src/events.ts`
+            // 的 `serial`：`await cb(...args)`），而宿主在 agent 创建流程里 await
+            // `announce(...)`（`packages/core/agent/src/index.ts` 的 `announce`）。所以"返回
+            // mountInto"等于把**会话创建/恢复**按在这个等待上：`mountInto` 对 HTTP 条目会
+            // `await ensureServeReady`，最多等满 `readyTimeoutMs`（默认 120 秒）。
+            //
+            // 2026-10-29 的现场教训：一个带 `serve` 的项目（服务没起）在开了一批子代理后
+            // 表现为"整段对话卡住、任何子代理会话都显示不出来、输入区按钮永远检测中"。
+            // 根因就是这条等待落在会话创建路径上；而按钮的 status 轮询同时被拖慢，
+            // 挂起的请求把页面的同源连接占满，于是整个 GUI 的请求一起排队。
+            //
+            // 取舍：会话秒开优先（红线 5 的方向）。代价是首条消息可能赶不上工具注册
+            // ——那件事本就被文档列为已知限制；控制台会把该服务器显示成 `starting` 或
+            // `本会话未挂载`，点[启动]即可补挂。
+            // 键缺失的诊断在 `startMountInBackground` 里（与 stdio 条目共用同一条文案）。
+            startMountInBackground(revivedKey, agent, view.plan.configs)
           }
 
           // G4：不注入任何系统提示；"需要行动"由控制台按钮承载。
@@ -854,6 +1005,10 @@ export function apply(ctx: HostContext, config: unknown): void {
           if (agent === undefined) return
           const key = agentKeyOf(agent)
           if (key === undefined) return
+          // 先立闸门再清理：后台挂载可能正卡在 serve 等待里，它会在下一个 await 点
+          // 看到这道闸门并停手（否则会在已销毁的 scope 上继续注册 fiber）。
+          abandonedSessions.add(key)
+          invalidateConsoleView(key)
           const record = agents.get(key)
           if (record === undefined) return
           agents.delete(key)
@@ -870,10 +1025,15 @@ export function apply(ctx: HostContext, config: unknown): void {
   // 或 HMR 重载后活会话会继续保留项目级 MCP 挂载与陈旧提示段，直到 agent 被销毁。
   ctx.effect(
     () => () => {
+      // 闸门先落：此后任何仍在等待中的后台挂载都会在下一个 await 点停手，
+      // 不会在插件卸载之后又往会话 scope 里注册新 fiber。
+      pluginUnloaded = true
       for (const record of agents.values()) {
         disposeServers(ctx, record.servers)
       }
       agents.clear()
+      abandonedSessions.clear()
+      invalidateConsoleView()
     },
     'project-mcp:agent-registrations',
   )

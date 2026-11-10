@@ -10,7 +10,16 @@ import { dirname, posix } from 'node:path'
 export type ParseResult =
   | { kind: 'absent' }
   | { kind: 'invalid'; reason: string }
-  | { kind: 'ok'; raw: string; servers: Record<string, unknown> }
+  | {
+      kind: 'ok'
+      raw: string
+      servers: Record<string, unknown>
+      /**
+       * 服务器表来自**顶层键**而不是 `mcpServers` 包裹（见 `readProjectMcpFile` 的兼容
+       * 分支）。装配层据此记一条诊断：兼容成功不等于用户的文件合规，那条线索必须留下。
+       */
+      implicitServers?: boolean
+    }
 
 /**
  * 注入的读取实现发现文件超过尺寸上限时抛出的哨兵。
@@ -96,11 +105,29 @@ export function readProjectMcpFile(projectRoot: string, readFile: (p: string) =>
     return { kind: 'invalid', reason: `${path} 顶层必须是 JSON 对象` }
   }
 
-  const servers = parsed.mcpServers
-  if (servers === undefined) return { kind: 'ok', raw, servers: {} }
-  if (!isPlainObject(servers)) {
+  const declared = parsed.mcpServers
+  if (declared !== undefined && !isPlainObject(declared)) {
     return { kind: 'invalid', reason: `${path} 的 mcpServers 必须是 JSON 对象` }
   }
+  // `mcpServers` 存在即为准（空对象也是合法写法：等于声明零台服务器）。
+  if (isPlainObject(declared)) return { kind: 'ok', raw, servers: declared }
 
-  return { kind: 'ok', raw, servers }
+  // ---- 顶层没有 `mcpServers`：兼容"把服务器直接写在顶层"的写法 ----
+  //
+  // `mcpServers` 是 Claude Code 的约定，但把服务器名直接当顶层键在各种 MCP 客户端里
+  // 都很常见。严格判 `invalid` 会让用户面对一个**空弹层且没有任何原因**（2026-10-29
+  // 现场：一个项目的 `.mcp.json` 正是这么写的——按钮在、点开一台服务器都没有）。
+  // 静默当成"零台服务器"同样糟糕：用户看到的也是空弹层。
+  //
+  // 只收"值像服务器条目"的顶层键（普通对象，且含 `command` / `url` / `type` 之一）：
+  // 顶层将来可能出现 `$schema`、`version` 之类的元数据键，不能把它们当服务器。
+  // 一个都不像时退回既有语义（`ok` + 空表 = 文件在但没声明服务器）。
+  const implicit: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(parsed)) {
+    if (!isPlainObject(value)) continue
+    if (!('command' in value) && !('url' in value) && !('type' in value)) continue
+    implicit[key] = value
+  }
+  if (Object.keys(implicit).length === 0) return { kind: 'ok', raw, servers: {} }
+  return { kind: 'ok', raw, servers: implicit, implicitServers: true }
 }

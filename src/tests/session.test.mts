@@ -212,3 +212,55 @@ test('变量缺失的服务器被跳过且诊断不含变量值', () => {
     assert.equal(plan.skipped[0]?.reason.includes('${MISSING_VAR}'), false, '诊断只报变量名，不报值')
   }
 })
+
+// —— 兼容分支的决策层：缺 `mcpServers` 包裹的文件必须"能用 + 留下线索" ——
+//
+// 解析层（`discovery.test.mts`）负责认出顶层键；本层负责两件事：
+// 1. 照常产出可挂载/待批准的条目（兼容意味着**能用**，不是给个提示就不干活）；
+// 2. 把"文件不合约定"这条线索放进 `diagnostics`，由装配层写进日志——否则用户会一直
+//    不知道自己的 `.mcp.json` 与约定不一致（下次升级客户端就又"看不见服务器"了）。
+
+/** 顶层写法（没有 `mcpServers` 包裹）的批准：哈希取自**顶层**条目的字面量。 */
+function trustForImplicit(raw: string, originalKeys: string[], root = '/repo'): TrustStore {
+  const parsed = JSON.parse(raw) as Record<string, unknown>
+  let store: TrustStore = EMPTY_TRUST
+  for (const key of originalKeys) {
+    store = approve(store, root, normalizeServerName(key), configHashOf(parsed[key]), 't')
+  }
+  return store
+}
+
+const IMPLICIT_RAW =
+  '{"winforms-designer":{"type":"stdio","command":"dotnet","args":["--stdio"]}}'
+
+test('缺 mcpServers 包裹 + 已批准 → 照常挂载，并留下"缺少包裹"的诊断', () => {
+  const plan = planSessionMount(inputOf({
+    readFile: () => IMPLICIT_RAW,
+    trust: trustForImplicit(IMPLICIT_RAW, ['winforms-designer']),
+  }))
+
+  assert.equal(plan.kind, 'mount', '兼容分支必须真的能用，而不是给个提示就不挂载')
+  if (plan.kind !== 'mount') return
+  assert.deepEqual(plan.configs.map(config => config.serverName), ['winforms-designer'])
+  assert.deepEqual(plan.pending, [], '已批准就不该剩待批准项')
+
+  const hints = plan.diagnostics.filter(note => note.includes('缺少顶层'))
+  assert.equal(hints.length, 1, `应恰好有一条"缺少包裹"的诊断：${JSON.stringify(plan.diagnostics)}`)
+  const hint = hints[0]!
+  assert.match(hint, /"mcpServers"/, `诊断应点名缺的是 mcpServers 包裹：${hint}`)
+  assert.ok(
+    hint.includes('{ "mcpServers": { … } }'),
+    `诊断必须给出可直接照抄的写法（否则用户只知道"缺包裹"却不知道改成什么样）：${hint}`,
+  )
+  // 诊断不得回显 `.mcp.json` 的内容（红线 3 的口径：只描述问题，不复述文件）。
+  assert.equal(hint.includes('dotnet'), false, `诊断不得回显条目内容：${hint}`)
+})
+
+test('缺 mcpServers 包裹 + 未批准 → 进入 untrusted，待批准项含该服务器', () => {
+  const plan = planSessionMount(inputOf({ readFile: () => IMPLICIT_RAW }))
+
+  assert.equal(plan.kind, 'untrusted', '兼容分支同样受批准约束：未批准不得挂载')
+  if (plan.kind !== 'untrusted') return
+  assert.deepEqual(pendingNames(plan), ['winforms-designer'])
+  assert.match(plan.pending[0]!.configHash, /^sha256:[0-9a-f]{64}$/, '待批准项必须带哈希供控制台写批准')
+})

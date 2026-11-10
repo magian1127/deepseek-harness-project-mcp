@@ -129,9 +129,21 @@ export interface DebugBridgeDeps {
   warn?: (message: string) => void
 }
 
+/**
+ * 回写 JSON。
+ *
+ * 客户端可能已经断开（用户关标签、页面卸载、请求超时被 abort）：对已结束/已销毁的
+ * `res` 再写会抛 `ERR_STREAM_WRITE_AFTER_END`，而工具调用/技能读取都是**异步**回调，
+ * 那里的抛出会变成未处理拒绝——辅助面绝不能因此影响宿主。写不出去就丢弃。
+ */
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
-  res.end(JSON.stringify(body))
+  if (res.writableEnded || res.destroyed) return
+  try {
+    res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
+    res.end(JSON.stringify(body))
+  } catch {
+    // 响应无处可去：页面侧关闭连接的正常后果，不需要诊断。
+  }
 }
 
 /** 只记错误类型名（不记 message：可能带路径或配置值）。 */

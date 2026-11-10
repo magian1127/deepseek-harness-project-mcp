@@ -131,34 +131,144 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /**
+     * 「项目 MCP」状态轮询的节奏常量（Client 半边唯一的周期取数）。
+     *
+     * 为什么不用 `setInterval`：同源 HTTP 并发有硬上限，一次慢/挂起的 status 请求会被
+     * 后续每个 1.5s 的定时器不断追加，最终把整页请求（会话数据、子代理会话内容）堵死。
+     * 所以改成 `setTimeout` 链 + 单飞 + 超时 + 失败退避 + 可见性门控。
+     */
+    const POLL_BASE_MS = 1500 // 正常节奏
+    const POLL_MAX_MS = 30000 // 退避上限
+    const POLL_TIMEOUT_MS = 4000 // 单次请求上限（超时视同一次失败）
+    // 可见性看门狗周期：`visibilitychange` 可能永远不来，见 useView 里的说明。
+    const WATCHDOG_MS = 30000
+
     function useView(sessionId) {
       const [state, setState] = React.useState({ view: null, loading: true })
       React.useEffect(() => {
-        let stopped = false
-        const tick = async () => {
-          if (!sessionId) {
-            if (!stopped) setState({ view: null, loading: false })
+        // 无会话 id：一次同步回落即可，不进入轮询。
+        if (!sessionId) {
+          setState({ view: null, loading: false })
+          return undefined
+        }
+
+        let stopped = false // 组件已卸载 / 会话已切换
+        let inFlight = null // 单飞锁：在途请求的 AbortController
+        let timer = null // 下一次轮询（setTimeout 链，不是 setInterval）
+        let failures = 0 // 连续失败次数 → 退避
+        let watchdog = null // 隐藏态下的可见性复查定时器
+        let hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden'
+
+        /** 1.5s → 3s → 6s → 12s → 24s → 30s（上限）。 */
+        const nextDelay = () => Math.min(POLL_BASE_MS * Math.pow(2, failures), POLL_MAX_MS)
+
+        /**
+         * 可见性看门狗：**不能**只依赖 `visibilitychange`。
+         *
+         * 有的宿主（Electron 桌面版、被遮挡后恢复的窗口）根本不派发这个事件，甚至一开始
+         * 就报 `hidden`。没有这条兜底，首次取数会被 `hidden` 挡掉，按钮就永远停在
+         * "检测中"——2026-10-30 现场的正是这个形状（服务端 1.8ms 就返回了 200，客户端
+         * 却一直不取）。
+         */
+        function armWatchdog() {
+          if (stopped || watchdog !== null) return
+          watchdog = setTimeout(() => {
+            watchdog = null
+            if (stopped) return
+            if (typeof document !== 'undefined') hidden = document.visibilityState === 'hidden'
+            if (hidden) armWatchdog()
+            else void tick(true)
+          }, WATCHDOG_MS)
+        }
+
+        /** 排下一次；已卸载 / 在途 / 已排期时都不排；隐藏时只挂看门狗。 */
+        function schedule() {
+          if (stopped || inFlight !== null || timer !== null) return
+          if (hidden) {
+            armWatchdog()
             return
           }
+          timer = setTimeout(() => {
+            timer = null
+            void tick()
+          }, nextDelay())
+        }
+
+        /**
+         * 取一次状态。单飞：在途时不发新请求，由在途那次结算后重新排期。
+         *
+         * @param force 忽略 `hidden` 取一次。只给"首次"与"看门狗"用：把首次也挡掉，
+         * 按钮就会永远显示"检测中"（用户看不到任何原因）。
+         */
+        async function tick(force) {
+          if (stopped || inFlight !== null) return
+          if (hidden && force !== true) return
+          const controller = new AbortController()
+          inFlight = controller
+          const abortTimer = setTimeout(() => controller.abort(), POLL_TIMEOUT_MS)
+          let landed = false
           try {
-            const res = await fetch(ROUTE + '/status?session=' + encodeURIComponent(sessionId))
+            const res = await fetch(ROUTE + '/status?session=' + encodeURIComponent(sessionId), {
+              signal: controller.signal,
+            })
             if (!res.ok) {
               // 围栏/网络层失败 ≠ 本项目没有 MCP：保留既有视图（无视图仍隐藏），但留下告警。
               warnStatusFailure(res.status)
-              if (!stopped) setState(s => ({ view: s.view, loading: false }))
-              return
+            } else {
+              const data = await res.json()
+              landed = true
+              if (!stopped) setState({ view: data && data.ok ? data.view ?? null : null, loading: false })
             }
-            const data = await res.json()
-            if (!stopped) setState({ view: data && data.ok ? data.view ?? null : null, loading: false })
           } catch {
-            if (!stopped) setState(s => (s.loading ? { view: null, loading: false } : s))
+            // 超时（abort）与网络异常都算一次失败：loading 归 false 并**保留**上一次视图。
+          } finally {
+            clearTimeout(abortTimer)
+            if (inFlight === controller) inFlight = null
+            if (landed) failures = 0
+            else failures += 1
+            if (!landed && !stopped) setState(s => (s.loading ? { view: s.view, loading: false } : s))
+            schedule()
           }
         }
-        void tick()
-        const timer = setInterval(() => void tick(), 1500)
+
+        const onVisibility = () => {
+          if (typeof document === 'undefined') return
+          if (document.visibilityState === 'hidden') {
+            hidden = true
+            // 只停「下一次」；在途请求留给 4s 超时兜底，abort 它等于白费一次真实取数。
+            if (timer !== null) {
+              clearTimeout(timer)
+              timer = null
+            }
+            return
+          }
+          hidden = false
+          // 回到前台立刻补一次（force：绕开可能陈旧的 hidden）；若已有在途请求，
+          // 由它的 finally 接着排期。
+          void tick(true)
+        }
+
+        if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisibility)
+        // 首次**总是**取一次（force）：即使宿主报 hidden 也要先拿到状态，
+        // 否则按钮会永远停在"检测中"（用户看不到任何原因）。
+        void tick(true)
+
         return () => {
           stopped = true
-          clearInterval(timer)
+          if (timer !== null) {
+            clearTimeout(timer)
+            timer = null
+          }
+          if (inFlight !== null) {
+            inFlight.abort() // 卸载即取消在途请求，不给浏览器留悬挂连接
+            inFlight = null
+          }
+          if (watchdog !== null) {
+            clearTimeout(watchdog)
+            watchdog = null
+          }
+          if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisibility)
         }
       }, [sessionId])
       return state

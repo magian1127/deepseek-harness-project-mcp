@@ -22,26 +22,26 @@
 
 | 模块 | 职责 | I/O |
 | --- | --- | --- |
-| `index.ts` | 插件入口 `apply`：装配命令、订阅 `agent/created` 与 `agent/disposed`、挂载与卸载、写信任存储、持有按 `url` 的进行中启动表 | **唯一做会话数据 I/O 与 Cordis 交互的模块**（`profile-modules.ts` / `serve.ts` 是显式例外，见下） |
+| `index.ts` | 插件入口 `apply`：装配命令、订阅 `agent/created` 与 `agent/disposed`、挂载与卸载、写信任存储、持有按 `url` 的进行中启动表、控制台视图缓存（TTL + 主动失效）与后台挂载去重表 | **唯一做会话数据 I/O 与 Cordis 交互的模块**（`profile-modules.ts` / `serve.ts` 是显式例外，见下） |
 | `config-guard.ts` | 挂载前的 Config 自校验（`validateMountConfig`）与只记类型名的 `errorName` | 纯函数 |
 | `types.ts` | 宿主服务的最小鸭子类型（`HostContext` / `AgentContext` / `CommandsService` / `SystemPromptService` / `LoaderService` / `AgentShape` / `McpClientConfig` / `ServeMetadata`） | 无 |
 | `profile-modules.ts` | 从当前 profile 的模块解析上下文解析并预载 DSH 运行时模块 | 模块解析 + 文件读 |
-| `discovery.ts` | 项目根发现（向上找 `.git`）、`.mcp.json` 读取与解析 | 纯函数 + 注入 I/O |
+| `discovery.ts` | 项目根发现（向上找 `.git`）、`.mcp.json` 读取与解析；顶层无 `mcpServers` 时的**兼容解析**（只收含 `command` / `url` / `type` 的对象值，命中则置 `implicitServers`） | 纯函数 + 注入 I/O |
 | `values.ts` | `${VAR}` 展开与不受信 JSON 的形状守卫（`asStringArray` / `asStringRecord` / `expandRecord` / `expandList`） | 纯函数 |
 | `translate.ts` | 条目 → `McpClientConfig`、`serverName` 规范化、解析 `serve` 字段 | 纯函数 |
 | `health.ts` | `checkHealth` / `waitReady` / `isHttpUrl`：就绪探测与轮询（`fetch`、定时器、时钟全部注入） | 纯函数 + 注入 I/O |
 | `serve.ts` | `planServeStart`（`serve` → 启动计划）、`deriveHealthUrl`、`splitServe`（剥离 `serve`）、`ensureServeReady`（编排 + 并发去重）、`isPowerShellCommand` / `spawnOptionsFor`（平台 + 命令 → spawn 选项）、`spawnDetached`（脱离进程启动） | 纯函数 + 注入 I/O；`spawnDetached` 是**真实进程 I/O**，但 `spawn` 与 `platform` 可注入（平台 × 命令各分支都有单测，并做过双向变异测试） |
 | `trust.ts` | 信任存储读写、规范化指纹、批准/撤销、存储路径 | 纯函数 + 注入 I/O |
 | `global-rows.ts` | 从 Loader 树收集全局 `mcp-client` 行的 `serverName` | 纯函数（只读遍历） |
-| `session.ts` | `planSessionMount`：会话 → 挂载决策（纯函数，零 I/O） | 纯函数 |
+| `session.ts` | `planSessionMount`：会话 → 挂载决策（纯函数，零 I/O）；兼容命中时把"缺少 `mcpServers` 包裹"写进计划的 `diagnostics` | 纯函数 |
 | `session-tag.ts` | `withSessionTag`：给 stdio config 追加 `--project-mcp-session <SessionId>` 标记（返回新对象） | 纯函数 |
 | `console-view.ts` | `composeConsoleView`：计划 + 挂载记账 + serve 进行中表 → 控制台视图 | 纯函数 |
 | `same-origin.ts` | `requestAllowed`：两座 HTTP 桥**共用**的同源三重围栏（peer 回环 + `Host` 白名单 + `sec-fetch-site`/`Origin`），拒绝理由 `loopback-only` / `same-origin-only` | 纯函数 |
-| `console-bridge.ts` | `installConsoleBridge`：`webServer` 前缀路由（status/start/revoke），每个请求先过 `same-origin.ts` 的 `requestAllowed`（**不接收 nonce、不注册 `tapIndex`**） | 注入 I/O；真实 HTTP I/O |
+| `console-bridge.ts` | `installConsoleBridge`：`webServer` 前缀路由（status/start/revoke），每个请求先过 `same-origin.ts` 的 `requestAllowed`（**不接收 nonce、不注册 `tapIndex`**）；同一 (动作, 会话, 服务器) 的在途请求只执行一次、重复到达立刻回 `accepted`，每个动作另有等待上限 | 注入 I/O；真实 HTTP I/O |
 | `debug-view.ts` | 调试台纯函数投影：`parseMcpToolName` / `groupTools` / `groupIdOf` / `filterTools` / `formFields` / `buildArguments` | 纯函数 |
 | `debug-executor.ts` | `DebugExecutor`：`callId` 序列、取消表、结果块投影（`.value` 优先、图片 4 MiB 截断）、`CallIdConflictError` | 纯函数 + 注入时钟 |
 | `debug-bridge.ts` | `installDebugBridge`：`webServer` 前缀路由（tools / call / cancel / prompt-sections）+ `projectTools` / `projectGroups` 投影 | 注入 I/O；真实 HTTP I/O |
-| `client.js` | Client 半边（plain-JS bundle）：输入区按钮 + 内联锚定弹层；`conversation.view` 的「工具调试」Tab（工具树 / 调用 / 结果 / 提示词面）。只渲染 Host 算好的视图 | 浏览器侧；不做会话数据折叠 |
+| `client.js` | Client 半边（plain-JS bundle）：输入区按钮 + 内联锚定弹层；`conversation.view` 的「工具调试」Tab（工具树 / 调用 / 结果 / 提示词面）。只渲染 Host 算好的视图；状态取数走**有界轮询**（单飞 + 超时 + 指数退避 + 可见性暂停，见 §10.3） | 浏览器侧；不做会话数据折叠 |
 
 **依赖方向**（单向，无环）：
 
@@ -215,16 +215,21 @@ npx tsx <工作区>/temp/check-engines-dsh.mjs deepseek-harness-project-mcp --ru
 6. 所有诊断只由服务器名、变量名与自造的 `reason` 文本拼成，不回显 `.mcp.json` 内容。
 7. 会话创建路径上的任何函数**都不抛异常**（抛异常会中断会话创建）。
 8. 挂载必须设 `failOnStartupError: false` 且**不 await 连接**。
-9. 挂载与提示段的 disposer 必须**双份登记**：注册落在 `agent.ctx`（作用域正确），
+9. **`agent/created` 的监听器不得把可能长期挂起的 promise 返回给宿主**：Cordis 的 serial
+   派发会 `await` 监听器返回值，宿主又在会话创建流程里 await 该派发。任何"等外部服务就绪"
+   的工作都必须转到后台任务（见 §10.1）。
+10. **控制台 HTTP 面必须是有界的**：客户端轮询要有单飞、单次超时、退避与可见性暂停；
+   服务端每个请求不得做无缓存的重 I/O；动作请求不得等到挂载完成（见 §10.2–§10.4）。
+11. 挂载与提示段的 disposer 必须**双份登记**：注册落在 `agent.ctx`（作用域正确），
    disposer 同时按 agent 键控地留在插件自己的 `ctx.effect` 里。`agent.ctx` 上的注册有
    两个 owner，插件卸载（禁用、HMR 重载）**不会**回收它们。
-10. `lib/` 与 `.tsbuild/` 不得手改。
-11. `ctx.get('loader')` 必须传 **Loader 本体**而非 `loader.root`：`entries()` 在 Loader 上，
+12. `lib/` 与 `.tsbuild/` 不得手改。
+13. `ctx.get('loader')` 必须传 **Loader 本体**而非 `loader.root`：`entries()` 在 Loader 上，
    传 root 会让全局名单静默变成空集、撞名守卫完全失效。
-12. 信任键（`projectRoot` + `fingerprint`）必须与 `isApproved` 的查询键**逐字一致**；
+14. 信任键（`projectRoot` + `fingerprint`）必须与 `isApproved` 的查询键**逐字一致**；
    批准时复用计划携带的值，不自行推导（如用进程 cwd）。
-13. 文档与源码中不写本机绝对路径。
-14. 提交标题以中文开头。
+15. 文档与源码中不写本机绝对路径。
+16. 提交标题以中文开头。
 
 ## 5. `inject` 声明与缺服务的 profile
 
@@ -291,12 +296,12 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 | 层 | 覆盖 | 命令 |
 | --- | --- | --- |
 | 纯函数单测 | `discovery` / `translate` / `values` / `health` / `serve` / `trust` / `global-rows` / `session` / `config-guard` / `session-tag` / `console-view` / `debug-view` / `debug-executor` / `same-origin`（经两座桥的路由用例覆盖） | `npm test` |
-| 装配集成 | `plugin-smoke`（假 ctx，验证注册与清理可逆）、`mount`（真实 fs + 假 agent ctx，验证挂载路径与控制台路由围栏）、`mount-guard`（真实 fs + 假 mcp-client，验证非法 config 被拦在 `ctx.plugin()` 之前）、`serve-mount`（真实 fs + 假 agent ctx + **真实 spawn**，验证拉起链路）、`debug-mount`（假 ctx，验证两座桥的装配条件与重试） | `npm test` |
+| 装配集成 | `plugin-smoke`（假 ctx，验证注册与清理可逆）、`mount`（真实 fs + 假 agent ctx，验证挂载路径与控制台路由围栏）、`mount-guard`（真实 fs + 假 mcp-client，验证非法 config 被拦在 `ctx.plugin()` 之前）、`serve-mount`（真实 fs + 假 agent ctx + **真实 spawn**，验证拉起链路）、`debug-mount`（假 ctx，验证两座桥的装配条件与重试）、`console-async`（真实 fs + 假 ctx，验证视图缓存、后台挂载与 `accepted` 语义）、`console-bridge`（假 req/res，验证路由动作语义与有界性） | `npm test` |
 | 模块解析 | `profile-modules`（`--profile` 解析、`DSH_HOME` 落点）、`profile-config-contract`（对**已安装的 profile 模块**断言 `Config['~standard']` 契约）、`profile-export-contract`（对**已安装的 profile 模块**断言 `mcp-client` / `atomic-write` 的导出形状） | `npm test` |
 | 类型 | `tsc --noEmit` | `npm run typecheck` |
 | 打包 | tarball 内容 | `npm pack --dry-run` |
 
-### 7.2 测试文件与用例数（当前 298）
+### 7.2 测试文件与用例数（当前 323）
 
 | 文件 | 用例 | 覆盖 |
 | --- | --- | --- |
@@ -305,11 +310,11 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 | `config-guard.test.mts` | 20 | 合法放行且**返回原 config（不是 schema 规范化后的 `value`）**、`value` 缺失时同样返回原配置、非法 `serverName` / 缺失 `command` 的诊断只含字段路径、无 `path` 时的通用摘要、`env` 键名可入诊断、不可信 path 段整条作废（含 `=`、超长、换行、非原始值、symbol）、数组下标合法、段数上限截断、**根级 union 无 `path` 时下钻 union 成员取字段**、成员抛错/返回 thenable 不影响主判定、非 union 不下钻、空 `issues` 视为失败、异步校验拦下、校验抛错只记类型名、非对象结果拦下、schema 缺失放行、`validate` 以 `~standard` 对象为接收者调用、`errorName` 只回类型名 |
 | `mount-guard.test.mts` | 4 | **schema 不通过时非法 config 被拦在 `ctx.plugin()` 之前且日志不含敏感值**、**多条非法配置全部拦下**、**被拦下的项不进挂载记账**、**命令层 trust 路径共用同一守卫** |
 | `profile-config-contract.test.mts` | 6 | 对**已安装的 profile 模块**断言：`Config` 是带 `~standard` 的 schemastery union、`validate` 同步、合法返回补齐默认值的 `value`、**非法时 `issue.message` 回显整个 config（泄密源）**、`validateMountConfig` 在真实 schema 上放行合法/拦下非法且不泄漏 |
-| `discovery.test.mts` | 12 | 向上找最近的 `.git`、无 `.git` 回退 cwd、`absent` / 非法 JSON / 顶层非对象 / `mcpServers` 非对象、缺 `mcpServers` 按空、原文透传用于指纹、**尺寸超限归一为 `invalid`（带尺寸与上限）而不是 `absent`**、**非哨兵异常仍返回 `absent`** |
+| `discovery.test.mts` | 19 | 向上找最近的 `.git`、无 `.git` 回退 cwd、`absent` / 非法 JSON / 顶层非对象 / `mcpServers` 非对象、缺 `mcpServers` 按空、原文透传用于指纹、**尺寸超限归一为 `invalid`（带尺寸与上限）而不是 `absent`**、**非哨兵异常仍返回 `absent`**；**兼容分支七态**：缺包裹时按顶层键解析并置 `implicitServers`、条目内容原样保留、元数据键（`$schema`）与非服务器对象（没有 `command`/`url`/`type`）不得混入、一个都不像时退回 `ok` + 空表且**不**置位、`mcpServers` 为空对象时不落兼容分支（回归） |
 | `translate.test.mts` | 29 | `normalizeServerName` 六态、`expandVariables` 六态（含原型链）、`translateServer` 的 stdio / http / 别名 / sse / ws / 无 type 有 url / 非对象 / 缺 command / 变量缺失 / env 展开 / 规范名、**`env` 与 `headers` 的 `__proto__` 键保留三态（含展开后落在该键上）**、**`command` / `url` 展开为空串时跳过** |
 | `trust.test.mts` | 32 | 指纹稳定性与敏感性（空白、键序、新增条目、`__proto__`、超深嵌套）、读写往返、失败关闭四态、`isApproved` 四态、`approve` / `revoke` 不改入参 |
 | `global-rows.test.mts` | 9 | 收集 `mcp-client` 行、忽略非 mcp-client / 缺 `serverName` / 非字符串、`loader` 缺失或形状不符或 `entries()` 抛错时降级空集、嵌套子树 |
-| `session.test.mts` | 18 | 无 cwd、子代理判据（`origin` 单条）、**分叉会话（有 `parentSession`、无 `origin`）应当挂载 / 未批准时进入 untrusted**、**两者同时存在时仍跳过**、无文件静默跳过、未信任、已信任、指纹失配、撞名跳过、损坏文件、结构错误、全候选被跳过时不要求批准、规范化去重、未知传输、变量缺失诊断 |
+| `session.test.mts` | 20 | 无 cwd、子代理判据（`origin` 单条）、**分叉会话（有 `parentSession`、无 `origin`）应当挂载 / 未批准时进入 untrusted**、**两者同时存在时仍跳过**、无文件静默跳过、未信任、已信任、指纹失配、撞名跳过、损坏文件、结构错误、全候选被跳过时不要求批准、规范化去重、未知传输、变量缺失诊断、**缺 `mcpServers` 包裹 + 已批准 → 照常挂载并留下"缺少包裹"的诊断（含可直接照抄的写法、不回显条目内容）**、**缺包裹 + 未批准 → 进入 `untrusted` 且待批准项含该服务器** |
 | `plugin-smoke.test.mts` | 2 | `apply` 注册与注销、`agent/created` 监听可逆 |
 | `console-view.test.mts` | 6 | `composeConsoleView` 的 `skip` → `null`、`invalid` 只有 `fileNote`、`untrusted` 逐条 `unauthorized`、`mount` 的 `failed` > `mounted` > `starting` > `not-mounted` 优先级、部分批准时未批准条目单独成行、`actionCount` 口径（未授权 + 失败 + 未挂载） |
 | `mount.test.mts` | 32 | **控制台路由准入：同源浏览器形态放行、非回环 peer / 非本机 `Host` / 跨站 `sec-fetch-site` / 异源 `Origin` 一律 403**、**两座桥都不注册 `tapIndex`（桌面版修复的回归守护：桌面文档由 Electron shell 直读打包 dist，`tapIndex` 永不执行）**、未批准不挂载（安全断言）、挂载带 `failOnStartupError: false`、loader 传本体、重复 trust 幂等、插件卸载回收、agent 销毁清理、loader 缺失诊断、`inject` 声明、**批准后提示段被撤下**、**撤销后提示段刷新为待批准**、**文件消失后提示段撤下**、**会话 B 不谎报已挂载**、**trust 回报实际挂载结果**、**挂载失败日志只记错误类型、不回显展开后的 env 值**、**fiber 启动失败后该名不再出现在"已挂载"里（并留下"已从挂载记账移除"诊断）**、**迟到的 fiber 拒绝不摘掉同名新条目（按身份摘除）**、**过大的 `.mcp.json` 报"过大"而非"没有 `.mcp.json"`，且不进入挂载路径**、**端到端：`env` 的 `__proto__` 键穿过守卫到达 `ctx.plugin()`**、**端到端：`headers` 的 `__proto__` 键穿过守卫到达 `ctx.plugin()`**、**同一 sessionId 的第二个 agent 对象不重复挂载**、**第二个对象发起的 untrust 能卸载第一个对象挂的 fiber**、**第二个对象销毁时回收第一个对象的 fiber**、**第二个对象不重复注入提示段**、**不同 sessionId 各自挂载**、**`agent.id` 缺失或非字符串时不挂载且有诊断（六种非法值）**、**id 不可用时"已挂载"如实为空**、**stdio 命令行带 `--project-mcp-session <sessionId>` 且追加在原有 args 之后**、**两个会话的标记不同**、**http 不追加标记**、**标记只含 SessionId，不带展开后的 env 值** |
@@ -320,10 +325,12 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 | `debug-executor.test.mts` | 12 | `projectValueBlocks` 的文本/图片/mimeType 回退/未支持块/元素级畸形/超大图片截断、`contentText` 只拼文本、成功调用**优先 `.value` 原始块**（模型面 `content` 不同）、`.value` 无块时回退模型面文本、失败调用的三种错误消息来源、自动 `callId` 跳过在途序号、**同一 `callId` 在途时被拒绝且不影响在途那条**、`cancel` 中止在途调用与未知 id 返回 false、**`execute` 抛错后仍从取消表摘除**、**scope 透传（有 scope 传 `agent`、无 scope 不塞该字段）** |
 | `debug-bridge.test.mts` | 21 | 路由前缀、**同源围栏放行浏览器同源请求（不带 nonce 也放行——真机修复的回归守护）** 含 `sec-fetch-site=none`/带同源 `Origin`/无 Origin/`localhost`/IPv6 回环五种合法形态、**非回环 peer / 非本机 Host / 缺 Host / 跨站 / 异源 Origin / 畸形 Origin 一律 403 且不执行工具**、拒绝理由区分 `loopback-only` 与 `same-origin-only`、`GET /api/tools` 的投影与分组形状、**`GET /api/tools` 带 `session` 时把 agent 当 scope 传给 `schemas`（会话级 `mcp__*` 出现；无 session / 解析不到时不造 scope）**、**`POST /api/call` 的 body 带 `session` 时把 agent 传给 `execute`（与列出同视角）**、`GET /api/prompt-sections` 的四态（正常/服务缺席/抛错/畸形）、`POST /api/call` 的成功与三种 400、`callId` 冲突 409、**执行器抛错降级为 500 + 错误类型名且响应体不含底层 message**、`POST /api/cancel` 的三态、未知路径与方法 404、disposer 注销、`projectTools` / `projectGroups` 纯投影；**技能**：`GET /api/skills` 的正常/服务缺席/抛错/畸形四态、**摘要不下发本机 `path`**、`GET /api/skill` 的正文/未知 404/缺 name 400/服务缺席也不崩、`projectSkills` 的默认 invocation 与丢 path、**带 `session` 时把 agent 当 `scope` 传给 `skills.list`/`skills.get`**、解析不到 agent 时退回全局视角（不凭空造 scope） |
 | `debug-mount.test.mts` | 3 | `apply` 在 tools + webServer 都在场时挂上两座桥、**两座桥都不注册 `tapIndex` 页面注入**（桌面版回归守护：桌面文档由 Electron shell 直读打包 dist，注入永不执行，一旦有人加回来立刻变红）、卸载后路由全部撤销且无注入残留、**tools 缺席时不挂调试台但 MCP 控制台照挂**、**webServer 晚到时由重试补挂且只挂一次** |
+| `console-bridge.test.mts` | 8 | **路由层不缓存视图**（分层守护：缓存必须在装配层，`viewFor` 每次都被调用）、动作结果原样透传（`{ok:true,accepted:true}` 走 200，失败仍 200 + `reason`）、**同一 (动作, 会话, 服务器) 的去重**（动作只执行一次、后到者立刻回 `accepted`、两个请求各写自己的 `res`）、去重键不误伤（不同 server / session / start 与 revoke 各自执行）、**动作超过上限按 `timeout` 结算且迟到结算不二次写响应**、拒绝归一为错误类型名且不透出错误消息、**客户端已断开（`destroyed` / `writableEnded`）时不写不抛**、disposer 注销路由 |
+| `console-async.test.mts` | 8 | **`agent/created` 对 mount 计划返回 `undefined`**（挂载留在后台，回归"会话创建被 serve 等待阻塞"）、**HTTP 条目健康检查挂住时 `agent/created` 仍立即返回**（用可控 `fetch` 证明）、**`POST start` 在批准写入后立刻回 `accepted`**（响应写出时健康检查仍未结算，且批准记录已落盘）、**同一 (会话, 服务器) 并发 start 只执行一次挂载**、**TTL 内两次 `GET status` 只合成一次视图**（以 `loader.entries()` 调用次数为观测面）、`start` 批准写入失效缓存（挂载仍挂起时状态已是 `starting`）、`revoke` 写入失效缓存（立即回 `unauthorized`）、**会话不可寻址时不缓存 `null`** |
 
 ### 7.3 Review Focus 的守护位置
 
-规格未逐一钉死的五类输入/失败模式，各自有测试守护：
+规格未逐一钉死的输入/失败模式，各自有测试守护：
 
 | 风险 | 守护用例 |
 | --- | --- |
@@ -337,6 +344,9 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
 | 拉起服务时把展开后的 `serve.env` 值写进日志 | `serve.test.mts`「展开后的 env 值不出现在任何日志」+ `serve-mount.test.mts` 的同名端到端用例 |
 | 两个会话同时挂载同一 `url` → 拉起两个服务（第二个因端口占用失败） | `serve.test.mts`「并发同 url 只 spawn 一次」+ `serve-mount.test.mts`「并发挂载同一 url 只 spawn 一次」（数子进程写出的行数） |
 | `serve.command` 写错 → `spawn` 的 `'error'` 事件带崩宿主 | 由 `spawnDetached` 的 `child.on('error', () => {})` 承担；无自动化守护（需要真实宿主进程），见 §9 |
+| `agent/created` 把可能长期挂起的 promise 交回宿主（会话创建被 `serve` 等待阻塞） | `console-async.test.mts` 的「监听器返回 `undefined`」与「健康检查挂住时仍立即返回」两条（可控 `fetch` 证明"没在等它"） |
+| 控制台动作把浏览器连接占住（等挂载完成 / 不去重 / 无上限） | `console-bridge.test.mts` 的 `accepted` 透传、并发去重、超时结算三条 + `console-async.test.mts` 的「`start` 立即回 `accepted`」 |
+| 视图缓存的失效点被绕过（点完"启动"在 TTL 内仍显示未授权） | `console-async.test.mts` 的 start / revoke 失效两条 + `console-bridge.test.mts` 的「路由层不缓存视图」（分层守护） |
 
 ### 7.3.1 为什么自校验必须在 `mountInto` 里
 
@@ -368,15 +378,17 @@ src, !src/tests, tsconfig.json, tsconfig.tests.json
   内联 `-e` 脚本，把 `serve.env` 里的探针值写进标记文件后立即退出。这样既能断言"进程真的被
   拉起来了"与"`env` 真的到了子进程"，又不留下常驻进程、不依赖任何外部命令。并发去重的用例
   让子进程往**同一个文件**追加一行，**行的数量就是 spawn 的次数**。
-- **`fire` 必须 await**：`agent/created` 的监听器现在是 async（HTTP 条目要先确保服务就绪），
-  因此夹具的 `fire` 按 Cordis `serial` 的语义 `await cb(...)`。同步遍历会让断言跑在挂载之前
-  ——"未挂载"的断言假性通过，"已挂载"的断言必然失败，两种都是错误的观测。
+- **`fire` 必须 await，但监听器必须同步返回**：`agent/created` 的监听器**不返回**挂载 promise
+  （挂载已转后台，见 §10.1），而 Cordis 的 `serial` 派发会 `await` 监听器返回值——所以夹具的
+  `fire` 照旧 `await cb(...)`，它同时是这条红线的回归位：监听器一旦把挂载 promise 交回去，
+  `fire` 就会等满整个 `readyTimeoutMs`，用例挂到超时变红。断言"已挂载"时必须**主动等后台
+  任务落定**（可控 promise 或轮询夹具），不能假定 `fire` 返回时挂载已完成。
 - **变异测试**：新增守护后用变异验证鉴别力（改回缺陷实现，确认恰好红掉对应用例）。
   `noEmitOnError` 会让编译失败的变异静默跑旧产物，变异后必须确认构建真的产出了新文件。
 
 ## 8 验证分层与未验证项
 
-**已由测试与命令覆盖**：上表 298 个用例、`npm run typecheck`、`npm pack --dry-run` 的
+**已由测试与命令覆盖**：上表 323 个用例、`npm run typecheck`、`npm pack --dry-run` 的
 tarball 内容。
 
 **未在真实 DSH 运行时验证**（需要真实 profile 与会话，无法在纯单元测试中覆盖）：
@@ -384,8 +396,8 @@ tarball 内容。
 - `agent/created` 在 `clear` / `compact` source 下的幂等性；
 - 非阻塞挂载下 `ctx.plugin()` 返回的 fiber 在 agent dispose 时是否被正确清理；
 - 从 `agent.ctx` 遍历 Loader 树能否拿到完整条目集（scope 继承是否覆盖 root）；
-- 首条消息是否真的赶不上工具注册；
-- `/mcp-project` 与提示段在真实 GUI 会话中的实际渲染；
+- 首条消息是否真的赶不上工具注册（后台挂载后，HTTP 条目还可能再晚一轮）；
+- 控制台按钮/弹层与「工具调试」Tab 在真实 GUI 会话中的实际渲染与交互；
 - `src/index.ts` 的挂载拒绝处理器对**真实 Cordis fiber** 是否会在
   `failOnStartupError: false` 下以**拒绝**结算：夹具给的是 thenable 桩，`mount.test.mts`
   自造的 fiber 由测试决定何时拒绝；真实 fiber 走 `fiber.await()`
@@ -403,10 +415,13 @@ tarball 内容。
   但 Ctrl+C 这一具体触发方式与其时间窗未单独测量。
 - **真实 MudMCP 的首次建索引耗时**：默认 120 秒的依据是实测"可能超过 90 秒"，但那是在
   本机、本仓库条件下的观测；不同项目/机器上的合适上限可能需要调整（可配）。
-- **`agent/created` 的 serial 等待是否真的挡住首条消息**：契约（`runtime-types.ts:257`
-  的 "AgentLoop holds queued input until all listeners finish"）与派发点
-  （`packages/core/agent/src/index.ts:550` 的 `await this.ctx.serial(...)`）都已核实，但
-  "用户实际感受到的等待时长"未经真实会话测量。
+- **已证实（2026-10-29 现场）**：`agent/created` 的 serial 派发**确实**会 await 监听器返回值
+  （契约 `runtime-types.ts:257` 的 "AgentLoop holds queued input until all listeners finish"、
+  派发点 `packages/core/agent/src/index.ts:550` 的 `await this.ctx.serial(...)`）。把挂载
+  promise 返回给宿主，等于把**会话创建**按在 `serve` 的就绪等待上（最长 `readyTimeoutMs`），
+  多开子代理时表现为整段对话卡住。该等待已移出创建路径（§10.1），因此本项不再是"未验证"。
+- **后台挂载的落定时机**：装配层的单测用可控 promise 证明"创建返回时挂载未完成"，但
+  "真实会话里从创建返回到工具出现之间隔多久"没有测量（与 `serve` 启动速度强相关）。
 - **工具调试 Tab 在真实 GUI 会话中的渲染**：`debug-view` / `debug-executor` / `debug-bridge`
   三层都有单测（含装配条件与重试），但"Tab 真的出现在会话视图行里、三栏布局在窄屏下折叠
   正确、图片块真的渲染出来"只能由真实浏览器确认。本环境无浏览器控制，只做了语法与路由级
@@ -491,8 +506,9 @@ Host 半边没有热通道：标记要进入长跑进程，需要使用者重启
 | `serve 配置已被修正` + `readyTimeoutMs` | `readyTimeoutMs` 不是有限正数，或超过 30 分钟上限，已退回默认 120000 / 收敛 | 想用别的值就写一个合法数字；否则无需处理 |
 | `…且该条目没有 serve 配置，无法自动拉起服务` | 健康检查失败，且该条目没写 `serve` | 要么手动启服务，要么补上 `serve` |
 | `拉起…的服务失败（错误类型：…）` | `spawn` 抛错（命令不存在、权限不足等） | 核对 `command` 是不是绝对路径、能不能在 PATH 上找到；`Error` 的 `code` 不在日志里（红线 3），必要时手动跑一次同样的命令 |
-| `已拉起…但等待就绪超过 N 毫秒仍未就绪` | 服务启动了但健康端点没在 `readyTimeoutMs` 内变成 2xx | 确认 `health` 路径对；服务若是首次建索引，调大 `readyTimeoutMs` |
+| `已拉起…的服务，但等待就绪超过 N 毫秒仍未就绪；仍交给 mcp-client 自行重试` | 服务启动了但健康端点没在 `readyTimeoutMs` 内变成 2xx | 确认 `health` 路径对；服务若是首次建索引，调大 `readyTimeoutMs` |
 | `确保…的服务就绪时出错（错误类型：…）` | `ensureServeReady` 内部意外抛错（契约漂移的兜底） | 属缺陷，记录错误类型与复现步骤 |
+| `后台挂载项目级 MCP 服务器失败（错误类型：…）` | 后台挂载任务意外抛出（`startMountInBackground` 的 catch） | 属缺陷，记录错误类型与复现步骤 |
 
 **注意日志里不会有**：`serve.env` 展开后的值、`.mcp.json` 的内容、健康端点的响应体。
 因此"服务到底收到了什么环境变量"只能靠**服务自己**的输出（把日志写进文件）确认，本插件
@@ -511,11 +527,10 @@ Get-CimInstance Win32_Process |
 try { (Invoke-WebRequest -Uri 'http://127.0.0.1:19701/health/ready' -TimeoutSec 2).StatusCode } catch { $_.Exception.Message }
 ```
 
-**"等了很久"怎么判断**：默认 `readyTimeoutMs` 是 120 秒，因此"服务没起得来"时首次打开
-会话最多卡 2 分钟——这是**预期行为**，不是死锁（会话最终会建起来，只是工具暂时不可用）。
-要区分"在等"与"卡死"，看服务进程是否真的在跑（上面第一条命令）以及它的日志：进程在跑
-且 CPU 在动 = 在建索引，等就是了；进程不在 = `spawn` 失败或服务立刻退出了，看服务自己的
-输出。
+**"等了很久"怎么判断**：默认 `readyTimeoutMs` 是 120 秒，服务没起得来时这条目的工具最多
+晚 2 分钟出现——这对**后台挂载**是预期行为，会话本身早已创建（§10.1）。要区分"在等"与
+"卡死"，看服务进程是否真的在跑（上面第一条命令）以及它的日志：进程在跑且 CPU 在动 =
+在建索引，等就是了；进程不在 = `spawn` 失败或服务立刻退出了，看服务自己的输出。
 
 ## 9. 已知局限（实现层面）
 
@@ -525,12 +540,127 @@ try { (Invoke-WebRequest -Uri 'http://127.0.0.1:19701/health/ready' -TimeoutSec 
 | 模块名精确匹配 | `global-rows.ts` | 行名写成子路径或相对路径时漏检 |
 | `readProjectMcpFile` 把任何读错误当作 `absent` | `discovery.ts` | 无法区分 `ENOENT` 与 `EACCES`；方向是 fail-safe |
 | 每会话独立连接 | `index.ts` | N 个会话 = N 份连接与子进程 |
-| 挂载只发生在会话创建时或本会话批准时 | `index.ts` | 别的会话批准后，本会话的计划已是"已批准"但不会自动挂载；`/mcp-project` 把它列在"已批准但本会话未挂载"下，`/mcp-project trust` 即挂上。这是**如实呈现**，不再是口径错误 |
-| 首条消息可能赶不上工具 | `index.ts` | 非阻塞挂载的固有代价。配了 `serve` 的 HTTP 条目是例外：首条消息会等服务就绪（有上限） |
+| 挂载只发生在会话创建时或本会话批准时 | `index.ts` | 别的会话批准后，本会话的计划已是"已批准"但不会自动挂载；控制台把它列在 `本会话未挂载` 下，点 [启动] 即挂上。这是**如实呈现**，不是口径错误 |
+| 首条消息可能赶不上工具 | `index.ts` | 非阻塞挂载的固有代价。后台挂载后 HTTP 条目还可能再晚一轮（`启动中` → `已挂载`） |
+| 控制台视图最多滞后一个 TTL | `index.ts` | 缓存在批准、撤销、挂载落定、会话销毁时主动失效，但"文件在外部被改"这类变化只能等 TTL 过期后的那次重算 |
 | `findProjectRoot` 不规范化路径 | `discovery.ts` | 同一目录的反斜杠与正斜杠写法在信任存储里是两个键 |
-| `runTrust` 在锁外读、锁内写 | `commands.ts` + `index.ts` | 并发批准不同项目理论上会丢更新 |
-| `3100` 提示段排序位是复制的字面量 | `index.ts` | 上游改动会静默分叉 |
+| 信任写入在锁外读、锁内写 | `index.ts` | 并发批准不同项目理论上会丢更新 |
 | `serve` 不检查端口归属、不重试 | `serve.ts` | 端口被别的进程占用时只记日志，由 `mcp-client` 自己连；不猜测、不抢占 |
 | `serve` 拉起的进程无法回收 | `serve.ts` | 生命周期归服务自己（设计决策）；插件卸载、DSH 退出都不会 kill 它。服务写错时会留下一个常驻进程，只能手动结束 |
 | `spawnDetached` 的 `'error'` 事件被吞掉 | `serve.ts` | 异步事件，而该函数是同步的、没有 logger；写错的 `command` 只在后续"等待就绪超时"里间接可见 |
 | 健康检查只认 2xx | `health.ts` | 3xx（含重定向）算未就绪；`redirect: 'error'` 刻意不跟随——跟随会打到没打算探测的地址 |
+| 顶层兼容的提示日志要等第一台批准后才出现 | `session.ts` + `index.ts` | "缺少 `mcpServers` 包裹"写在计划的 `diagnostics` 里，而装配层只对 `mount` 计划写日志；未批准时计划是 `untrusted`（不携带 `diagnostics`），此时弹层里的 `未授权` 行是更早的线索 |
+
+## 10. 实现约束：会话创建路径、后台挂载与控制台轮询
+
+> 这一节钉死 2026-10-29 那次修复的三条实现约束。改动 `index.ts` 的 `agent/created`、
+> `console-bridge.ts` 的等待上限、或 `client.js` 的取数节奏之前先读这里。
+
+### 10.1 为什么不在 `agent/created` 里 await
+
+`agent/created` 是 **serial 派发且被 await**：Cordis 的 `serial` 会 `await cb(...)`，宿主又在
+会话创建流程里 `await this.ctx.serial(...)`（派发点与契约见 §8 的"已证实"条目）。因此
+**监听器的返回值就是会话创建的等待时间**。
+
+旧实现把 `mountInto(...)` 的 promise 当成监听器返回值：
+`return mountInto(...)`。而 `mountInto` 对 HTTP 条目会 `await ensureServeReady(...)`，那一步
+在服务未就绪时最多等满 `readyTimeoutMs`（默认 120 秒）。于是：
+
+- **会话创建、恢复、清空/压缩、子代理派生全部排在这个等待后面**；
+- 一个项目里只要有一条"服务没起好"的 HTTP 条目，多开子代理时整段对话就卡住；
+- 同一时间按钮的 `status` 轮询也被拖慢，挂起请求把页面同源连接占满（见 §10.3），
+  于是"子代理会话内容也加载不出来"。
+
+现在 `agent/created` 的监听器**同步返回 `undefined`**（`try/catch` 里也一样），挂载交给
+`startMountInBackground`：
+
+| 关注点 | 旧 | 新 |
+| --- | --- | --- |
+| 监听器返回值 | `mountInto` 的 promise | `undefined`（同步） |
+| 谁等 `serve` 就绪 | 宿主（= 会话创建） | 后台任务 |
+| 代价落在 | 会话创建最多卡 `readyTimeoutMs` | 该条目的工具晚一点出现（`启动中`） |
+| 去重 | 同名已在记账里则跳过 | 额外按 `(会话, 服务器)` 的 `startInFlight` 去重 |
+| 失败 | 监听器 catch | 后台任务的 `.catch` 记 warn，绝不冒泡成未处理拒绝 |
+
+取舍是刻意的：**等待要么落在会话创建上、要么落在工具出现上**。会话创建是整条 UI 与所有
+子代理的共同路径，工具出现只影响一个条目。
+
+**后台任务的两道闸门**：挂载转到后台后，会话可能先被销毁、插件可能先被卸载。因此后台任务
+在**每个 await 点之后**都要复查：
+
+1. 该会话的记账是否还在（`agent/disposed` 已清掉 / 插件已卸载）——不在就停手，**不**往
+   已销毁的 scope 注册 fiber；
+2. 插件自身是否已卸载——卸载后不得让挂载"重新出现"（否则活会话会拿到一个来源已经消失的
+   fiber，且没有任何路径能回收它）。
+
+这两条缺一，修复就会从"卡住会话"变成"往死掉的会话写东西"。
+
+
+### 10.2 控制台视图缓存（服务端）
+
+`viewFor(sessionId)` 的每次调用原本要**同步**做完：`findProjectRoot`（逐级 `existsSync`）、
+读 `.mcp.json`（`inspectAgent` 一次、`collectMountable` 的探针再读一次）、读信任文件、
+遍历整棵 Loader 树、再跑两遍 `planSessionMount`。它在宿主主线程上，且会被按会话数乘起来——
+这正是"整个 GUI 变慢"的一半成因。
+
+现在的实现（`src/index.ts` 的 `apply` 里）：
+
+| 项 | 值/位置 | 说明 |
+| --- | --- | --- |
+| TTL 常量 | `VIEW_CACHE_TTL_MS = 1000` | 短于客户端基础间隔（1500ms），正常轮询命中缓存 |
+| 缓存键 | `agent.id`（会话 id） | 与挂载记账同键，会话销毁时一起清 |
+| 条目上限 | `VIEW_CACHE_MAX = 256` | 防长期运行下按会话无限增长；淘汰最早的条目 |
+| 主动失效 | `invalidateConsoleView(sessionId? \| 无参)` | 见下面的失效点清单 |
+| 不缓存的路径 | 会话不可寻址（agent 不存在 / `view === null`） | 那多半是"会话还在创建中"，缓存会让按钮晚一个 TTL 才出现 |
+
+**失效必须与状态变化同点**：任何"让视图该变"的动作改完状态后立即调用
+`invalidateConsoleView`。只依赖 TTL 会让用户看到"点了没反应"。当前的失效点：
+
+| 失效点 | 传参 |
+| --- | --- |
+| POST start 批准写入之后、动作下发之前 | 该会话 id |
+| 后台挂载落定（`finally`，成功或失败都算） | 该会话 id |
+| POST revoke 写入信任记录之后 | 该会话 id |
+| `agent/disposed` 清理登记项时 | 该会话 id |
+| 插件卸载（清理全部 agent 维度注册时） | 无参（清空） |
+
+
+### 10.3 客户端轮询边界
+
+常量在 `client.js` 的 `useView` 里（本仓库唯一的 Client 半边，plain JS、无构建）：
+
+| 常量 | 值 | 作用 |
+| --- | --- | --- |
+| `POLL_BASE_MS` | 1500 | 正常节奏 |
+| `POLL_TIMEOUT_MS` | 4000 | 单次请求上限（`AbortController`），超时视同一次失败 |
+| `POLL_MAX_MS` | 30000 | 指数退避上限（连续失败 3 → 6 → 12 → 24 → 30 秒；任一成功复位到 1500ms） |
+
+必须同时具备的行为（缺一条就会重现 2026-10-29 的连接占满）：
+
+1. **单飞**：有在途 `status` 请求时不发新的，结算后再排下一次；
+2. **超时**：到点 abort，`loading` 归 false，**保留上一次已渲染的视图**（不清空）；
+3. **退避**：连续失败按 2 倍递增到上限，任一次成功立刻复位；
+4. **可见性**：`document.visibilityState === 'hidden'` 时暂停，回到前台立刻补一次；
+5. **卸载清理**：abort 在途请求、清定时器与 `visibilitychange` 监听，不在已卸载组件上
+   setState。
+
+### 10.4 `POST /start` 的 `accepted` 语义
+
+`console-bridge.ts` 与装配层两侧共同保证"动作请求不等于挂载请求"：
+
+- **动作只写授权**：`start` 先 `await writeStoreAtomic(approve(...))`（必须 await：真实 profile
+  下它走 `await withFileLock(...)`，不 await 会读到旧存储），然后**重算计划**取该服务器的
+  config，转交后台挂载，**立即**返回 `{ ok: true, accepted: true }`；
+- **在途去重**：`(动作, 会话, 服务器)` 相同且未结算时，后到的请求直接回同样的
+  `{ ok: true, accepted: true }`，不排队、不重复挂载；
+- **动作等待上限**：`console-bridge.ts` 的 `ACTION_TIMEOUT_MS = 15000` 兜"信任写入卡在文件
+  锁上"这类异常，到点按 `{ ok: false, reason: 'timeout' }` 结算，绝不让一条浏览器连接永久
+  悬着。它与挂载无关——挂载已经在后台，不在响应路径上；
+- **写响应必须先判连接**：两座桥的 `sendJson` 都先看 `writableEnded || destroyed`，并整体
+  try/catch。客户端可能已经断开（关标签、页面卸载、请求被 abort），对已结束的 `res` 再写会抛
+  `ERR_STREAM_WRITE_AFTER_END`，而异步回调里的抛出就是未处理拒绝——辅助面不能因此影响宿主；
+- **响应体口径不变**：只有固定 `reason` 文本与视图字段，不含 `.mcp.json` 内容、不含展开后的
+  环境变量值（红线 3 延伸到 HTTP 面）。
+
+Client 侧对应地**不能**把 `ok: true` 当成"已挂载"：它触发一次刷新即可，真实状态由随后的
+轮询给出（`启动中` → `已挂载` / `失败`）。

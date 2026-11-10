@@ -163,9 +163,23 @@ await this.ctx.serial(entry.carrier, 'agent/created', { agent, source, signal })
 
 **因此 `workspace` 模式可以在 `agent/created` 里 await 连接完成** —— 用户的输入会等到监听器结束，MCP 工具在首次请求前就已注册完毕，`restrict` 可以**一次性精确完成**。
 
+> **2026-10-29 修订（本设计恢复时必须重做这一节）**：上面的"可以 await"**不再成立**。
+> `agent/created` 的监听器若返回 promise，宿主会 await 它，于是**会话创建**被外面的耗时
+> 按在地上——这正是 2026-10-29 修复的缺陷（`serve` 等待曾把会话卡满 `readyTimeoutMs`，
+> 多开子代理时整段对话卡住）。红线已经改成"会话创建路径不得返回可 long-pending 的
+> promise"（见仓库 [`AGENTS.md`](../AGENTS.md) 红线 4 与
+> [`development.md` §10.1](development.md#101-为什么不在-agentcreated-里-await)）。
+> 因此本设计的"await + 10s 超时"需要改成**后台挂载 + 工具面就绪后再 restrict**（即回到
+> 早期被否掉的"两步 restrict"），或另找不需要等待的过滤机制。`session` 模式的
+> "不 await"不变。
+
+
 **这消除了原本设计里的"两步 restrict"**（先 deny 已知前缀、工具注册后再补一次）。
 
 ### 4.5 等待策略：await + 10s 超时
+
+> **2026-10-29 起作废**（见 §4.4 的修订说明）：本节的"await"不再是合法选项。恢复本设计时
+> 按"后台挂载 + 两步 restrict"重做；下表的 `workspace` 行保留仅作历史对照。
 
 `workspace` 模式必须等工具名才能 restrict，因此**必须 await**（与 `session` 模式的"不 await"刻意不同）：
 
@@ -221,7 +235,7 @@ await this.ctx.serial(entry.carrier, 'agent/created', { agent, source, signal })
 | --- | --- | --- |
 | 1 | 默认模式 | **保持 `session`**（不改变现有行为） |
 | 2 | `workspace` 模式的子进程标记 | **改用 `--project-mcp-workspace <projectRoot>`**（反映真实归属，避免排查时困惑） |
-| 3 | 等待策略与降级 | **await + 10s 超时**；超时后**不 restrict + 记 warn**（用户推断 `agent/created` 可 await，控制器已核实成立，方案因此简化——不再需要两步 restrict） |
+| 3 | 等待策略与降级 | **await + 10s 超时**；超时后**不 restrict + 记 warn**（~~用户推断 `agent/created` 可 await，控制器已核实成立~~ → **2026-10-29 作废**：派发确实会 await 监听器，但正因如此它才不允许被当成等待点，见 §4.4） |
 
 ## 9 不在本次范围
 
